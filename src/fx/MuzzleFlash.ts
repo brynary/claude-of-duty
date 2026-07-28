@@ -204,37 +204,40 @@ export class MuzzleFlash {
 
     // 5. Propellant smoke always lives in world space so it hangs where it was
     //    made instead of riding the camera. Automatic fire puts ten of these a
-    //    second within a metre of the lens, so it is metered against the same
-    //    coverage budget as impact dust.
+    //    second right at the lens, which is why the near field was fogged: the
+    //    player's own gun was the biggest smoke emitter in the game.
+    //
+    //    It is now thrown *forward*, out past a metre, and it lives for well
+    //    under a second. That is where propellant smoke actually is — a puff
+    //    hanging in front of the muzzle, not a film on the lens — and it is far
+    //    enough out that the cloud near-fade lets it through at full strength.
     const allow = this.worldParticles.allowance()
-    const smokeCount = allow < 0.45 ? 1 : 2 + (r.bool(0.4) ? 1 : 0)
+    const smokeCount = allow < 0.4 ? 1 : 2
     for (let i = 0; i < smokeCount; i++) {
       const p = this.worldParticles.params
-      p.position.copy(this.worldOrigin).addScaledVector(this.worldForward, r.range(0.04, 0.3) * flashScale)
+      p.position.copy(this.worldOrigin).addScaledVector(this.worldForward, r.range(0.55, 1.1) * flashScale)
       this.dir.copy(this.worldForward)
-        .addScaledVector(this.worldRight, r.spread(0.5))
-        .addScaledVector(this.worldUp, r.spread(0.5))
+        .addScaledVector(this.worldRight, r.spread(0.35))
+        .addScaledVector(this.worldUp, r.spread(0.35))
         .normalize()
-      p.velocity.copy(this.dir).multiplyScalar(r.range(0.8, 2.6))
+      p.velocity.copy(this.dir).multiplyScalar(r.range(1.6, 3.4))
       p.velocity.y += 0.3
-      p.life = r.range(0.7, 1.5)
-      // Kept small: this card is born 60cm from the player's own lens, and at
-      // half a metre a puff of any size is a screen-wide grey veil.
-      p.sizeStart = r.range(0.07, 0.12) * flashScale
-      p.sizeEnd = r.range(0.28, 0.5) * flashScale
+      p.life = r.range(0.4, 0.8)
+      p.sizeStart = r.range(0.14, 0.24) * flashScale
+      p.sizeEnd = r.range(0.5, 0.85) * flashScale
       p.drag = 3.4
       p.gravity = -0.05
       p.turbulence = 0.22
       p.colorStart.setHex(0xc4beb2, THREE.SRGBColorSpace)
       p.colorEnd.setHex(0x7f7a73, THREE.SRGBColorSpace)
-      p.alphaStart = 0.24 * allow
+      p.alphaStart = 0.3
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(1.4)
       p.tile = r.int(0, 3)
       p.frames = 16
-      p.erode = 0.6
-      p.soft = 0.4
+      p.erode = 0.45
+      p.soft = 0.7
       this.worldParticles.emit('smoke', time)
     }
 

@@ -158,7 +158,7 @@ export class Ambient {
 
   /** Sand and grit skittering along the ground on the wind. */
   private groundDrift(ctx: GameContext, time: number, dt: number): void {
-    if (this.particles.allowance() < 0.5) return
+    if (this.particles.allowance() < 0.6) return
     const interval = ctx.config.particleBudget >= 8000 ? 1 / 9 : 1 / 4
     this.driftTimer -= dt
     let spawned = 0
@@ -211,7 +211,7 @@ export class Ambient {
     if (ctx.config.particleBudget < 4000) return
     // Atmosphere is the first thing to give way when the frame is already
     // carrying combat smoke: it is the layer nobody would miss.
-    if (this.particles.allowance() < 0.6) return
+    if (this.particles.allowance() < 0.8) return
     const interval = 1 / 6
     this.hazeTimer -= dt
     let spawned = 0

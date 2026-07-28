@@ -5,6 +5,7 @@ import { ShadowCascade } from './lighting/ShadowCascade'
 import { LightPool, type LightLease } from './lighting/LightPool'
 import { LightShafts } from './lighting/LightShafts'
 import { SkyOcclusion } from './lighting/SkyOcclusion'
+import { IrradianceVolume } from './lighting/IrradianceVolume'
 import { AerialPerspective } from './lighting/AerialPerspective'
 import {
   DEFAULT_TIME_OF_DAY, SKY_PARAMS, SKY_SCALE_VISIBLE,
@@ -174,6 +175,7 @@ export class LightingSystem implements System, LightingService {
   private pool!: LightPool
   private shafts!: LightShafts
   private readonly occlusion = new SkyOcclusion()
+  private readonly irradiance = new IrradianceVolume()
   private readonly aerial = new AerialPerspective()
   private hemisphere = new THREE.HemisphereLight(0x9dbdea, 0x6a5c46, HEMISPHERE_INTENSITY)
   private fog = new THREE.FogExp2(0xb9c9d8, RESIDUAL_FOG_DENSITY)
@@ -192,6 +194,8 @@ export class LightingSystem implements System, LightingService {
   private readonly sunTint = new THREE.Color()
   private readonly ambientTint = new THREE.Color()
   private readonly bounceTint = new THREE.Color()
+  /** Key-light irradiance on a perpendicular surface, for the probe bake. */
+  private readonly sunIrradiance = new THREE.Color()
   /** Pre-shoulder sky radiance for the current view direction, scene-referred. */
   private readonly fogSample = new THREE.Vector3()
   private readonly muzzleColor = new THREE.Color(1.0, 0.86, 0.62)
@@ -264,6 +268,12 @@ export class LightingSystem implements System, LightingService {
     this.cascade?.setLightDirection(this.tmpDir.copy(this.sunDirection).negate())
     this.cascade?.setColor(this.sunTint, this.sun.intensity)
     this.environmentDirty = true
+    // The shafts and the irradiance volume are both baked for one sun position
+    // and neither can be re-tinted: half the light in the volume arrived off a
+    // surface the sun no longer reaches. Nothing calls this at runtime today —
+    // the graded poses share one time of day — so it takes the honest path and
+    // re-measures, at the cost of the same load hitch it paid at start-up.
+    this.irradiance.invalidate()
     this.shaftsDirty = true
   }
 
@@ -355,13 +365,54 @@ export class LightingSystem implements System, LightingService {
       // sky, which reads as bright blue rather than gunmetal.
     }
 
-    // Both probes need the level's collision, which lands during the level
+    // Every probe needs the level's collision, which lands during the level
     // system's init, and a settled physics world.
     if (this.shaftsDirty && this.frames > 2) {
       this.shaftsDirty = false
       this.occlusion.bake(ctx)
+      this.bakeIrradiance(ctx)
       this.rebuildShafts(ctx)
     }
+  }
+
+  /**
+   * Measures where the indirect light in this level goes.
+   *
+   * Runs after the occlusion bake, whose grid it adopts, and takes over the
+   * bounce from the constant-direction fallback the moment it succeeds. It is a
+   * one-off load cost near 700ms — measured, see IrradianceVolume's RAYS — and
+   * there is no incremental path: a half-baked volume would light half the level
+   * from a measured direction and the rest from nowhere, which reads worse than
+   * either end state.
+   *
+   * Failure is not fatal. The volume leaves itself unbaked, the fallback bounce
+   * stays on, and the frame is the one the previous round shipped.
+   */
+  private bakeIrradiance(ctx: GameContext): void {
+    const grid = this.occlusion.grid
+    if (!grid) return
+    // Irradiance on a surface facing the sun, in the units the shader's
+    // `irradiance` accumulator is in — colour times intensity, which is what a
+    // directional light contributes before its cosine term. Its luminance is
+    // SUN_TARGET_LUMINANCE by construction; taking it from the live tint and
+    // intensity rather than that constant is what keeps the bake calibrated to
+    // whatever time of day it is baking for.
+    this.sunIrradiance.setRGB(
+      this.sunTint.r * this.sun.intensity,
+      this.sunTint.g * this.sun.intensity,
+      this.sunTint.b * this.sun.intensity,
+      THREE.LinearSRGBColorSpace,
+    )
+
+    try {
+      this.irradiance.bake(
+        ctx, grid, this.sunDirection, this.sunIrradiance,
+        (dir, out) => this.sky.probeRadiance(dir, out),
+      )
+    } catch (err) {
+      console.warn('[lighting] irradiance bake failed', err)
+    }
+    this.occlusion.setFallbackBounce(!this.irradiance.baked)
   }
 
   lateUpdate(dt: number, ctx: GameContext): void {
@@ -525,6 +576,9 @@ export class LightingSystem implements System, LightingService {
   private readonly patchWorldMaterial = (
     shader: { vertexShader: string; fragmentShader: string; uniforms: Record<string, THREE.IUniform> },
   ): void => {
+    // Order matters only in that both must run: the occlusion pass emits the
+    // call to `giIrradiance` and the volume declares it. Neither is optional.
+    this.irradiance.patch(shader)
     this.occlusion.patch(shader)
     this.aerial.patch(shader)
   }
@@ -604,6 +658,7 @@ export class LightingSystem implements System, LightingService {
     this.shafts?.dispose()
     this.pool?.dispose()
     this.occlusion.dispose()
+    this.irradiance.dispose()
     this.sky.dispose()
     this.sun.dispose()
     this.hemisphere.dispose()

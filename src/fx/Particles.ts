@@ -1,5 +1,5 @@
 import * as THREE from 'three'
-import type { FxTextureSet } from './FxTextures'
+import { SMOKE_MASK_FILL, type FxTextureSet } from './FxTextures'
 
 /**
  * One GPU-driven, pooled, instanced particle system.
@@ -88,6 +88,22 @@ uniform vec2  uSheet;
  * flattens local contrast across half the frame.
  */
 uniform vec2  uScreenLimit;
+/**
+ * Global opacity for this group, 0..1. The coverage ledger drives it every
+ * frame so the *rendered* smoke load is clamped rather than merely discouraged.
+ * A spawn-time throttle cannot undo a veil that has already accumulated — and
+ * because a card lives for seconds, a spawn-time throttle is a proportional
+ * controller with a two-second transport delay, which limit-cycles: the frame
+ * gets captured at whatever point in the cycle it lands on. This is the same
+ * budget applied where it cannot be late.
+ */
+uniform float uOpacity;
+/**
+ * x = distance at which a cloud card is fully gone, y = fully present. Cloud
+ * cards spawned inside arm's reach are never readable as volume and are the
+ * single largest contributor to near-field haze, so they are simply not drawn.
+ */
+uniform vec2  uNearFade;
 
 attribute vec4 aOrigin;   // xyz spawn position, w spawn time
 attribute vec4 aVelLife;  // xyz initial velocity, w lifetime
@@ -148,14 +164,18 @@ void main() {
   // thins out as it grows past the fade point and is gone by the cap, so a puff
   // the camera walks into disappears instead of smearing a translucent sheet
   // over the whole frame.
-  float cover = 1.0;
+  float viewDist = max(-mv.z, 1e-4);
+  float cover = uOpacity;
   if (uScreenLimit.y > 0.0) {
-    float projHalf = size * 0.5 * projectionMatrix[1][1] / max(-mv.z, 1e-4);
-    cover = 1.0 - smoothstep(uScreenLimit.x, uScreenLimit.y, projHalf);
-    if (cover <= 0.0) {
-      gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-      return;
-    }
+    float projHalf = size * 0.5 * projectionMatrix[1][1] / viewDist;
+    cover *= 1.0 - smoothstep(uScreenLimit.x, uScreenLimit.y, projHalf);
+  }
+  if (uNearFade.y > uNearFade.x) {
+    cover *= smoothstep(uNearFade.x, uNearFade.y, viewDist);
+  }
+  if (cover <= 0.0) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    return;
   }
 
   vec2 corner = position.xy;
@@ -336,6 +356,8 @@ class ParticleGroup {
           uGravity: { value: new THREE.Vector3(0, -9.81, 0) },
           uSheet: { value: new THREE.Vector2(4, 4) },
           uScreenLimit: { value: new THREE.Vector2(0, 0) },
+          uOpacity: { value: 1 },
+          uNearFade: { value: new THREE.Vector2(0, 0) },
         },
       ]),
       vertexShader: VERT,
@@ -403,14 +425,27 @@ class ParticleGroup {
     ;(this.material.uniforms.uScreenLimit.value as THREE.Vector2).set(fadeStart, cap)
   }
 
+  setOpacity(v: number): void {
+    this.material.uniforms.uOpacity.value = v
+  }
+
+  setNearFade(hidden: number, visible: number): void {
+    ;(this.material.uniforms.uNearFade.value as THREE.Vector2).set(hidden, visible)
+  }
+
   dispose(): void {
     this.geometry.dispose()
     this.material.dispose()
   }
 }
 
-/** Slots in the coverage ledger. Roughly ten seconds of sustained fire. */
-const LEDGER = 1024
+/**
+ * Slots in the coverage ledger. Every live cloud card needs one: a slot that
+ * gets recycled while its card is still alive is coverage the ledger stops
+ * seeing, and undercounting is exactly the failure mode that lets a veil build.
+ * Five seconds of a seven-shooter firefight fits inside this.
+ */
+const LEDGER = 4096
 /**
  * Cards covering less of the frame than this are not tracked. It exists to keep
  * the ledger's slots for the cards that can actually veil the frame: a 2cm chip
@@ -418,7 +453,9 @@ const LEDGER = 1024
  * dust puff at 5m is 8e-5 and there are hundreds of those too — one group is
  * the problem and the other is rounding error.
  */
-const LEDGER_FLOOR = 2e-5
+const LEDGER_FLOOR = 2e-6
+/** Groups the coverage budget governs. Hard effects are not clouds. */
+const CLOUD_GROUPS: readonly GroupKey[] = ['smoke', 'smokeAdd']
 
 export class Particles {
   /** Shared scratch used by every emitter; never allocate to spawn. */
@@ -440,11 +477,17 @@ export class Particles {
   private readonly ledgerAmount = new Float32Array(LEDGER)
   private ledgerHead = 0
   private coverage = 0
+  /** Low-passed `coverage`, so the spawn throttle cannot chase its own tail. */
+  private smoothed = 0
+  /** Live opacity multiplier on the cloud groups. */
+  private gain = 1
   private readonly viewpoint = new THREE.Vector3()
   /** projectionMatrix[1][1], i.e. 1 / tan(vfov / 2). */
   private focal = 1.19
   private aspect = 16 / 9
   private readonly budget: number
+  private screenFade = 0
+  private screenCap = 0
 
   constructor(scene: THREE.Scene, budget: number, textures: FxTextureSet, soft: boolean, coverageBudget = 0.030) {
     this.budget = Math.max(1e-4, coverageBudget)
@@ -479,7 +522,10 @@ export class Particles {
       const until = time + p.life
       if (until > this.softUntil) this.softUntil = until
     }
-    this.charge(p, time)
+    // Only cloud cards are costed, because only cloud cards are clamped. The
+    // ledger and the clamp have to govern the same population or the clamp
+    // corrects for coverage it cannot remove.
+    if (key === 'smoke' || key === 'smokeAdd') this.charge(p, time)
   }
 
   /** True while any depth-fading particle is alive, so the prepass can idle. */
@@ -490,6 +536,19 @@ export class Particles {
   update(time: number): void {
     for (const g of this.groups.values()) g.flush(time)
     this.settle(time)
+
+    // Clamp what is *drawn*, not just what is spawned. `coverage` is the
+    // estimated fraction of the frame live cloud cards will cover; if that is
+    // over budget, every cloud card is thinned by exactly the ratio that brings
+    // it back. The result is a hard ceiling on the veil that does not depend on
+    // guessing an emission rate, and it holds no matter how many emitters exist
+    // or how long the fight has been running.
+    const want = this.coverage > this.budget ? this.budget / this.coverage : 1
+    // Smoothed so the frame does not pulse; converges inside the frozen tail
+    // the capture harness renders before it reads pixels.
+    this.gain += (want - this.gain) * 0.3
+    this.smoothed += (this.coverage - this.smoothed) * 0.2
+    for (const key of CLOUD_GROUPS) this.groups.get(key)?.setOpacity(this.gain)
   }
 
   // --- screen coverage ledger ------------------------------------------------
@@ -506,19 +565,32 @@ export class Particles {
   }
 
   /**
-   * The fraction of the frame this card will cover, averaged over its life.
-   * A disc of world radius `r` at distance `d` occupies `pi (r f / d)^2` of the
-   * NDC box's area of `4 * aspect`; the 0.48 accounts for the circular mask the
-   * fragment shader applies inside the quad, and 0.42 for the fact that a mask
-   * is nowhere near solid across its own footprint.
+   * The fraction of the frame this card will cover, averaged over its life —
+   * that is, its contribution to the frame's mean alpha.
+   *
+   * The quad spans `size` metres, so at distance `d` it spans `size * f / d` in
+   * NDC half-height units, of a box whose area in those units is `4 * aspect`.
+   * `SMOKE_MASK_FILL` is the measured mean alpha of a smoke cell — the mask is
+   * nowhere near solid across its own quad and assuming it is over-costs every
+   * card by a factor of two. `0.82` is the integral of the birth and death
+   * fades the vertex shader applies. The screen-size cap is folded in as well,
+   * so a card the cap is already erasing is not charged for coverage it never
+   * gets to draw.
    */
   private coverageOf(p: ParticleParams): number {
     const dist = this.viewpoint.distanceTo(p.position)
     if (dist < 0.05) return 0
     const size = (p.sizeStart + p.sizeEnd) * 0.5
-    const r = 0.48 * size * this.focal / dist
-    const alpha = (p.alphaStart + p.alphaEnd) * 0.5
-    return (Math.PI * r * r) / (4 * this.aspect) * alpha * 0.42
+    const span = size * this.focal / dist
+    let cover = 1
+    if (this.screenCap > this.screenFade) {
+      const t = (span * 0.5 - this.screenFade) / (this.screenCap - this.screenFade)
+      const c = t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t)
+      cover = 1 - c
+      if (cover <= 0) return 0
+    }
+    const alpha = (p.alphaStart + p.alphaEnd) * 0.5 * 0.82
+    return (span * span) / (4 * this.aspect) * alpha * SMOKE_MASK_FILL * cover
   }
 
   private charge(p: ParticleParams, time: number): void {
@@ -551,16 +623,23 @@ export class Particles {
   }
 
   /**
-   * The multiplier an emitter should fold into the count and opacity of any
-   * *cloud* layer — dust, propellant smoke, haze. It is 1 while the frame is
-   * clear and falls away as the budget fills, so a firefight with seven
-   * shooters produces a scene with smoke in it rather than a scene behind
-   * smoke. Hard effects (sparks, chips, decals) ignore it: they are what makes
-   * the impact read, and they cost almost nothing in coverage.
+   * The multiplier an emitter should fold into the count of any *cloud* layer —
+   * dust, propellant smoke, haze. It is 1 while the frame is clear and reaches
+   * zero once the budget is full, so a firefight with seven shooters produces a
+   * scene with smoke in it rather than a scene behind smoke. Hard effects
+   * (sparks, chips, decals) ignore it: they are what makes the impact read, and
+   * they cost almost nothing in coverage.
+   *
+   * It reads the *smoothed* load rather than the instantaneous one. A cloud
+   * card lives for seconds, so throttling on the raw figure is a proportional
+   * controller with a multi-second transport delay and it limit-cycles — the
+   * frame ends up either bare or buried depending on where in the cycle the
+   * shutter falls. The rendered clamp in `update` is what actually guarantees
+   * the ceiling; this only keeps the fill rate sensible.
    */
   allowance(): number {
-    const k = 1 - this.coverage / this.budget
-    return k < 0.1 ? 0.1 : k > 1 ? 1 : k
+    const k = 1 - this.smoothed / this.budget
+    return k < 0 ? 0 : k > 1 ? 1 : k
   }
 
   setDepth(depth: THREE.Texture | null, near: number, far: number): void {
@@ -574,7 +653,19 @@ export class Particles {
    * lives 40cm from the lens and is *supposed* to be large.
    */
   setScreenLimit(fadeStart: number, cap: number): void {
+    this.screenFade = fadeStart
+    this.screenCap = cap
     for (const g of this.groups.values()) g.setScreenLimit(fadeStart, cap)
+  }
+
+  /**
+   * Distance band over which cloud cards fade in. Everything closer than
+   * `hidden` is not drawn at all: a dust puff one metre from the lens is never
+   * legible as volume, it is only a translucent sheet across the sharpest part
+   * of the frame, and it is the dominant term in the near-field haze figure.
+   */
+  setCloudNearFade(hidden: number, visible: number): void {
+    for (const key of CLOUD_GROUPS) this.groups.get(key)?.setNearFade(hidden, visible)
   }
 
   setVisible(v: boolean): void {

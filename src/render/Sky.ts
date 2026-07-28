@@ -1,7 +1,7 @@
 import * as THREE from 'three'
 import {
   SKY_GLSL, SKY_PARAMS, SKY_SCALE_ENV, SKY_SCALE_VISIBLE, SUN_DISC_RADIANCE,
-  betaMie, betaRayleigh, skyRadiance, sunIntensity, type SkyParams,
+  betaMie, betaRayleigh, skyRadiance, skyShoulder, sunIntensity, type SkyParams,
 } from './lighting/SkyModel'
 
 const DOME_RADIUS = 800
@@ -240,6 +240,45 @@ export class SkyDome {
     u.uScale.value = visibleScale
     previous?.dispose()
     return this.envTarget.texture
+  }
+
+  /**
+   * What the environment probe emits in a direction: the same expression the
+   * probe scene's fragment shader evaluates, on the CPU, at environment scale
+   * and without the sun disc.
+   *
+   * The irradiance volume gathers "what does this probe see along this ray",
+   * and for a ray that leaves the level the answer has to be *this* number and
+   * not a fresh guess at the sky. If the two ever disagree, a surface receives
+   * one sky through the image-based ambient and a different one through the
+   * bounce, and the seam falls exactly on the openings the bake exists to light.
+   * Reading the live uniforms rather than re-deriving from SKY_PARAMS is what
+   * keeps them from drifting.
+   *
+   * The disc is deliberately absent. `skyRadiance` excludes it, and so does
+   * this: direct sun is the shadow cascade's, and a ray that happened to point
+   * within half a degree of the disc would otherwise inject SUN_DISC_RADIANCE
+   * — eighty, against a sky of about a tenth — into one probe as a spike.
+   */
+  probeRadiance(dir: THREE.Vector3, out: THREE.Vector3): THREE.Vector3 {
+    const u = this.material.uniforms
+    skyRadiance(dir, u.uSunDir.value as THREE.Vector3, this.params, out)
+    out.set(
+      skyShoulder(out.x * SKY_SCALE_ENV),
+      skyShoulder(out.y * SKY_SCALE_ENV),
+      skyShoulder(out.z * SKY_SCALE_ENV),
+    )
+
+    const below = 1 - THREE.MathUtils.smoothstep(dir.y, -(u.uHorizonFade.value as number), 0)
+    if (below <= 0) return out
+    const ground = u.uGroundColor.value as THREE.Vector3
+    // mix( col, mix( col, ground * scale, 0.82 ), below ), collapsed.
+    const t = 0.82 * below
+    return out.set(
+      THREE.MathUtils.lerp(out.x, ground.x * SKY_SCALE_ENV, t),
+      THREE.MathUtils.lerp(out.y, ground.y * SKY_SCALE_ENV, t),
+      THREE.MathUtils.lerp(out.z, ground.z * SKY_SCALE_ENV, t),
+    )
   }
 
   setVisibleScale(scale: number): void {

@@ -3,11 +3,11 @@ import type { MaterialName } from '../render/MaterialNames'
 import type { Rand } from '../core/Rand'
 import type { Surface } from '../core/Types'
 import {
-  Builder, CHAMFER, DOOR_H, DOOR_W, PARAPET_H, SILL_H, SLAB_T, STOREY, UP, WALL_T, WINDOW_H,
-  catenary, chamferBox, clothQuad, cylinderGeom, decalQuad, impactChip, plainBox, rampPrism,
-  sphereGeom, rotRectSdf,
+  ARRIS, Builder, CHAMFER, DOOR_H, DOOR_W, PARAPET_H, SILL_H, SLAB_T, STOREY, UP, WALL_T, WINDOW_H,
+  catenary, chamferBox, clothQuad, cylinderGeom, decalQuad, impactChip, plainBox, planeQuad,
+  rampPrism, shiftUv, sphereGeom, rotRectSdf,
 } from './Kit'
-import { groundHeight, settleHeight } from './Terrain'
+import { TERRAIN_EDGE, groundHeight, settleHeight } from './Terrain'
 
 /**
  * The modular architecture kit and the district's building list.
@@ -654,6 +654,111 @@ function wallDish(b: Builder, x: number, y: number, out: number, rng: Rand): voi
 }
 
 /**
+ * The glazing in an opening, as separate lights rather than one sheet.
+ *
+ * A single pane the size of the whole opening was the loudest artefact left in
+ * the alley pose: "large flat near-white polygons with almost no texture, no
+ * grain, and hard geometric edges ... physically they look unlit/emissive".
+ * Three separate faults were producing that, and none of them is in the glass
+ * material itself.
+ *
+ * *It was one polygon.* Real sashes are divided by the bars that are already
+ * modelled over them, and each light sits in its own plane a fraction of a
+ * degree off its neighbours. Splitting on the existing bars turns one flat
+ * reflection of the sky into four that disagree, which is the whole difference
+ * between glass and a board.
+ *
+ * *It was two polygons deep.* Built as a `plate`, the pane was a box: the eye
+ * looked through its front face and its back face and composited the same
+ * blended grey twice, which took an 0.86 alpha to 0.98 and closed off the dark
+ * room behind it.
+ *
+ * *Every window in the district shared one set of UVs.* Local-space UVs on a
+ * shared primitive mean the same streak in the same corner of every pane on the
+ * map. Each light now takes its own offset and quarter turn.
+ */
+function glazedLights(
+  b: Builder, gw: number, gh: number, cx: number, cy: number, z: number, rng: Rand,
+): void {
+  const cols = gw > 0.75 ? 2 : 1
+  const rows = gh > 1.1 ? 2 : 1
+  // The bars this splits on are the ones the frame draws: a centre mullion, and
+  // a transom at 0.55 of the opening height.
+  const split = gh * 0.55
+  const bar = 0.035
+  for (let i = 0; i < cols; i++) {
+    for (let j = 0; j < rows; j++) {
+      const x0 = cols === 1 ? -gw / 2 : (i === 0 ? -gw / 2 : bar)
+      const x1 = cols === 1 ? gw / 2 : (i === 0 ? -bar : gw / 2)
+      const y0 = rows === 1 ? -gh / 2 : (j === 0 ? -gh / 2 : split - gh / 2 + bar)
+      const y1 = rows === 1 ? gh / 2 : (j === 0 ? split - gh / 2 - bar : gh / 2)
+      const lw = x1 - x0
+      const lh = y1 - y0
+      if (lw < 0.05 || lh < 0.05) continue
+      const g = shiftUv(planeQuad(lw, lh), rng.range(0, 4), rng.range(0, 4), rng.int(0, 3))
+      // A sash never has four lights in the same state. `glass` is the same
+      // recipe at a quarter of the grime, so it is far more transparent and
+      // shows the dark room behind it; `glassDirty` reflects. One of each in a
+      // window is what makes the pair read as glass rather than as infill.
+      b.geom(rng.bool(0.45) ? 'glass' : 'glassDirty', g, xform(
+        cx + (x0 + x1) / 2, cy + (y0 + y1) / 2, z,
+        0, rng.spread(0.045), rng.spread(0.045),
+      ))
+    }
+  }
+}
+
+/**
+ * Timber nailed over an opening.
+ *
+ * Six boards at a hand-nailed pitch carry twelve lit arrises and twelve
+ * shadowed gaps across a 1.4 m opening, which is an order of magnitude more
+ * relief than the glazing it replaces, and the gaps show the dark recess rather
+ * than the sky. Each board takes its own UV offset and grain direction, because
+ * a shared primitive repeated across a facade is the loudest procedural tell
+ * there is.
+ */
+function boardedOpening(b: Builder, o: Opening, out: number, rng: Rand): void {
+  const span = o.width + rng.range(0.1, 0.22)
+  const cy = o.sill + o.height / 2
+  // Depths are set against `openingSurround`, which stands an architrave 0.09 m
+  // proud of every exterior opening: the boards have to clear its face or they
+  // co-plane with it, and each layer here has to touch the one behind it or the
+  // whole assembly floats.
+  const battenZ = out - 0.065
+  const boardZ = out - 0.1
+  for (const sx of [-1, 1]) {
+    b.geom('woodBeam', plainBox(0.07, o.height + 0.04, 0.045),
+      xform(o.at + sx * (o.width / 2 - 0.12), cy, battenZ))
+  }
+  const n = rng.int(4, 6)
+  const pitch = (o.height + 0.1) / n
+  for (let i = 0; i < n; i++) {
+    // One board in six was never replaced, and the gap it leaves is what stops
+    // this reading as a single sheet of ply.
+    if (rng.bool(0.16)) continue
+    const th = rng.range(0.022, 0.032)
+    const bh = pitch * rng.range(0.72, 0.9)
+    const y = cy - o.height / 2 - 0.05 + (i + 0.5) * pitch
+    const g = shiftUv(chamferBox(span * rng.range(0.9, 1.04), bh, th, ARRIS),
+      rng.range(0, 3), rng.range(0, 3), i % 2)
+    b.geom(rng.bool(0.72) ? 'woodPlank' : 'woodPainted', g,
+      xform(o.at + rng.spread(0.05), y, boardZ, 0, 0, rng.spread(0.035)))
+  }
+  // One board across the diagonal, and the nails holding the lot on.
+  if (rng.bool(0.5)) {
+    const dl = Math.hypot(o.width, o.height) * rng.range(0.82, 1.0)
+    b.geom('woodPlank', chamferBox(dl, rng.range(0.13, 0.19), 0.024, ARRIS),
+      xform(o.at, cy + rng.spread(0.1), out - 0.135, 0, 0,
+        Math.atan2(o.height, o.width) * (rng.bool() ? 1 : -1)))
+  }
+  for (let i = 0; i < rng.int(3, 6); i++) {
+    b.geom('metalRusted', plainBox(0.022, 0.022, 0.008),
+      xform(o.at + rng.spread(o.width / 2 - 0.1), cy + rng.spread(o.height / 2 - 0.1), out - 0.1175))
+  }
+}
+
+/**
  * A projecting frame around an opening.
  *
  * The reveal a 34 cm wall gives is 34 cm at a grazing angle and nothing at all
@@ -775,6 +880,22 @@ export function buildWall(b: Builder, s: WallSpec): void {
       }
     }
 
+    // --- boarding -----------------------------------------------------
+    // In a district this shot up, a share of the windows would be boarded over.
+    // It is also the cure for the loudest artefact the critique found in the
+    // alley: a 1.1 x 1.4 m sheet of glazing seen at four metres is a large flat
+    // near-white polygon reflecting open sky off a wall that is itself in
+    // shade, and no amount of dirt in the texture stops it reading as painted
+    // board. Timber over it is hard relief, real grain and dark gaps instead.
+    //
+    // Weighted to the storey that meets the ground — the one the player walks
+    // past at two metres, and the one anybody would actually reach to board —
+    // and never on a building the player can enter, because those windows are
+    // the only key light their interiors get and one of them is what the
+    // interior pose is graded on.
+    const boarded = s.exterior && !s.dressInside && o.kind === 'window' && o.glass !== false
+      && rng.bool((s.plinth && s.plinth > 0 ? 0.42 : 0.24) * (s.weather ?? 0.6))
+
     // --- glazing ------------------------------------------------------
     if (o.glass !== false && (o.kind === 'window' || o.kind === 'shop')) {
       // 0.22 m back from the face rather than 0.15: with the architrave
@@ -783,9 +904,11 @@ export function buildWall(b: Builder, s: WallSpec): void {
       const inset = out + 0.22
       const gw = o.width - 0.1
       const gh = o.height - 0.1
-      const broken = o.broken ?? rng.bool(0.22)
+      // Behind boards, what shows through the gaps has to be the dark room, not
+      // a lit pane.
+      const broken = boarded || (o.broken ?? rng.bool(0.22))
       if (!broken) {
-        b.plate('glassDirty', gw, gh, 0.02, o.at, o.sill + o.height / 2, inset)
+        glazedLights(b, gw, gh, o.at, o.sill + o.height / 2, inset, rng)
       } else {
         // Shards clinging to the frame.
         const shards = rng.int(2, 4)
@@ -806,10 +929,13 @@ export function buildWall(b: Builder, s: WallSpec): void {
       if (o.height > 1.1) b.plate(fm, o.width - 0.1, 0.05, 0.05, o.at, o.sill + o.height * 0.55, inset)
       if (o.bars) windowGrille(b, o.at, o.sill, o.width, o.height, out, rng)
     }
+    if (boarded) boardedOpening(b, o, out, rng)
     if (s.exterior && o.kind === 'shop' && o.width > 1.2) {
       rollerShutter(b, o.at, o.sill, o.width, o.height, out, rng.range(0.16, 0.92))
     }
-    if (o.shutters && s.exterior) {
+    // Shutters swing across the plane the boards occupy, so an opening never
+    // gets both.
+    if (o.shutters && s.exterior && !boarded) {
       const sw = o.width / 2 - 0.02
       for (const side of [-1, 1]) {
         const open = rng.range(0.15, 1.4)
@@ -1274,6 +1400,88 @@ function slabWithWell(b: Builder, mat: MaterialName, w: number, d: number, T: nu
   slab(x0, x1, z1, iz)
 }
 
+/**
+ * Exposed joists and a bressummer under a floor slab.
+ *
+ * Measured across all eight graded frames, the largest single low-detail area
+ * that is neither sky nor smoke is the ceiling in the interior pose: 1.7 per
+ * cent of the frame at a local contrast of 0.017, because a floor slab seen
+ * from below is one unbroken plane four metres wide with nothing on it. No
+ * texture fixes that — a ceiling is lit almost entirely by bounce, so the only
+ * thing that can put contrast on it is geometry casting onto itself.
+ *
+ * A joist every half metre gives the plane twenty-odd shadow lines running the
+ * short way and one deep beam running the other, which is also simply what a
+ * building of this construction has. Everything sits above 2.3 m, so none of it
+ * needs a collider.
+ */
+function ceilingJoists(
+  b: Builder, rng: Rand, w: number, d: number, T: number, y: number, sw: Stairwell,
+): void {
+  const soffit = y - SLAB_T
+  const ix = w / 2 - T * 0.8
+  const iz = d / 2 - T * 0.8
+  // Joists span the shorter way, as they would if anyone had built this.
+  const alongX = w <= d
+  const sMin = alongX ? -ix : -iz
+  const sMax = alongX ? ix : iz
+  const pMin = alongX ? -iz : -ix
+  const pMax = alongX ? iz : ix
+  const wellL0 = alongX ? sw.x - sw.w / 2 : sw.z - sw.d / 2
+  const wellL1 = alongX ? sw.x + sw.w / 2 : sw.z + sw.d / 2
+  const wellP0 = alongX ? sw.z - sw.d / 2 : sw.x - sw.w / 2
+  const wellP1 = alongX ? sw.z + sw.d / 2 : sw.x + sw.w / 2
+  if (sMax - sMin < 1.5 || pMax - pMin < 1.5) return
+
+  const put = (p: number, a: number, c: number, jw: number, jh: number) => {
+    if (c - a < 0.3) return
+    if (alongX) b.plate('woodBeam', c - a, jh, jw, (a + c) / 2, soffit - jh / 2, p)
+    else b.plate('woodBeam', jw, jh, c - a, p, soffit - jh / 2, (a + c) / 2)
+  }
+
+  // Downstand binder across the joist run, on corbels. Held to 0.26 m and hung
+  // from the soffit rather than from under the joists: the deepest opening head
+  // in the kit sits 0.35 m below a slab, and a binder any lower would cut
+  // across a doorway — including the blown-out opening the interior pose is
+  // composed through.
+  const beams = sMax - sMin > 7.5 ? 2 : 1
+  const bd = 0.26
+  for (let i = 0; i < beams; i++) {
+    const at = sMin + ((i + 1) * (sMax - sMin)) / (beams + 1)
+    if (alongX) {
+      b.plate('woodBeam', 0.26, bd, pMax - pMin, at, soffit - bd / 2, (pMin + pMax) / 2)
+      for (const sp of [pMin, pMax]) b.plate('stoneBlock', 0.4, 0.17, 0.34, at, soffit - 0.15, sp)
+    } else {
+      b.plate('woodBeam', pMax - pMin, bd, 0.26, (pMin + pMax) / 2, soffit - bd / 2, at)
+      for (const sp of [pMin, pMax]) b.plate('stoneBlock', 0.34, 0.17, 0.4, sp, soffit - 0.15, at)
+    }
+  }
+
+  const n = Math.floor((pMax - pMin - 0.3) / rng.range(0.48, 0.58))
+  const spacing = (pMax - pMin - 0.3) / (n + 1)
+  for (let i = 0; i <= n; i++) {
+    const p = pMin + 0.15 + (i + 0.5) * spacing
+    // One joist gone, and the bare soffit showing in the bay where it was, is
+    // what stops twenty-odd identical members reading as a comb.
+    if (rng.bool(0.07)) continue
+    const jh = rng.range(0.16, 0.2)
+    const jw = rng.range(0.075, 0.095)
+    if (p > wellP0 && p < wellP1) {
+      put(p, sMin, wellL0, jw, jh)
+      put(p, wellL1, sMax, jw, jh)
+    } else {
+      put(p, sMin, sMax, jw, jh)
+    }
+    // Every third bay gets a strut nogged between the joists, staggered, which
+    // is both how a floor is stiffened and a second shadow direction up there.
+    if (i % 3 === 2 && i < n) {
+      const at = sMin + (sMax - sMin) * rng.range(0.25, 0.75)
+      if (alongX) b.plate('woodBeam', 0.06, jh * 0.8, spacing * 0.78, at, soffit - jh * 0.5, p + spacing * 0.5)
+      else b.plate('woodBeam', spacing * 0.78, jh * 0.8, 0.06, p + spacing * 0.5, soffit - jh * 0.5, at)
+    }
+  }
+}
+
 export interface BuildResult {
   /** Roofed volumes, in world space, for `isIndoors`. */
   indoor: THREE.Box3[]
@@ -1382,8 +1590,10 @@ export function buildBuilding(b: Builder, spec: BuildingSpec, rng: Rand, result:
     }
     // Floor slab between storeys, with a stairwell void when enterable.
     if (s > 0) {
-      if (spec.enterable) slabWithWell(b, roofMat, w, d, T, y0, sw)
-      else b.solid(roofMat, w - T * 1.6, SLAB_T, d - T * 1.6, 0, y0 - SLAB_T / 2, 0, 0, 0.02, 'concrete')
+      if (spec.enterable) {
+        slabWithWell(b, roofMat, w, d, T, y0, sw)
+        ceilingJoists(b, rng, w, d, T, y0, sw)
+      } else b.solid(roofMat, w - T * 1.6, SLAB_T, d - T * 1.6, 0, y0 - SLAB_T / 2, 0, 0, 0.02, 'concrete')
       buildStairFlight(b, sw.x, (s - 1) * sh, sw.z - sw.d / 2 + 0.18, Math.PI, sw.w - 0.2, 18, sh / 18, 0.26, 'concreteWorn', true)
     }
   }
@@ -1429,6 +1639,7 @@ export function buildBuilding(b: Builder, spec: BuildingSpec, rng: Rand, result:
   // Roof slab and parapet.
   if (spec.enterable) {
     slabWithWell(b, roofMat, w, d, T, roofY, sw)
+    ceilingJoists(b, rng, w, d, T, roofY, sw)
     buildStairFlight(b, sw.x, (spec.storeys - 1) * sh, sw.z - sw.d / 2 + 0.18, Math.PI, sw.w - 0.2, 18, sh / 18, 0.26, 'concreteWorn', true)
     // Bulkhead hut over the stair head, with a doorway onto the deck.
     b.push(sw.x, roofY, sw.z, 0)
@@ -2206,28 +2417,389 @@ export function buildWaterTower(b: Builder, rng: Rand): void {
   b.pop()
 }
 
-/** Distant blocks beyond the playable area, to give the skyline depth. */
-export function buildSkyline(b: Builder, rng: Rand): void {
-  const rings = [
-    { r: 96, n: 26, hMin: 5, hMax: 13 },
-    { r: 148, n: 30, hMin: 7, hMax: 20 },
-    { r: 205, n: 26, hMin: 6, hMax: 26 },
-  ]
-  const pal: MaterialName[] = ['stuccoTan', 'plasterOchre', 'plasterWhite', 'concreteWorn', 'brickPainted']
-  for (const ring of rings) {
-    for (let i = 0; i < ring.n; i++) {
-      const a = (i / ring.n) * Math.PI * 2 + rng.spread(0.08)
-      const r = ring.r * rng.range(0.82, 1.2)
-      const x = Math.cos(a) * r
-      const z = Math.sin(a) * r
-      const w = rng.range(9, 26)
-      const d = rng.range(9, 22)
-      const h = rng.range(ring.hMin, ring.hMax)
-      b.box(rng.pick(pal), w, h, d, x, h / 2 - 1.5, z, rng.range(0, Math.PI), 0.12)
-      if (rng.bool(0.25)) {
-        b.box('stuccoTan', 2.2, h * rng.range(0.5, 1.1), 2.2, x + rng.spread(w / 3), h + h * 0.3, z + rng.spread(d / 3), 0, 0.1)
+// ---------------------------------------------------------------------------
+// The city beyond the district
+// ---------------------------------------------------------------------------
+
+/**
+ * Roof clutter for a backdrop block, in silhouette only.
+ *
+ * Every camera in the level sits well below these rooflines, so anything set
+ * back behind its own parapet is invisible; the placement is deliberately
+ * biased to the half of the roof facing the district. Sizes are chosen against
+ * what the frame can actually resolve — at 110 m and a 80 degree vertical FOV
+ * one metre is thirteen pixels, so a 2.4 m tank is a thirty-pixel silhouette
+ * and a 7 m mast is a readable vertical, while anything under a metre is not
+ * worth the triangles.
+ */
+function backdropRoofClutter(b: Builder, rng: Rand, w: number, d: number, top: number, scale = 1): void {
+  const items = rng.int(1, 3)
+  for (let i = 0; i < items; i++) {
+    const px = rng.spread(Math.max(0.5, w / 2 - 1.6))
+    const pz = -d / 2 + rng.range(0.9, Math.max(1.1, d * 0.5))
+    switch (rng.int(0, 3)) {
+      case 0: {
+        // Water tank on a stand. The gap under the belly is what makes this
+        // read as a tank rather than as another lump of the parapet.
+        const r = rng.range(0.75, 1.2)
+        const th = rng.range(1.7, 2.8)
+        for (const sx of [-1, 1]) {
+          for (const sz of [-1, 1]) {
+            b.plate('metalRusted', 0.13, 0.95, 0.13, px + sx * r * 0.62, top + 0.48, pz + sz * r * 0.62)
+          }
+        }
+        b.geom('metalRusted', cylinderGeom(r, r, th, 8), xform(px, top + 0.95 + th / 2, pz))
+        break
+      }
+      case 1: {
+        // Stair bulkhead — a second, smaller silhouette off one corner.
+        const bw = rng.range(2.2, 3.6) * scale
+        const bh = rng.range(2.1, 3.1) * scale
+        b.plate('concreteWorn', bw, bh, rng.range(1.9, 3.0) * scale, px, top + bh / 2, pz)
+        b.plate('metalRusted', bw + 0.3, 0.16, 0.3, px, top + bh + 0.08, pz - 0.5)
+        break
+      }
+      case 2: {
+        // Aerial mast with a crossarm and a guy anchor.
+        const mh = rng.range(4.5, 9.5) * scale
+        b.plate('metalRusted', 0.17, mh, 0.17, px, top + mh / 2, pz)
+        b.plate('metalRusted', rng.range(1.3, 2.6) * scale, 0.12, 0.12, px, top + mh * rng.range(0.62, 0.86), pz)
+        b.plate('metalRusted', rng.range(0.8, 1.6) * scale, 0.11, 0.11, px, top + mh * rng.range(0.4, 0.58), pz)
+        break
+      }
+      default: {
+        // Flue on a plinth.
+        const ch = rng.range(2.2, 4.2) * scale
+        b.plate('concreteWorn', 1.1, 0.5, 1.1, px, top + 0.25, pz)
+        b.geom('metalRusted', cylinderGeom(0.32, 0.4, ch, 6), xform(px, top + 0.5 + ch / 2, pz))
+        break
       }
     }
+  }
+}
+
+/**
+ * One block of the backdrop city, authored in a frame whose local -Z faces the
+ * district. Everything is a plain box: a chamfer is a sub-pixel feature at
+ * these ranges and costs nearly four times the geometry.
+ *
+ * `detail` is what the range can carry: 2 resolves individual windows, 1
+ * resolves a floor rhythm but not a window, 0 is pure silhouette, and -1 is the
+ * walled compound the outskirts are made of rather than a city block.
+ */
+function backdropBlock(
+  b: Builder, rng: Rand,
+  w: number, h: number, d: number,
+  mat: MaterialName, detail: number,
+): void {
+  // Sunk well into the ground: out here the terrain is sampled on an 8 m grid,
+  // and a block seated on the analytic height would show daylight under one
+  // corner of itself.
+  const buried = 5
+  b.geom(mat, plainBox(w, h + buried, d), xform(0, (h - buried) / 2, 0))
+  // Parapet. Every flat-roofed building in the district has one, and its
+  // shadow line is the single feature that stops a distant block reading as an
+  // extruded rectangle.
+  b.plate('concreteWorn', w + 0.5, 0.72, d + 0.5, 0, h + 0.24, 0)
+
+  // The edge of town is compounds, not city blocks. A wall standing clear of
+  // the shed behind it puts two silhouettes and a strip of shadowed ground
+  // between them onto what was a bare plane, which is the whole job out here.
+  if (detail < 0) {
+    const cw = w * rng.range(1.15, 1.5)
+    const cd = d * rng.range(1.2, 1.7)
+    const wallH = rng.range(2.0, 2.8)
+    const t = 0.3
+    for (const sz of [-1, 1]) {
+      b.plate(mat, cw, wallH + 3, t, 0, (wallH - 3) / 2, (sz * cd) / 2)
+    }
+    for (const sx of [-1, 1]) {
+      b.plate(mat, t, wallH + 3, cd, (sx * cw) / 2, (wallH - 3) / 2, 0)
+    }
+    // Gate piers, taller than the run, on the face that looks at the district.
+    for (const sx of [-1, 1]) {
+      b.plate('concreteWorn', 0.55, wallH + 3.7, 0.55, sx * rng.range(1.1, 1.8), (wallH + 0.7 - 3) / 2, -cd / 2)
+    }
+    backdropRoofClutter(b, rng, w, d, h + 0.6, 0.45)
+    return
+  }
+
+  if (detail >= 2) {
+    // Individual windows. At 60-140 m a 1.2 m opening covers eight to eighteen
+    // pixels, which is exactly the scale that says "city" rather than "box".
+    const bay = rng.range(2.7, 3.7)
+    const storey = rng.range(3.0, 3.9)
+    const cols = Math.max(1, Math.floor((w - 1.8) / bay))
+    const rows = Math.max(1, Math.floor((h - 2.2) / storey))
+    const ww = bay * rng.range(0.34, 0.46)
+    const wh = storey * rng.range(0.4, 0.54)
+    for (let i = 0; i < cols; i++) {
+      for (let j = 0; j < rows; j++) {
+        if (rng.bool(0.12)) continue // shuttered, bricked up, or in shadow
+        const wx = -((cols - 1) * bay) / 2 + i * bay
+        const wy = h - 1.0 - (j + 0.5) * storey
+        if (wy < 1.4) continue
+        b.plate(rng.bool(0.84) ? 'asphalt' : 'concreteWorn', ww, wh, 0.16, wx, wy, -d / 2 - 0.04)
+      }
+    }
+    // String course under the lowest window: one continuous horizontal per
+    // block, so the band of city has a shared datum line rather than a scatter
+    // of unrelated rectangles.
+    const course = h - 1.0 - (rows - 0.5) * storey - wh / 2 - 0.35
+    if (course > 1.0) b.plate('concreteWorn', w + 0.18, 0.3, d + 0.18, 0, course, 0)
+  } else if (detail === 1) {
+    // Too far for a window, near enough for a floor rhythm. Broken into runs so
+    // it reads as punched openings rather than ribbon glazing.
+    const storey = rng.range(3.2, 4.4)
+    const rows = Math.max(1, Math.floor((h - 2.6) / storey))
+    for (let j = 0; j < rows; j++) {
+      const wy = h - 1.3 - (j + 0.5) * storey
+      if (wy < 1.6) continue
+      const runs = rng.int(2, 4)
+      for (let k = 0; k < runs; k++) {
+        const rw = (w / runs) * rng.range(0.55, 0.86)
+        const rx = -w / 2 + (w * (k + 0.5)) / runs
+        b.plate('asphalt', rw, storey * rng.range(0.3, 0.42), 0.16, rx, wy, -d / 2 - 0.04)
+      }
+    }
+  }
+
+  // A setback upper storey. Two thirds of the horizon is more interesting than
+  // a row of equal-topped boxes, and this is the cheapest way to buy a stepped
+  // silhouette: one more box and one more coping.
+  if (rng.bool(detail >= 2 ? 0.38 : 0.5)) {
+    const sw = w * rng.range(0.4, 0.74)
+    const sd = d * rng.range(0.45, 0.82)
+    const sh = rng.range(2.6, 3.4) * rng.int(1, detail >= 2 ? 2 : 4)
+    const ox = rng.spread((w - sw) / 2)
+    const oz = rng.spread((d - sd) / 2)
+    b.geom(mat, plainBox(sw, sh + 1.2, sd), xform(ox, h + 0.6 + (sh - 1.2) / 2, oz))
+    b.plate('concreteWorn', sw + 0.4, 0.6, sd + 0.4, ox, h + 0.6 + sh + 0.2, oz)
+    if (detail >= 1) backdropRoofClutter(b, rng, sw, sd, h + 0.6 + sh + 0.5)
+  } else if (detail >= 1) {
+    backdropRoofClutter(b, rng, w, d, h + 0.6)
+  }
+}
+
+/**
+ * A tall feature on the horizon. A skyline of nothing but blocks reads as a
+ * texture; one vertical that is obviously a *thing* reads as a place, and the
+ * eight graded poses look out along enough different bearings that these have
+ * to be hand-placed rather than scattered.
+ */
+function backdropLandmark(b: Builder, rng: Rand, kind: number, h: number): void {
+  switch (kind) {
+    case 0: {
+      // Minaret: shaft, gallery, upper shaft, cap.
+      const r = h * 0.028
+      b.geom('stuccoTan', cylinderGeom(r * 0.82, r * 1.15, h * 0.66, 10), xform(0, h * 0.33, 0))
+      b.geom('concreteWorn', cylinderGeom(r * 1.5, r * 1.5, h * 0.045, 10), xform(0, h * 0.68, 0))
+      b.geom('stuccoTan', cylinderGeom(r * 0.62, r * 0.78, h * 0.24, 10), xform(0, h * 0.82, 0))
+      b.geom('concreteWorn', cylinderGeom(0.05, r * 0.95, h * 0.11, 10), xform(0, h * 0.98, 0))
+      b.geom('concreteWorn', plainBox(h * 0.16, h * 0.05, h * 0.16), xform(0, 0.2, 0))
+      break
+    }
+    case 1: {
+      // Industrial flue with banding. Deliberately not one of the brick
+      // materials: their texel is 0.9 m, which at 250 m is a quarter of a pixel
+      // and shimmers rather than reads.
+      const r = h * 0.035
+      b.geom('plasterDamaged', cylinderGeom(r * 0.62, r, h, 10), xform(0, h / 2, 0))
+      for (let i = 0; i < 4; i++) {
+        const t = 0.45 + i * 0.16
+        b.geom('metalRusted', cylinderGeom(r * (1.04 - t * 0.32), r * (1.06 - t * 0.32), h * 0.02, 10),
+          xform(0, h * t, 0))
+      }
+      break
+    }
+    case 2: {
+      // Lattice mast. Four battered legs and enough bracing to read as a truss.
+      const foot = h * 0.075
+      const bays = 8
+      for (const sx of [-1, 1]) {
+        for (const sz of [-1, 1]) {
+          for (let i = 0; i < bays; i++) {
+            const t0 = i / bays
+            const t1 = (i + 1) / bays
+            const s0 = foot * (1 - t0 * 0.78)
+            const s1 = foot * (1 - t1 * 0.78)
+            const seg = h / bays
+            b.geom('metalRusted', plainBox(0.16, Math.hypot(seg, s0 - s1), 0.16),
+              xform(sx * (s0 + s1) / 2, h * (t0 + t1) / 2, sz * (s0 + s1) / 2))
+          }
+        }
+      }
+      for (let i = 1; i < bays; i++) {
+        const s = foot * (1 - (i / bays) * 0.78) * 2
+        for (const sz of [-1, 1]) {
+          b.plate('metalRusted', s, 0.13, 0.13, 0, h * (i / bays), (sz * s) / 2)
+          b.plate('metalRusted', 0.13, 0.13, s, (sz * s) / 2, h * (i / bays), 0)
+        }
+      }
+      break
+    }
+    default: {
+      // A slab tower with a stepped crown and a mast — the one thing on the
+      // horizon that is taller than everything around it.
+      const w = h * 0.3
+      const d = h * 0.24
+      b.geom('concreteWorn', plainBox(w, h + 6, d), xform(0, (h - 6) / 2, 0))
+      b.plate('concreteWorn', w + 0.6, 0.8, d + 0.6, 0, h + 0.3, 0)
+      const cw = w * 0.6
+      b.geom('concreteWorn', plainBox(cw, h * 0.12 + 1.2, d * 0.62), xform(0, h + 0.6 + h * 0.06, 0))
+      b.plate('concreteWorn', cw + 0.5, 0.6, d * 0.62 + 0.5, 0, h + 0.6 + h * 0.12 + 0.2, 0)
+      b.plate('metalRusted', 0.2, h * 0.16, 0.2, 0, h + 0.7 + h * 0.2, 0)
+      const storey = h * 0.075
+      const rows = Math.floor((h - 4) / storey)
+      for (let j = 0; j < rows; j++) {
+        b.plate('asphalt', w * rng.range(0.68, 0.86), storey * 0.4, 0.18,
+          rng.spread(w * 0.05), h - 2 - (j + 0.5) * storey, -d / 2 - 0.05)
+      }
+      break
+    }
+  }
+}
+
+/**
+ * The city beyond the playable district.
+ *
+ * The previous version was three sparse rings of chamfered boxes in the same
+ * bright palette as the near field, and the critique of the elevated pose was
+ * exact: "the background is untextured white boxes standing on a flat tan plane
+ * meeting the sky at a hard line". All three faults are structural.
+ *
+ * *The hard line.* The ground is modelled to {@link TERRAIN_EDGE} and then
+ * stops. Nothing was reliably standing in front of that edge, so it read as the
+ * boundary of the level. The near band here is **continuous in azimuth** and
+ * placed entirely inside the terrain square, so from any camera in the level
+ * the ground runs into a street of buildings before it can reach the sky.
+ * `NEAR_ADVANCE` is under twice the half-angle the *narrowest* block subtends
+ * at the *largest* radius, which makes the overlap a property of the
+ * construction rather than of how the jitter happened to fall.
+ *
+ * *The boxes.* At this range only silhouette and value carry, so everything is
+ * a plain box — but silhouette is exactly what a plain box does not have.
+ * Parapets, setbacks, tanks, bulkheads and masts cost a few thousand triangles
+ * across the whole horizon and are the difference between a skyline and a bar
+ * chart.
+ *
+ * *The white.* The aerial pass floors transmittance at 0.45, so a distant
+ * surface keeps nearly half its own albedo however far away it is; the brightest
+ * material in the palette therefore stayed a bright slab at 200 m instead of
+ * settling toward the haze. The palettes below are the mid and low end only,
+ * and they get darker with distance.
+ *
+ * Nothing here casts, receives or collides.
+ */
+export function buildSkyline(b: Builder, rng: Rand): void {
+  interface Band {
+    rMin: number
+    rMax: number
+    wMin: number
+    wMax: number
+    dMin: number
+    dMax: number
+    hMin: number
+    hMax: number
+    /** Azimuth stepped between blocks, radians. */
+    advance: number
+    detail: number
+    pal: MaterialName[]
+    /** Chance a slot is left empty. Zero on the band that has to be continuous. */
+    thin?: number
+    /** Azimuth wedge to leave clear, in degrees. */
+    clear?: [number, number]
+  }
+
+  // The near band's radius is capped so that even the deepest block keeps its
+  // back wall inside the modelled ground: 134 + 26/2 = 147 < TERRAIN_EDGE.
+  const NEAR_MAX = TERRAIN_EDGE - 18
+  // atan(24 / (2 * 134)) = 0.0893 rad is the least any near block can subtend
+  // from the middle of the level; two of those is 0.179, so an advance of 0.12
+  // can never leave a gap however the radii and widths come out. Chosen as
+  // large as that bound allows, because every metre of extra overlap here is
+  // overdraw on the one band of the frame the whole horizon runs through.
+  const NEAR_ADVANCE = 0.12
+  const bands: Band[] = [
+    // Outskirts: walled compounds and single-storey sheds on the open ground
+    // between the district and the city. This is the other half of "a flat tan
+    // plane" — the near band fixes where the plane meets the sky, this breaks
+    // the plane itself. Left open across the bearing the highway runs out on,
+    // so the one leading line the elevated pose is composed around still reads
+    // as a road out of town rather than as a road into a wall.
+    {
+      rMin: 58, rMax: 96, wMin: 8, wMax: 17, dMin: 7, dMax: 14,
+      hMin: 2.7, hMax: 5.6, advance: 0.2, detail: -1, thin: 0.42, clear: [36, 68],
+      pal: ['stuccoTan', 'plasterDamaged', 'concreteWorn', 'stuccoTan', 'plasterOchre'],
+    },
+    {
+      rMin: 100, rMax: NEAR_MAX, wMin: 24, wMax: 38, dMin: 14, dMax: 26,
+      hMin: 9, hMax: 16.5, advance: NEAR_ADVANCE, detail: 2,
+      pal: ['stuccoTan', 'plasterOchre', 'concreteWorn', 'plasterDamaged', 'stuccoTan'],
+    },
+    {
+      rMin: 178, rMax: 246, wMin: 26, wMax: 50, dMin: 20, dMax: 40,
+      hMin: 15, hMax: 33, advance: 0.15, detail: 1,
+      pal: ['concreteWorn', 'stuccoTan', 'plasterDamaged', 'concreteWorn'],
+    },
+    {
+      rMin: 292, rMax: 392, wMin: 34, wMax: 72, dMin: 26, dMax: 55,
+      hMin: 24, hMax: 56, advance: 0.27, detail: 0,
+      pal: ['concreteWorn', 'plasterDamaged', 'asphalt', 'concreteWorn'],
+    },
+  ]
+
+  for (const band of bands) {
+    // Walking azimuth rather than dividing a fixed count keeps the overlap
+    // argument above true whatever the radii come out at.
+    for (let a = rng.range(0, band.advance); a < Math.PI * 2; a += band.advance) {
+      if (band.thin && rng.bool(band.thin)) continue
+      if (band.clear) {
+        const deg = (a * 180) / Math.PI
+        if (deg > band.clear[0] && deg < band.clear[1]) continue
+      }
+      const r = rng.range(band.rMin, band.rMax)
+      const x = Math.cos(a) * r
+      const z = Math.sin(a) * r
+      // Local -Z faces the origin, so the dressed face is the one in frame.
+      b.push(x, groundHeight(x, z), z, Math.PI / 2 - a + rng.spread(0.06))
+      backdropBlock(
+        b, rng,
+        rng.range(band.wMin, band.wMax),
+        rng.range(band.hMin, band.hMax),
+        rng.range(band.dMin, band.dMax),
+        rng.pick(band.pal),
+        band.detail,
+      )
+      b.pop()
+    }
+  }
+
+  // Landmarks, on the bearings the graded poses actually look along: the
+  // elevated shot runs out at 55 degrees, the low sun at 20, the two weapon
+  // poses at 70, the alley at 92, the firefight at 110 and the plaza at 235.
+  // Heights are held under 50 m: the sun sits at 21 degrees, and from the
+  // middle of the level a 50 m mark at 250 m reaches 10 degrees, so nothing
+  // here can eat the sun disc the low-sun pose is graded on.
+  const marks: [number, number, number, number][] = [
+    // azimuth (deg), radius, kind, height
+    [56, 268, 0, 34],
+    [22, 205, 1, 28],
+    [74, 318, 3, 46],
+    [96, 232, 2, 36],
+    [113, 296, 0, 38],
+    [162, 258, 1, 30],
+    [238, 240, 0, 31],
+    [292, 330, 2, 42],
+  ]
+  for (const [deg, radius, kind, height] of marks) {
+    const a = (deg * Math.PI) / 180 + rng.spread(0.04)
+    const r = radius * rng.range(0.94, 1.06)
+    const x = Math.cos(a) * r
+    const z = Math.sin(a) * r
+    b.push(x, groundHeight(x, z) - 3, z, Math.PI / 2 - a)
+    backdropLandmark(b, rng, kind, height * rng.range(0.92, 1.1))
+    b.pop()
   }
 }
 

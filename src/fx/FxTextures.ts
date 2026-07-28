@@ -201,22 +201,32 @@ function radial(g: CanvasRenderingContext2D, cx: number, cy: number, r: number, 
 /**
  * 16-frame smoke sheet.
  *
- * Three things this has to get right, because all three were visible defects:
+ * Four things this has to get right, because all four were visible defects:
  *
- * 1. **The alpha must die well inside its cell.** A mask that still carries
+ * 1. **Every field must be sampled below Nyquist.** This is the one that
+ *    produced the "long fibrous streaks" the critics kept naming. The previous
+ *    sheet took a base-9, four-octave fBm — top octave 72 cycles across the
+ *    field — and sampled it at 5.6 field tiles across a 160px cell, i.e. a
+ *    0.4-pixel period. What lands in the texture is not smoke, it is the
+ *    aliasing moire of that octave, and moire from a domain-warped field folds
+ *    down into long curved filaments. Stack a few hundred randomly rotated
+ *    cards carrying that pattern and the frame grows hair. Both fields are now
+ *    sampled so their *top* octave keeps a period of ~4 texels: shape at 2.2
+ *    base cycles across the cell over 5 octaves (35 cycles, 4.5px), detail at
+ *    2.4x that over 3 octaves (32 cycles, 5px).
+ * 2. **The alpha must die well inside its cell.** A mask that still carries
  *    alpha at the tile border shows the quad, and the quad is the single most
  *    obvious tell in a particle system. The puff is trimmed by a noise-warped
- *    radius that reaches zero by 0.45 of the cell, leaving a real gutter that
+ *    radius that reaches zero by 0.46 of the cell, leaving a real gutter that
  *    also survives a couple of mip levels.
- * 2. **No axis-aligned structure.** The previous sheet blitted one noise tile
- *    twice side by side, which left a linear seam every card shared regardless
- *    of its per-particle rotation. Here the sample frame is rotated per frame
- *    and domain-warped, so no two frames share a direction.
- * 3. **RGB carries baked shading, not white.** The particle shader multiplies
- *    the per-particle colour by this, so a puff arrives with a lit side, a
- *    self-shadowed core and real internal relief. A flat-white mask tinted by a
- *    single colour is a grey wash that flattens local contrast wherever it
- *    covers, which is exactly what the frames were showing.
+ * 3. **The density ramp must be wide.** A narrow black-to-white remap turns an
+ *    fBm's iso-contours into a ridge network — which is what erosion then eats
+ *    the puff down to, leaving only the ridges. A wide ramp keeps the mask a
+ *    graded volume all the way through its life.
+ * 4. **RGB carries baked shading, not white**, read off a *blurred* copy of the
+ *    density so the relief follows billows rather than texels. The particle
+ *    shader multiplies the per-particle colour by this, so a puff arrives with
+ *    a lit side and a self-shadowed core rather than being one flat tinted wash.
  */
 function buildSmokeSheet(rand: Rand): HTMLCanvasElement {
   const T = 160
@@ -224,13 +234,20 @@ function buildSmokeSheet(rand: Rand): HTMLCanvasElement {
   const N = 256
   const sheet = makeCanvas(T * COLS, T * COLS, true)
 
-  const shape = fbmField(N, 3, 5, Math.floor(rand.next() * 1e6))
-  const detail = fbmField(N, 9, 4, Math.floor(rand.next() * 1e6))
-  const warpU = fbmField(N, 2, 3, Math.floor(rand.next() * 1e6))
-  const warpV = fbmField(N, 2, 3, Math.floor(rand.next() * 1e6))
+  // Base frequencies chosen with the sample rate below: see note 1.
+  const SHAPE_BASE = 4
+  const SHAPE_CYCLES = 2.2
+  const DETAIL_MUL = 2.4
+  const shape = fbmField(N, SHAPE_BASE, 5, Math.floor(rand.next() * 1e6))
+  const detail = fbmField(N, 6, 3, Math.floor(rand.next() * 1e6))
+  const warpU = fbmField(N, 2, 2, Math.floor(rand.next() * 1e6))
+  const warpV = fbmField(N, 2, 2, Math.floor(rand.next() * 1e6))
+  const rimField = fbmField(N, 3, 2, Math.floor(rand.next() * 1e6))
 
   const raw = new Float32Array(T * T)
   const density = new Float32Array(T * T)
+  const relief = new Float32Array(T * T)
+  const scratch = new Float32Array(T * T)
   const BINS = 512
   const hist = new Int32Array(BINS)
   const img = sheet.createImageData(T, T)
@@ -243,12 +260,14 @@ function buildSmokeSheet(rand: Rand): HTMLCanvasElement {
   const LZ = 0.70
 
   for (let f = 0; f < 16; f++) {
-    const grow = 1 + f * 0.085
-    const rise = f * 0.030
-    const ang = f * 0.12 + 0.17
+    const grow = 1 + f * 0.075
+    const rise = f * 0.028
+    // A full rotation across the sheet, so no two frames share a direction and
+    // an animating puff never reads as one image sliding.
+    const ang = f * 0.41 + 0.17
     const ca = Math.cos(ang)
     const sa = Math.sin(ang)
-    const scale = 2.35 / grow
+    const scale = (SHAPE_CYCLES / SHAPE_BASE) / grow
 
     for (let y = 0; y < T; y++) {
       const v = (y + 0.5) / T - 0.5
@@ -257,20 +276,24 @@ function buildSmokeSheet(rand: Rand): HTMLCanvasElement {
         const cu = u * ca - v * sa
         const cv = u * sa + v * ca
 
-        const wu = cu + (sampleField(warpU, N, (cu * 1.9 + 0.31) * N, (cv * 1.9 + 0.11) * N) - 0.5) * 0.30
-        const wv = cv + (sampleField(warpV, N, (cu * 1.9 + 0.63) * N, (cv * 1.9 + 0.77) * N) - 0.5) * 0.30 - rise
+        // Gentle warp. The old 0.30 displacement was over a third of the shape
+        // field's period, which combs the iso-contours into parallel strands
+        // before the sampler ever gets a chance to alias them.
+        const wu = cu + (sampleField(warpU, N, (cu * 1.3 + 0.31) * N, (cv * 1.3 + 0.11) * N) - 0.5) * 0.14
+        const wv = cv + (sampleField(warpV, N, (cu * 1.3 + 0.63) * N, (cv * 1.3 + 0.77) * N) - 0.5) * 0.14 - rise
 
-        let d = sampleField(shape, N, wu * scale * N, wv * scale * N) * 0.78
-        d += sampleField(detail, N, (wu * scale * 2.4 + 0.5) * N, wv * scale * 2.4 * N) * 0.22
-        // fBm piles up around 0.5; expand it so the puff has real internal
-        // range instead of resolving to one translucent grey value.
-        d = (d - 0.5) * 1.45 + 0.5
+        let d = sampleField(shape, N, wu * scale * N, wv * scale * N) * 0.80
+        d += sampleField(detail, N, (wu * scale * DETAIL_MUL + 0.5) * N, wv * scale * DETAIL_MUL * N) * 0.20
+        d = (d - 0.5) * 1.30 + 0.5
 
-        // Noise-warped trim. Reaches zero by r = 0.45, so the cell keeps a
-        // gutter and no mip level can carry alpha to the tile border.
-        const rad = Math.sqrt(u * u + v * v) / 0.40
-        const rim = rad * (0.85 + 0.34 * sampleField(warpU, N, (u * 3.1 + 0.9) * N, (v * 3.1 + 0.4) * N))
-        const edge = 1 - smooth01((rim - 0.35) / 0.65)
+        // Noise-warped trim. The trim reaches zero at `rim == 1`, i.e. at
+        // `0.46 / factor`, so the factor floor of 1.02 is what guarantees the
+        // gutter: the widest the puff can get in any direction is r = 0.451,
+        // inside the 0.5 tile half-width, and no mip level can then carry alpha
+        // across a cell boundary into its neighbour.
+        const rad = Math.sqrt(u * u + v * v) / 0.46
+        const rim = rad * (1.02 + 0.20 * sampleField(rimField, N, (u * 2.1 + 0.9) * N, (v * 2.1 + 0.4) * N))
+        const edge = 1 - smooth01((rim - 0.30) / 0.70)
 
         const rv = d * edge
         raw[y * T + x] = rv < 0 ? 0 : rv > 1 ? 1 : rv
@@ -280,19 +303,50 @@ function buildSmokeSheet(rand: Rand): HTMLCanvasElement {
     // The frame advects through the noise, so a fixed black point makes some
     // frames dense and others nearly empty. Pick the threshold from the frame's
     // own histogram instead, against a coverage schedule that thins the puff
-    // out over its life.
+    // out over its life. The ramp is deliberately wide (see note 3).
     hist.fill(0)
     for (let i = 0; i < raw.length; i++) hist[Math.min(BINS - 1, (raw[i] * BINS) | 0)]++
-    const target = (0.34 - f * 0.008) * raw.length
+    const target = (0.52 - f * 0.011) * raw.length
     let acc = 0
     let bin = BINS - 1
     for (; bin > 0; bin--) {
       acc += hist[bin]
       if (acc >= target) break
     }
-    const lo = bin / BINS
-    const invSpan = 1 / Math.max(Math.min(1, lo + 0.45) - lo, 1e-3)
+    const SPAN = 0.46
+    const lo = Math.max(0, bin / BINS - SPAN * 0.45)
+    const invSpan = 1 / SPAN
     for (let i = 0; i < raw.length; i++) density[i] = smooth01((raw[i] - lo) * invSpan)
+
+    // Separable box blur of the density: the relief is read from this so the
+    // baked shading follows billows instead of amplifying single texels.
+    const K = 3
+    for (let y = 0; y < T; y++) {
+      for (let x = 0; x < T; x++) {
+        let s = 0
+        let n = 0
+        for (let k = -K; k <= K; k++) {
+          const xx = x + k
+          if (xx < 0 || xx >= T) continue
+          s += density[y * T + xx]
+          n++
+        }
+        scratch[y * T + x] = s / n
+      }
+    }
+    for (let x = 0; x < T; x++) {
+      for (let y = 0; y < T; y++) {
+        let s = 0
+        let n = 0
+        for (let k = -K; k <= K; k++) {
+          const yy = y + k
+          if (yy < 0 || yy >= T) continue
+          s += scratch[yy * T + x]
+          n++
+        }
+        relief[y * T + x] = s / n
+      }
+    }
 
     for (let y = 0; y < T; y++) {
       const yUp = y > 0 ? y - 1 : 0
@@ -300,19 +354,19 @@ function buildSmokeSheet(rand: Rand): HTMLCanvasElement {
       for (let x = 0; x < T; x++) {
         const i = y * T + x
         const a = density[i]
-        const gx = density[y * T + (x < T - 1 ? x + 1 : x)] - density[y * T + (x > 0 ? x - 1 : x)]
-        const gy = density[yDn * T + x] - density[yUp * T + x]
+        const gx = relief[y * T + (x < T - 1 ? x + 1 : x)] - relief[y * T + (x > 0 ? x - 1 : x)]
+        const gy = relief[yDn * T + x] - relief[yUp * T + x]
         // Read the density field as a height field: gradients tilt the surface
         // toward or away from the key, which is what gives a puff its billows.
-        const nx = -gx * 6.5
-        const ny = -gy * 6.5
+        const nx = -gx * 4.2
+        const ny = -gy * 4.2
         const inv = 1 / Math.sqrt(nx * nx + ny * ny + 1)
         const ndl = Math.max(0, (nx * LX + ny * LY + LZ) * inv)
-        // Stored sRGB 0.62..1.0. Emitter colours therefore land roughly a third
-        // darker in linear than the old flat-white mask produced, which is the
-        // right direction anyway: the frames were over-bright and over-veiled.
-        let shade = 0.80 + 0.24 * ndl - 0.20 * a
-        shade = shade < 0.62 ? 0.62 : shade > 1 ? 1 : shade
+        // Stored sRGB 0.60..1.0. Emitter colours therefore land roughly a third
+        // darker in linear than a flat-white mask produces, which is the right
+        // direction anyway: the frames were over-bright and over-veiled.
+        let shade = 0.78 + 0.28 * ndl - 0.18 * a
+        shade = shade < 0.60 ? 0.60 : shade > 1 ? 1 : shade
         const b = Math.round(shade * 255)
         const o = i * 4
         px[o] = b
@@ -326,6 +380,14 @@ function buildSmokeSheet(rand: Rand): HTMLCanvasElement {
   }
   return sheet.canvas
 }
+
+/**
+ * Mean alpha of one smoke cell, averaged across the sheet's frames. The
+ * coverage ledger needs this to cost a card honestly: a card's screen footprint
+ * is its quad, but the fraction of that quad the mask actually fills is what
+ * veils the frame. Measured from the generator above rather than guessed.
+ */
+export const SMOKE_MASK_FILL = 0.11
 
 // --- static sprite atlas ----------------------------------------------------
 

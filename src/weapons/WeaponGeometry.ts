@@ -634,6 +634,153 @@ export function lensGeom(radius: number, sag: number, segments = 28, rings = 5):
   return g.toGeometry()
 }
 
+/** One cross-section of a loft. The sweep runs along +Z in loft space. */
+export interface LoftRing {
+  /** Section centre. X and Y offset the section; Z advances the sweep. */
+  c: [number, number, number]
+  /** Half-extent across X and across Y. */
+  rx: number
+  ry: number
+  /**
+   * Superellipse exponent for this section: |x/rx|^n + |y/ry|^n = 1.
+   *
+   * 2 is a true ellipse, which is a finger; 3 to 4 is the rounded slab a palm,
+   * a forearm or a moulded body actually is; past 6 it is a box with a fillet.
+   * Interpolating it along the sweep is what lets one loft run from a boxy
+   * wrist into a round knuckle without a seam.
+   */
+  n?: number
+  wear?: number
+}
+
+/**
+ * Lofts a superelliptic section along a chain of rings.
+ *
+ * Every organic part of a viewmodel — fingers, thumb, palm, forearm — is a
+ * tapered tube with a varying cross-section, and building those out of
+ * chamfered boxes is what the critics have been reading as "slab fingers".
+ * A box cannot help: its silhouette is straight between two hard corners and
+ * its shading is four constant normals, so a 15mm finger segment resolves to a
+ * lit face, a dark face and a bright bevel. That is a machined block, and four
+ * of them in a row is a machined block four times.
+ *
+ * The chamfer was also quietly wrecking the material. `chamferBox` marks every
+ * bevel vertex `aWear = 1`, and on a 15mm finger with a 4.5mm chamfer the
+ * bevels are 74% of the surface — so the glove rendered almost entirely at its
+ * worn-edge albedo and worn-edge roughness rather than the authored ones, which
+ * is why the hands measured *brighter* than the rifle they are holding.
+ *
+ * Normals come from the surface itself (ring tangent crossed with sweep
+ * tangent) rather than from an analytic form, so an offset, sheared or
+ * collapsing section still shades correctly, and a ring that closes to a point
+ * makes a proper rounded tip instead of a flat cap.
+ */
+export function loftGeom(rings: readonly LoftRing[], segments = 12): THREE.BufferGeometry {
+  const g = new GeomBuf()
+  const R = rings.length
+  if (R < 2) return g.toGeometry()
+
+  // Section points, ring-major. Built once, then differenced for normals.
+  const px = new Float32Array(R * segments)
+  const py = new Float32Array(R * segments)
+  const pz = new Float32Array(R * segments)
+  for (let k = 0; k < R; k++) {
+    const r = rings[k]
+    const ex = 2 / (r.n ?? 2)
+    for (let i = 0; i < segments; i++) {
+      const th = (i / segments) * Math.PI * 2
+      const co = Math.cos(th)
+      const si = Math.sin(th)
+      const ax = Math.pow(Math.abs(co), ex)
+      const ay = Math.pow(Math.abs(si), ex)
+      const j = k * segments + i
+      px[j] = r.c[0] + r.rx * (co < 0 ? -ax : ax)
+      py[j] = r.c[1] + r.ry * (si < 0 ? -ay : ay)
+      pz[j] = r.c[2]
+    }
+  }
+
+  const nx = new Float32Array(R * segments)
+  const ny = new Float32Array(R * segments)
+  const nz = new Float32Array(R * segments)
+  const tRing = new THREE.Vector3()
+  const tSweep = new THREE.Vector3()
+  const nrm = new THREE.Vector3()
+  for (let k = 0; k < R; k++) {
+    const kPrev = Math.max(0, k - 1)
+    const kNext = Math.min(R - 1, k + 1)
+    for (let i = 0; i < segments; i++) {
+      const iPrev = (i + segments - 1) % segments
+      const iNext = (i + 1) % segments
+      const a = k * segments + iPrev
+      const bIdx = k * segments + iNext
+      tRing.set(px[bIdx] - px[a], py[bIdx] - py[a], pz[bIdx] - pz[a])
+      const c = kPrev * segments + i
+      const d = kNext * segments + i
+      tSweep.set(px[d] - px[c], py[d] - py[c], pz[d] - pz[c])
+      nrm.crossVectors(tSweep, tRing)
+      if (nrm.lengthSq() < 1e-16) {
+        // Degenerate ring (a closed tip): fall back to the sweep direction.
+        nrm.copy(tSweep).normalize()
+      } else {
+        nrm.normalize()
+        const j = k * segments + i
+        const ox = px[j] - rings[k].c[0]
+        const oy = py[j] - rings[k].c[1]
+        if (nrm.x * ox + nrm.y * oy < 0) nrm.negate()
+      }
+      const j = k * segments + i
+      nx[j] = nrm.x; ny[j] = nrm.y; nz[j] = nrm.z
+    }
+  }
+
+  const p0 = new THREE.Vector3()
+  const p1 = new THREE.Vector3()
+  const p2 = new THREE.Vector3()
+  const p3 = new THREE.Vector3()
+  const n0 = new THREE.Vector3()
+  const n1 = new THREE.Vector3()
+  const n2 = new THREE.Vector3()
+  const n3 = new THREE.Vector3()
+  const put = (idx: number, p: THREE.Vector3, n: THREE.Vector3) => {
+    p.set(px[idx], py[idx], pz[idx])
+    n.set(nx[idx], ny[idx], nz[idx])
+  }
+  for (let k = 0; k < R - 1; k++) {
+    const wA = rings[k].wear ?? 0
+    const wB = rings[k + 1].wear ?? 0
+    for (let i = 0; i < segments; i++) {
+      const iNext = (i + 1) % segments
+      put(k * segments + i, p0, n0)
+      put(k * segments + iNext, p1, n1)
+      put((k + 1) * segments + iNext, p2, n2)
+      put((k + 1) * segments + i, p3, n3)
+      g.quadW(p0, p1, p2, p3, n0, n1, n2, n3, wA, wA, wB, wB)
+    }
+  }
+
+  // Flat caps, only where the end ring has not already closed to a point.
+  // The cap normal is taken from the chain's own direction rather than assumed
+  // to be +Z: a digit is authored sweeping toward the fingertip, which is -Z.
+  for (const end of [0, R - 1]) {
+    const r = rings[end]
+    if (Math.max(r.rx, r.ry) < 4e-4) continue
+    const inward = end === 0 ? rings[1] : rings[R - 2]
+    _c.set(r.c[0] - inward.c[0], r.c[1] - inward.c[1], r.c[2] - inward.c[2])
+    if (_c.lengthSq() < 1e-12) continue
+    _n.copy(_c).normalize()
+    _a.set(r.c[0], r.c[1], r.c[2])
+    const w = r.wear ?? 0
+    for (let i = 0; i < segments; i++) {
+      const iNext = (i + 1) % segments
+      p0.set(px[end * segments + i], py[end * segments + i], pz[end * segments + i])
+      p1.set(px[end * segments + iNext], py[end * segments + iNext], pz[end * segments + iNext])
+      g.tri(_a, p0, p1, _n, w)
+    }
+  }
+  return g.toGeometry()
+}
+
 /** Flat disc facing +Z, used for lenses. */
 export function discGeom(radius: number, segments = 32): THREE.BufferGeometry {
   const g = new GeomBuf()
@@ -657,8 +804,8 @@ export function discGeom(radius: number, segments = 32): THREE.BufferGeometry {
 
 export type WeaponMatKey =
   | 'gunmetal' | 'phosphate' | 'steel' | 'polymer' | 'polymerTan' | 'rubber'
-  | 'glass' | 'glassFront' | 'glove' | 'sleeve' | 'brass' | 'dark' | 'anodised'
-  | 'rail' | 'magPolymer' | 'bore' | 'stock'
+  | 'glass' | 'glassFront' | 'glove' | 'glovePalm' | 'sleeve' | 'brass' | 'dark'
+  | 'anodised' | 'rail' | 'magPolymer' | 'bore' | 'stock'
 
 interface WearParams {
   color: number
@@ -708,6 +855,7 @@ export class WeaponMaterials {
   readonly fabricNormal: THREE.DataTexture
   readonly camoAlbedo: THREE.DataTexture
   readonly gloveNormal: THREE.DataTexture
+  readonly gloveRough: THREE.DataTexture
   readonly dotTexture: THREE.DataTexture
   readonly crossTexture: THREE.DataTexture
   readonly glareTexture: THREE.DataTexture
@@ -885,20 +1033,57 @@ export class WeaponMaterials {
     this.camoAlbedo = makeDataTexture(cam, C, true, anisotropy)
 
     // --- glove: pebbled synthetic leather ---
-    const gh = new Float32Array(F * F)
-    for (let y = 0; y < F; y++) {
-      for (let x = 0; x < F; x++) {
-        const u = x / F
-        const v = y / F
-        // Octave 6 on a 128px map is 256 noise cells across 128 texels: the
-        // field was aliased before it was ever written to the texture, and at
-        // normalScale 0.6 on a glove that fills the lower third of an ADS frame
-        // that reads as glitter on the knuckles.
-        gh[y * F + x] = Math.pow(noise.sample(3, u, v), 1.3) + noise.sample(5, u, v) * 0.35
+    //
+    // Measured on the shipped build, this map put the glove's median normal
+    // 30 degrees off the surface and its 99th percentile at 56. Nothing on a
+    // hand is that steep. Grain on a goatskin or synthetic-leather palm is a
+    // 0.8-1.2mm pebble standing 40-60 microns proud, which is a 5-8 degree
+    // slope; 30 degrees is scree, and scree over a box is exactly the
+    // "characters two console generations behind the environment" read. The
+    // metal on the same weapon sits at 1 degree, so the hands were seventeen
+    // times rougher than the rifle they hold and separated into a different
+    // material class on their own.
+    //
+    // Three changes: the map goes to 256 so a 4-texel pebble survives the band
+    // limit, the pebble moves to octave 4 (64 cells, 0.87mm at the glove's
+    // texel density), and the strength drops to land the median near 8.
+    const G = 256
+    const gh = new Float32Array(G * G)
+    for (let y = 0; y < G; y++) {
+      for (let x = 0; x < G; x++) {
+        const u = x / G
+        const v = y / G
+        // Pebble, tooth, and a very shallow broad undulation for the soft
+        // folding of a glove over a knuckle. The broad term is deliberately
+        // tiny: creases on a glove are geometry now, not a bump map.
+        const pebble = Math.pow(noise.sample(4, u, v), 1.25)
+        const tooth = noise.sample(5, u, v)
+        const fold = noise.fbm(u, v, 2, 2)
+        gh[y * G + x] = pebble * 0.62 + tooth * 0.20 + fold * 0.14
       }
     }
-    blurField(gh, F, 2)
-    this.gloveNormal = heightToNormalTexture(gh, F, 0.92, anisotropy)
+    blurField(gh, G, 2)
+    this.gloveNormal = heightToNormalTexture(gh, G, 0.42, anisotropy)
+
+    // Leather is not uniformly matte: the crown of each pebble takes a
+    // handling polish and the valleys stay dead. That two-band roughness is
+    // most of what separates worn leather from moulded rubber, and the glove
+    // used to borrow the polymer map, which has neither the frequency nor the
+    // correlation with its own relief.
+    const gr = new Uint8Array(G * G * 4)
+    for (let y = 0; y < G; y++) {
+      for (let x = 0; x < G; x++) {
+        const i = (y * G + x) * 4
+        const u = x / G
+        const v = y / G
+        const crown = smoothstep(0.42, 0.86, gh[y * G + x])
+        const soil = noise.fbm(u, v, 1, 3)
+        const rough = clamp01(0.94 - crown * 0.26 + (soil - 0.5) * 0.14)
+        const rb = Math.round(rough * 255)
+        gr[i] = rb; gr[i + 1] = rb; gr[i + 2] = rb; gr[i + 3] = 255
+      }
+    }
+    this.gloveRough = makeDataTexture(gr, G, false, anisotropy)
 
     // --- reticle sprites ---
     this.dotTexture = this.makeDot(64)
@@ -1245,18 +1430,36 @@ export class WeaponMaterials {
       // filled nylon furniture measures 4-6%. Corrected to the real number,
       // which is also what makes the furniture read lighter and flatter than
       // the receiver instead of disappearing into it.
+      // `normalScale` on the three moulded keys below is the one number that
+      // was still describing the wrong material.
+      //
+      // Measured off the map: at 0.85 the polymer surface's median normal sits
+      // 17 degrees off its face and its 99th percentile at 38. Glass-filled
+      // nylon out of a textured tool carries a 0.8-1.2mm stipple standing 30-60
+      // microns proud — a 4-7 degree slope. Seventeen degrees is not stipple,
+      // it is aggregate, and the parts wearing it (grip, magazine) are the two
+      // biggest non-metal blocks on the weapon. Against a receiver whose metal
+      // map measures 1 degree, the furniture separated into a different
+      // material class entirely: "pumice/concrete rather than moulded nylon".
+      //
+      // Both halves of the correction matter. The scale drops to land the
+      // median near 6-7 degrees, and the texel density at the call sites goes
+      // up so the stipple cell lands under a millimetre instead of over one.
+      // Amplitude down *and* frequency up is a finer surface; amplitude down
+      // alone is just a flatter one, and this round is explicitly not allowed
+      // to trade local contrast away.
       case 'polymer':
         mat = this.wearMaterial(key, {
           color: 0x393c40, roughness: 0.88, metalness: 0.02,
           wearColor: 0x585c61, wearAlbedo: 0.35, wearRough: 0.62, wearMetal: 0.04,
-          envIntensity: 0.36, normalScale: 0.85,
+          envIntensity: 0.36, normalScale: 0.34,
         }, { roughnessMap: this.polymerRough, normalMap: this.polymerNormal })
         break
       case 'polymerTan':
         mat = this.wearMaterial(key, {
           color: 0x5f5541, roughness: 0.88, metalness: 0.02,
           wearColor: 0x968769, wearAlbedo: 0.40, wearRough: 0.64, wearMetal: 0.04,
-          envIntensity: 0.36, normalScale: 0.85,
+          envIntensity: 0.36, normalScale: 0.34,
         }, { roughnessMap: this.polymerRough, normalMap: this.polymerNormal })
         break
       // The magazine is the one large block that must not share a value with
@@ -1267,14 +1470,19 @@ export class WeaponMaterials {
         mat = this.wearMaterial(key, {
           color: 0x2a2d31, roughness: 0.93, metalness: 0.02,
           wearColor: 0x4a4e53, wearAlbedo: 0.32, wearRough: 0.68, wearMetal: 0.04,
-          envIntensity: 0.26, normalScale: 0.95,
+          envIntensity: 0.26, normalScale: 0.36,
         }, { roughnessMap: this.polymerRough, normalMap: this.polymerNormal })
         break
       case 'rubber':
         mat = this.wearMaterial(key, {
           color: 0x222426, roughness: 0.96, metalness: 0.0,
           wearColor: 0x46484a, wearAlbedo: 0.25, wearRough: 0.84, wearMetal: 0,
-          envIntensity: 0.20, normalScale: 1.05,
+          // Worst of the four moulded keys as shipped, at a 21 degree median.
+          // A rubber buttpad genuinely is coarser than nylon, but its coarseness
+          // is the moulded tread — which is real geometry here — not a 21 degree
+          // random walk over the whole face. Half of the pad is the closest and
+          // largest single surface the camera ever sees.
+          envIntensity: 0.20, normalScale: 0.50,
         }, { roughnessMap: this.polymerRough, normalMap: this.polymerNormal })
         break
       case 'brass':
@@ -1284,12 +1492,36 @@ export class WeaponMaterials {
           envIntensity: 1.0, normalScale: 0.35,
         }, { roughnessMap: this.metalRough, normalMap: this.metalNormal })
         break
+      // Glove shell: the back of the hand, the fingers and the thumb.
+      //
+      // `wearAlbedo` is held far below every other key here for a reason
+      // specific to how the hand is now built. Wear is an *edge* term, and a
+      // lofted digit has no chamfer band to carry it, so what little arrives
+      // comes from the fingertips and knuckle crowns where a glove really does
+      // scuff. At the old 0.30 with box geometry, half the surface of the palm
+      // and three quarters of the surface of every finger sat at full wear and
+      // the hands rendered pale — brighter than the receiver they were holding,
+      // which is backwards for a dark glove in the shadow of its own arm.
       case 'glove':
         mat = this.wearMaterial(key, {
-          color: 0x2c2e31, roughness: 0.88, metalness: 0.0,
-          wearColor: 0x55504a, wearAlbedo: 0.30, wearRough: 0.70, wearMetal: 0,
-          envIntensity: 0.38, normalScale: 1.0,
-        }, { roughnessMap: this.polymerRough, normalMap: this.gloveNormal })
+          color: 0x25272a, roughness: 0.86, metalness: 0.0,
+          wearColor: 0x4a463f, wearAlbedo: 0.16, wearRough: 0.74, wearMetal: 0,
+          envIntensity: 0.32, normalScale: 0.82,
+        }, { roughnessMap: this.gloveRough, normalMap: this.gloveNormal })
+        break
+      // Palm side: the printed-silicone or suede reinforcement patch that
+      // covers the palm, the thenar pad and the inside of every finger. It is
+      // the surface actually in contact with the grip, so it is darker, deader
+      // and finer-grained than the shell, and having it as its own value is
+      // what stops the hand reading as one moulded lump: at the hip the eye
+      // sees the shell on the knuckles and this on the wrapped fingers in the
+      // same 8-pixel block.
+      case 'glovePalm':
+        mat = this.wearMaterial(key, {
+          color: 0x1b1d1f, roughness: 0.95, metalness: 0.0,
+          wearColor: 0x3c3a35, wearAlbedo: 0.14, wearRough: 0.82, wearMetal: 0,
+          envIntensity: 0.20, normalScale: 0.66,
+        }, { roughnessMap: this.gloveRough, normalMap: this.gloveNormal })
         break
       // `color` here is a multiplier over the camo map, and it used to be a
       // pale 0x8a8a8a. That is a trap: the base colour is what the surface
@@ -1335,7 +1567,14 @@ export class WeaponMaterials {
           // survives -- that magnification is the "coarse granular texture"
           // filed against the mass -- so the map is held down and the texel
           // density doubled at the call sites instead.
-          envIntensity: 0.18, normalScale: 0.80,
+          //
+          // "Held down" was true of the texel density and not of the amplitude:
+          // 0.80 measured a 16 degree median off this map, within a degree of
+          // the `polymer` it was split away from and sixteen times the metal
+          // beside it. The stock body, comb and toe are the largest close
+          // surfaces in any hip frame, so this key was carrying more of the
+          // "pumice" read than the grip and magazine put together.
+          envIntensity: 0.18, normalScale: 0.34,
         }, { roughnessMap: this.polymerRough, normalMap: this.polymerNormal })
         break
       case 'glass':
@@ -1361,7 +1600,7 @@ export class WeaponMaterials {
     for (const t of [
       this.metalNormal, this.metalRough, this.metalAlbedo, this.polymerNormal,
       this.polymerRough, this.fabricNormal, this.camoAlbedo, this.gloveNormal,
-      this.dotTexture, this.crossTexture, this.glareTexture,
+      this.gloveRough, this.dotTexture, this.crossTexture, this.glareTexture,
     ]) t.dispose()
   }
 }
@@ -1478,6 +1717,11 @@ export class PartBuilder {
     _scl.set(1, 1, 1)
     _mtx.compose(_a.set(pos[0], pos[1], pos[2]), _q, _scl)
     this.addGeom(mat, g, _mtx, o?.wear ?? 0, o?.uv ?? 24)
+  }
+
+  /** Lofted section chain, placed by a full matrix. See `loftGeom`. */
+  loftAt(mat: WeaponMatKey, rings: readonly LoftRing[], matrix: THREE.Matrix4, seg = 12, wear = 0, uv = 40): void {
+    this.addGeom(mat, loftGeom(rings, seg), matrix, wear, uv)
   }
 
   disc(mat: WeaponMatKey, radius: number, pos: [number, number, number], o?: PartOpts): void {
@@ -2041,12 +2285,19 @@ function addMagazine(b: PartBuilder, o: MagOpts = {}): number {
     const sd = d * (1 - t * 0.06)
     cursor.multiply(spin)
     m.copy(cursor).multiply(local.makeTranslation(0, -len * 0.5, 0))
-    b.addGeom(body, chamferBox(sw, len * 1.03, sd, 0.0022), m, 0.08 + t * 0.12, 30)
+    b.addGeom(body, chamferBox(sw, len * 1.03, sd, 0.0022), m, 0.08 + t * 0.12, 44)
     if (o.ribs !== false && i > 0 && i < slices - 1) {
       // Proud on all four faces, not just the flanks, so the rib throws a
       // shadow line the bake can pick up instead of vanishing at a grazing
       // view. This is the magazine's only high-frequency detail.
-      b.addGeom(body, chamferBox(sw + 0.0022, 0.0036, sd + 0.0022, 0.0009), m, 0.4, 30)
+      b.addGeom(body, chamferBox(sw + 0.0022, 0.0036, sd + 0.0022, 0.0009), m, 0.4, 44)
+      // Mould parting line down both flanks: a 0.5mm ridge that runs the whole
+      // length of the part, which is the one feature that says "out of a tool"
+      // rather than "milled from a block".
+      for (const sx of [-1, 1]) {
+        b.addGeom(body, chamferBox(0.0010, len * 1.02, 0.0016, 0.0003),
+          local.copy(m).multiply(new THREE.Matrix4().makeTranslation(sx * (sw * 0.5 + 0.0003), 0, 0)), 0.55, 52)
+      }
     }
     // Witness holes down the flank: four per side on a polymer mag, and the
     // only true black on a part that is otherwise one moulded value.
@@ -2060,11 +2311,22 @@ function addMagazine(b: PartBuilder, o: MagOpts = {}): number {
     _a.setFromMatrixPosition(cursor)
     if (_a.y < lowest) lowest = _a.y
   }
-  // Floorplate with its retaining lip.
+  // Floorplate: base pad, retaining lip, the spring-plate button that pokes
+  // through it and the two grip flutes moulded into its front and rear faces.
+  // This is the bottom 15mm of the one part that hangs below the whole weapon,
+  // so it is on the silhouette in every hip frame.
   m.copy(cursor).multiply(local.makeTranslation(0, 0.001, 0))
-  b.addGeom(body, chamferBox(w + 0.004, 0.011, d + 0.004, 0.0018), m, 0.45, 30)
+  b.addGeom(body, chamferBox(w + 0.004, 0.011, d + 0.004, 0.0018), m, 0.45, 44)
   b.addGeom(body, chamferBox(w + 0.0068, 0.0038, d + 0.0068, 0.0010),
-    local.copy(m).multiply(new THREE.Matrix4().makeTranslation(0, -0.0064, 0)), 0.75, 30)
+    local.copy(m).multiply(new THREE.Matrix4().makeTranslation(0, -0.0064, 0)), 0.75, 44)
+  b.addGeom('dark', chamferBox(0.0090, 0.0022, 0.0090, 0.0006),
+    local.copy(m).multiply(new THREE.Matrix4().makeTranslation(0, -0.0090, 0)), 0.10, 52)
+  for (const dz of [-1, 1]) {
+    for (const dy of [-0.0026, 0.0016]) {
+      b.addGeom(body, chamferBox(w - 0.004, 0.0026, 0.0016, 0.0004),
+        local.copy(m).multiply(new THREE.Matrix4().makeTranslation(0, dy, dz * (d * 0.5 + 0.0028))), 0.6, 56)
+    }
+  }
   return lowest
 }
 
@@ -2093,33 +2355,72 @@ export function buildMagDropMesh(mats: WeaponMaterials, o: MagOpts = {}): THREE.
   return mesh
 }
 
-/** Pistol grip with moulded finger swells and a checkered panel. */
+/**
+ * Pistol grip with moulded finger swells, textured side panels and a cap.
+ *
+ * The rake sign was wrong and every part of the grip was paying for it. The
+ * grip axis is built as `dir = (0, -cos a, +sin a)` — down and *rearward*,
+ * which is how a pistol grip rakes — and each block was then placed along that
+ * axis but rotated by `RX(+a)`, which tips a box's own down-axis to
+ * `(0, -cos a, -sin a)`: down and *forward*. Box and axis therefore disagreed
+ * by 2a, about 41 degrees on this weapon.
+ *
+ * Rendered with the hands hidden it is unmistakable: the grip body hangs off
+ * the back of the lower receiver with a visible gap at the top, canted the
+ * wrong way, and the cap, the beavertail and the finger swells sit beside it
+ * rather than on it. It never showed up in a capture because the trigger hand
+ * covers exactly the part that comes apart. `RX(-a)` puts a box's down-axis on
+ * the grip axis, which is the whole correction; the swell offset also becomes
+ * a proper normal to the grip's front face rather than a z-only nudge.
+ */
 function addPistolGrip(
   b: PartBuilder, mat: WeaponMatKey, top: [number, number, number],
   length: number, angle: number, width = 0.032,
 ): void {
   const dirY = -Math.cos(angle)
   const dirZ = Math.sin(angle)
+  // Outward normal of the grip's front (trigger-side) face.
+  const frontY = -Math.sin(angle)
+  const frontZ = -Math.cos(angle)
+  const rake: [number, number, number] = [-angle, 0, 0]
   const cx = top[0]
   const cy = top[1] + dirY * length * 0.5
   const cz = top[2] + dirZ * length * 0.5
-  b.box(mat, [width, length, 0.042], [cx, cy, cz], { rot: [angle, 0, 0], c: 0.006, uv: 34, wear: 0.12 })
+  b.box(mat, [width, length, 0.042], [cx, cy, cz], { rot: rake, c: 0.006, uv: 50, wear: 0.12 })
   // Finger swells on the front face.
   for (let i = 0; i < 3; i++) {
     const t = 0.24 + i * 0.24
-    const px = cx
-    const py = top[1] + dirY * length * t
-    const pz = top[2] + dirZ * length * t - 0.019 * Math.cos(angle)
-    b.box(mat, [width * 0.96, 0.016, 0.008], [px, py, pz], { rot: [angle, 0, 0], c: 0.003, uv: 34, wear: 0.5 })
+    const py = top[1] + dirY * length * t + frontY * 0.019
+    const pz = top[2] + dirZ * length * t + frontZ * 0.019
+    b.box(mat, [width * 0.96, 0.016, 0.008], [cx, py, pz], { rot: rake, c: 0.003, uv: 50, wear: 0.5 })
   }
   // Beavertail / backstrap flare.
   b.box(mat, [width * 0.95, 0.03, 0.02], [cx, top[1] - 0.006 + dirY * 0.012, top[2] + 0.026 + dirZ * 0.012], {
-    rot: [angle * 0.6, 0, 0], c: 0.005, uv: 34, wear: 0.3,
+    rot: [-angle * 0.6, 0, 0], c: 0.005, uv: 50, wear: 0.3,
   })
+  // Moulded texture panels: a raised border on each flank with a recessed
+  // field inside it. This is the checkering a real grip carries, and it is
+  // relief the occlusion bake can darken rather than a bump map pretending to.
+  for (const sx of [-1, 1]) {
+    for (const t of [0.30, 0.58, 0.84]) {
+      const py = top[1] + dirY * length * t
+      const pz = top[2] + dirZ * length * t
+      b.box(mat, [0.0022, 0.020, 0.030], [cx + sx * (width * 0.5 - 0.0004), py, pz], {
+        rot: rake, c: 0.0006, uv: 56, wear: 0.42,
+      })
+    }
+  }
   // Grip cap.
-  b.box('dark', [width * 0.9, 0.007, 0.036], [top[0] + dirY * 0, top[1] + dirY * (length + 0.002), top[2] + dirZ * (length + 0.002)], {
-    rot: [angle, 0, 0], c: 0.002, uv: 34, wear: 0.4,
+  b.box('dark', [width * 0.9, 0.007, 0.036], [cx, top[1] + dirY * (length + 0.002), top[2] + dirZ * (length + 0.002)], {
+    rot: rake, c: 0.002, uv: 50, wear: 0.4,
   })
+  // Grip screw in the cap, and the storage-core plug it holds in.
+  b.tube('steel', 0.0038, 0.0038, 0.0030,
+    [cx, top[1] + dirY * (length + 0.0055), top[2] + dirZ * (length + 0.0055)],
+    { axis: 'y', rot: rake, seg: 10, uv: 52, wear: 0.8 })
+  b.box('dark', [0.0016, 0.0014, 0.0052],
+    [cx, top[1] + dirY * (length + 0.0068), top[2] + dirZ * (length + 0.0068)],
+    { rot: rake, c: 0.0003, uv: 60 })
 }
 
 /** Trigger guard drawn as three chamfered members, plus the trigger itself. */
@@ -2137,9 +2438,11 @@ interface HandOpts {
   palm: [number, number, number]
   /** Rotation applied to the whole hand, XYZ euler. */
   rot: [number, number, number]
-  /** Where the forearm exits toward, in weapon space. */
+  /**
+   * Where the forearm exits toward, in weapon space. The wrist end is derived
+   * from the hand's own frame, so this only has to set the direction.
+   */
   elbow: [number, number, number]
-  wrist: [number, number, number]
   /** 0 relaxed .. 1 fully closed. */
   curl?: number
   thumbOver?: boolean
@@ -2154,6 +2457,27 @@ interface HandOpts {
   sleeveEnd: number
 }
 
+/**
+ * Per-finger anatomy, millimetres, gloved.
+ *
+ * Index, middle, ring, little. `y` and `z` are the metacarpal head — the
+ * knuckle — in hand space, and they are deliberately not in a line: the real
+ * arch runs the middle knuckle furthest forward and the little one nearly
+ * 15mm back, which is most of what stops four digits reading as one slab
+ * regardless of how well each one is modelled. Phalanx lengths are the
+ * standard proportions (middle longest, little shortest by a third), and the
+ * radii taper across the hand as well as along each finger.
+ */
+const FINGERS: readonly {
+  y: number, z: number, len: [number, number, number], r0: number, r1: number,
+  splay: number, roll: number,
+}[] = [
+  { y: 0.0325, z: -0.0480, len: [0.041, 0.026, 0.019], r0: 0.0094, r1: 0.0072, splay: 0.10, roll: 0.10 },
+  { y: 0.0110, z: -0.0520, len: [0.045, 0.030, 0.020], r0: 0.0096, r1: 0.0073, splay: 0.02, roll: 0.02 },
+  { y: -0.0105, z: -0.0490, len: [0.042, 0.028, 0.019], r0: 0.0090, r1: 0.0069, splay: -0.05, roll: -0.05 },
+  { y: -0.0305, z: -0.0400, len: [0.033, 0.022, 0.017], r0: 0.0081, r1: 0.0062, splay: -0.13, roll: -0.14 },
+]
+
 function addHand(b: PartBuilder, o: HandOpts): void {
   const s = o.side
   const curl = o.curl ?? 1
@@ -2166,76 +2490,304 @@ function addHand(b: PartBuilder, o: HandOpts): void {
   const T = (x: number, y: number, z: number) => new THREE.Matrix4().makeTranslation(x, y, z)
   const RY = (a: number) => new THREE.Matrix4().makeRotationY(a)
   const RX = (a: number) => new THREE.Matrix4().makeRotationX(a)
+  const RZ = (a: number) => new THREE.Matrix4().makeRotationZ(a)
   const local = (x: number, y: number, z: number, out: THREE.Matrix4) => out.copy(base).multiply(T(x * s, y, z))
 
   const m = new THREE.Matrix4()
+  const m2 = new THREE.Matrix4()
+  /**
+   * Mirrors a ring chain's X offsets for the support hand.
+   *
+   * `local` only flips the *translation* it is handed, so an offset baked into
+   * a loft's own section centres — the thenar, the palm patch, the piping —
+   * would stay on the back of the left hand instead of moving to its palm.
+   * Mutating in place is safe and free: every array reaching this is an object
+   * literal built at this call site.
+   */
+  const mir = (r: LoftRing[]): LoftRing[] => {
+    if (s > 0) return r
+    for (const q of r) q.c[0] = -q.c[0]
+    return r
+  }
 
-  // Palm: thicker across the knuckles, tapering toward the wrist. Sized to a
-  // real hand — 88mm across the knuckles, ~185mm wrist crease to fingertip.
+  // --- metacarpus ----------------------------------------------------------
+  // Hand space: -Z toward the fingertips, +Y toward the thumb side, and the
+  // palm facing -X so the fingers curl toward it under RY(+bend). Every X
+  // offset goes through `local` and every Y rotation through `s`, which is
+  // what mirrors the whole assembly for the support hand.
+  //
+  // 88mm across the knuckles, 30mm thick there, tapering to a 60mm wrist:
+  // measured hand-breadth figures, and the exponent runs from a nearly
+  // rectangular 3.2 at the knuckles to a round 2.6 at the wrist because that
+  // is the shape change a hand actually makes along its length.
   local(0, 0, 0, m)
-  b.addGeom('glove', chamferBox(0.033, 0.088, 0.064, 0.009), m, 0.10, 40)
-  local(-0.001, 0.029, -0.013, m)
-  b.addGeom('glove', chamferBox(0.032, 0.032, 0.042, 0.008), m, 0.22, 40)
-  // Reinforced knuckle pad, the classic tactical-glove read.
-  local(-0.002, 0.033, -0.028, m)
-  b.addGeom('dark', chamferBox(0.030, 0.024, 0.017, 0.005), m, 0.30, 40)
-  // Wrist cinch strap.
-  local(0, -0.043, 0.004, m)
-  b.addGeom('dark', chamferBox(0.036, 0.011, 0.058, 0.004), m, 0.25, 40)
+  b.loftAt('glove', mir([
+    { c: [-0.0012, -0.0060, -0.0520], rx: 0.0122, ry: 0.0378, n: 2.9, wear: 0.16 },
+    { c: [-0.0006, -0.0028, -0.0442], rx: 0.0141, ry: 0.0432, n: 3.2, wear: 0.07 },
+    { c: [0.0006, 0.0000, -0.0300], rx: 0.0152, ry: 0.0440, n: 3.2, wear: 0.02 },
+    { c: [0.0010, 0.0012, -0.0120], rx: 0.0158, ry: 0.0420, n: 3.1, wear: 0.02 },
+    { c: [0.0012, 0.0018, 0.0080], rx: 0.0162, ry: 0.0378, n: 2.9, wear: 0.02 },
+    { c: [0.0010, 0.0016, 0.0260], rx: 0.0163, ry: 0.0330, n: 2.7, wear: 0.04 },
+    { c: [0.0004, 0.0008, 0.0400], rx: 0.0156, ry: 0.0298, n: 2.6, wear: 0.08 },
+  ]), m, 18, 0, 46)
 
-  // Four fingers wrapping around the front, curling about the grip axis.
-  const segLens = [0.033, 0.026, 0.021]
-  const widths = [0.0152, 0.0140, 0.0124]
+  // Thenar and hypothenar: the two muscle pads that make a palm a palm rather
+  // than the flat side of a block. Both are on the palm side and in the palm
+  // material, so the hand carries two values across its width.
+  local(0, 0, 0, m)
+  b.loftAt('glovePalm', mir([
+    { c: [-0.0060, 0.0210, 0.0320], rx: 0.0078, ry: 0.0110, n: 2.4, wear: 0.06 },
+    { c: [-0.0098, 0.0255, 0.0140], rx: 0.0116, ry: 0.0165, n: 2.5, wear: 0.02 },
+    { c: [-0.0106, 0.0275, -0.0090], rx: 0.0118, ry: 0.0168, n: 2.5, wear: 0.02 },
+    { c: [-0.0084, 0.0280, -0.0290], rx: 0.0080, ry: 0.0118, n: 2.4, wear: 0.08 },
+  ]), m, 12, 0, 52)
+  local(0, 0, 0, m)
+  b.loftAt('glovePalm', mir([
+    { c: [-0.0070, -0.0280, 0.0300], rx: 0.0058, ry: 0.0096, n: 2.6, wear: 0.06 },
+    { c: [-0.0096, -0.0308, 0.0070], rx: 0.0088, ry: 0.0130, n: 2.6, wear: 0.02 },
+    { c: [-0.0092, -0.0306, -0.0190], rx: 0.0082, ry: 0.0122, n: 2.6, wear: 0.02 },
+    { c: [-0.0058, -0.0288, -0.0360], rx: 0.0050, ry: 0.0088, n: 2.5, wear: 0.09 },
+  ]), m, 12, 0, 52)
+
+  // Palm reinforcement patch: the suede or printed-silicone panel every
+  // shooting glove carries, stitched across the palm and up over the thenar.
+  // It is 1.2mm proud of the shell, so it throws its own contact line.
+  local(0, 0, 0, m)
+  b.loftAt('glovePalm', mir([
+    { c: [-0.0090, -0.0020, 0.0300], rx: 0.0086, ry: 0.0290, n: 3.6, wear: 0.10 },
+    { c: [-0.0120, -0.0010, 0.0140], rx: 0.0068, ry: 0.0345, n: 3.8, wear: 0.02 },
+    { c: [-0.0128, 0.0000, -0.0140], rx: 0.0060, ry: 0.0372, n: 3.8, wear: 0.02 },
+    { c: [-0.0116, -0.0020, -0.0380], rx: 0.0058, ry: 0.0350, n: 3.6, wear: 0.06 },
+    { c: [-0.0092, -0.0030, -0.0470], rx: 0.0050, ry: 0.0290, n: 3.2, wear: 0.14 },
+  ]), m, 14, 0, 58)
+  // Its stitched border, as raised piping with a dark thread line beside it.
+  // Individual stitches were tried and are the wrong call: at the hip a 0.8mm
+  // stitch is a single pixel, so it aliases instead of reading. A 2mm piping
+  // run is 2-3 pixels and resolves as a seam at every distance the hand is
+  // ever seen from.
+  for (const sy of [-1, 1]) {
+    local(0, 0, 0, m)
+    b.loftAt('glove', mir([
+      { c: [-0.0092, sy * 0.0300, 0.0290], rx: 0.0022, ry: 0.0016, n: 2.2, wear: 0.30 },
+      { c: [-0.0124, sy * 0.0352, 0.0130], rx: 0.0024, ry: 0.0018, n: 2.2, wear: 0.30 },
+      { c: [-0.0132, sy * 0.0378, -0.0140], rx: 0.0024, ry: 0.0018, n: 2.2, wear: 0.30 },
+      { c: [-0.0120, sy * 0.0356, -0.0380], rx: 0.0022, ry: 0.0016, n: 2.2, wear: 0.30 },
+    ]), m, 8, 0, 60)
+    local(0, 0, 0, m)
+    b.loftAt('dark', mir([
+      { c: [-0.0110, sy * 0.0286, 0.0288], rx: 0.0010, ry: 0.0008, n: 2.2 },
+      { c: [-0.0140, sy * 0.0336, 0.0128], rx: 0.0011, ry: 0.0009, n: 2.2 },
+      { c: [-0.0148, sy * 0.0362, -0.0140], rx: 0.0011, ry: 0.0009, n: 2.2 },
+      { c: [-0.0136, sy * 0.0340, -0.0378], rx: 0.0010, ry: 0.0008, n: 2.2 },
+    ]), m, 6, 0, 60)
+  }
+
+  // --- fingers -------------------------------------------------------------
   for (let f = 0; f < 4; f++) {
-    const fy = 0.032 - f * 0.0184
-    const chain = new THREE.Matrix4()
-    // Trigger discipline: the index finger lies straight along the receiver
-    // above the guard rather than curling into the trigger.
+    const F = FINGERS[f]
+    // Trigger discipline: the index lies straight along the receiver above the
+    // guard rather than curling into the trigger, with the small natural bend
+    // a finger keeps when it is indexed rather than rigid.
     const indexed = o.indexFinger === true && f === 0
-    local(-0.005, fy, indexed ? -0.030 : -0.026, chain)
-    // Splay along the grip so the fingers do not read as one slab.
-    chain.multiply(RX(indexed ? 0.30 : 0.07 - f * 0.05))
-    chain.multiply(RY(s * (indexed ? 0.14 : 0.55)))
+    const chain = new THREE.Matrix4()
+    local(-0.0035, F.y, F.z, chain)
+    chain.multiply(RX(indexed ? 0.34 : F.splay))
+    chain.multiply(RZ(s * F.roll))
+    chain.multiply(RY(s * (indexed ? 0.10 : 0.46)))
+    // MCP, PIP, DIP. A hand closed on a 32mm grip runs roughly 60/75/40
+    // degrees; the previous 45/47/36 is a hand resting on a rail, and the
+    // difference is whether the silhouette reads as a fist or a staircase.
     const bends = indexed
-      ? [0.12, 0.07, 0.05]
-      : [0.78 * curl, 0.82 * curl, 0.62 * curl]
-    const taper = f === 3 ? 0.86 : f === 0 ? 0.95 : 1
+      ? [0.14, 0.10, 0.16]
+      : [1.05 * curl, 1.30 * curl, 0.72 * curl]
+
+    // Knuckle dome on the back of the hand, standing proud of the metacarpus.
+    local(0.0090, F.y, F.z + 0.0035, m)
+    b.loftAt('glove', [
+      { c: [0, 0, 0.0075], rx: 0.0002, ry: 0.0002, n: 2 },
+      { c: [0, 0, 0.0035], rx: F.r0 * 0.78, ry: F.r0 * 0.86, n: 2.3, wear: 0.34 },
+      { c: [0, 0, -0.0040], rx: F.r0 * 0.82, ry: F.r0 * 0.90, n: 2.3, wear: 0.30 },
+      { c: [0, 0, -0.0105], rx: 0.0002, ry: 0.0002, n: 2 },
+    ], m, 10, 0, 56)
+
     for (let k = 0; k < 3; k++) {
       chain.multiply(RY(s * bends[k]))
-      const w = widths[k] * taper
-      const seg = new THREE.Matrix4().copy(chain).multiply(T(0, 0, -segLens[k] * taper * 0.5))
-      b.addGeom('glove', chamferBox(w, w * 0.95, segLens[k] * taper, 0.0045), seg, 0.14 + k * 0.10, 55)
+      const len = F.len[k]
+      const t0 = k / 3
+      const t1 = (k + 1) / 3
+      const rA = F.r0 + (F.r1 - F.r0) * t0
+      const rB = F.r0 + (F.r1 - F.r0) * t1
+      const rM = (rA + rB) * 0.5
+      const tip = k === 2
+
+      // The joint crease: a narrow band a millimetre under the phalanx
+      // radius, sitting between two segments that overlap it. Only a sliver of
+      // it is ever visible, which is the point — it is the dark line across a
+      // knuckle that turns a smooth tube into a jointed finger, and it reads
+      // at three pixels where a modelled wrinkle would need thirty.
+      m.copy(chain)
+      b.loftAt('dark', [
+        { c: [0, 0, 0.0026], rx: rA * 0.94, ry: rA * 0.90, n: 2.4 },
+        { c: [0, 0, -0.0030], rx: rA * 0.94, ry: rA * 0.90, n: 2.4 },
+      ], m, 10, 0, 60)
+
+      b.loftAt('glove', tip ? [
+        { c: [0, 0, 0.0010], rx: rA * 1.06, ry: rA, n: 2.6, wear: 0.10 },
+        { c: [0, 0, -len * 0.30], rx: rM * 1.02, ry: rM * 1.00, n: 2.5, wear: 0.06 },
+        { c: [0, 0, -len * 0.66], rx: rB * 1.00, ry: rB * 1.00, n: 2.4, wear: 0.14 },
+        { c: [0, 0, -len * 0.88], rx: rB * 0.82, ry: rB * 0.88, n: 2.3, wear: 0.34 },
+        { c: [0, 0, -len * 1.00], rx: 0.0003, ry: 0.0003, n: 2, wear: 0.55 },
+      ] : [
+        { c: [0, 0, 0.0012], rx: rA * 1.06, ry: rA, n: 2.6, wear: 0.12 },
+        { c: [0, 0, -len * 0.22], rx: rM * 1.03, ry: rM * 1.00, n: 2.5, wear: 0.04 },
+        { c: [0, 0, -len * 0.60], rx: rM * 0.99, ry: rM * 0.98, n: 2.4, wear: 0.04 },
+        { c: [0, 0, -len * 0.90], rx: rB * 0.98, ry: rB * 0.98, n: 2.4, wear: 0.10 },
+        { c: [0, 0, -len * 1.02], rx: rB * 0.90, ry: rB * 0.92, n: 2.4, wear: 0.22 },
+      ], m.copy(chain), 10, 0, 56)
+
+      // Grip pad on the inside of the two segments that touch the weapon.
       if (k < 2) {
-        const kn = new THREE.Matrix4().copy(chain).multiply(T(s * w * 0.35, 0, -segLens[k] * taper))
-        b.addGeom('glove', chamferBox(w * 0.8, w * 0.8, 0.009, 0.003), kn, 0.40, 55)
+        m.copy(chain).multiply(T(-s * rA * 0.66, 0, 0))
+        b.loftAt('glovePalm', [
+          { c: [0, 0, -len * 0.10], rx: rA * 0.42, ry: rA * 0.80, n: 3.0, wear: 0.10 },
+          { c: [0, 0, -len * 0.50], rx: rM * 0.46, ry: rM * 0.86, n: 3.2, wear: 0.02 },
+          { c: [0, 0, -len * 0.88], rx: rB * 0.42, ry: rB * 0.80, n: 3.0, wear: 0.10 },
+        ], m, 10, 0, 62)
       }
-      chain.multiply(T(0, 0, -segLens[k] * taper))
+      chain.multiply(T(0, 0, -len))
     }
   }
 
-  // Thumb laid over the top.
+  // --- thumb ---------------------------------------------------------------
+  // Opposed, which is the cue the critics called out by its absence: it leaves
+  // the radial side of the palm at a wide angle, rolls under, and its pad
+  // faces the fingers rather than lying flat along the top like a fifth finger.
+  //
+  // The chain is aimed rather than dialled in. `RX` first swings the digit off
+  // the fingers' axis toward the radial side, then `RY` about the swung frame
+  // brings it across the palm; solving those two for a metacarpal pointing
+  // (-0.45, +0.55, -0.70) — palmar, radial, distal, which is where a thumb
+  // actually leaves the wrist — gives 0.67 and 0.47. A thumb laid over the
+  // handguard needs the same joint, less flexion and more forward reach, so
+  // both angles and all three bends move together under `thumbOver` instead of
+  // the digit being re-posed by eye.
+  const over = o.thumbOver === true
   const thumb = new THREE.Matrix4()
-  local(0.010, 0.030, 0.008, thumb)
-  thumb.multiply(RY(s * (o.thumbOver ? 0.95 : 0.55)))
-  thumb.multiply(RX(o.thumbOver ? 0.15 : -0.35))
-  const t0 = new THREE.Matrix4().copy(thumb).multiply(T(0, 0, -0.019))
-  b.addGeom('glove', chamferBox(0.017, 0.017, 0.038, 0.006), t0, 0.2, 55)
-  thumb.multiply(T(0, 0, -0.036))
-  thumb.multiply(RY(s * 0.45))
-  const t1 = new THREE.Matrix4().copy(thumb).multiply(T(0, 0, -0.014))
-  b.addGeom('glove', chamferBox(0.0145, 0.0145, 0.030, 0.005), t1, 0.35, 55)
+  local(-0.0075, 0.0250, 0.0105, thumb)
+  thumb.multiply(RX(over ? 0.40 : 0.67))
+  thumb.multiply(RY(s * (over ? 0.34 : 0.62)))
+  {
+    // Metacarpal, blended into the thenar it emerges from.
+    b.loftAt('glove', [
+      { c: [0, 0, 0.0110], rx: 0.0140, ry: 0.0150, n: 2.8, wear: 0.02 },
+      { c: [0, 0, -0.0060], rx: 0.0134, ry: 0.0142, n: 2.6, wear: 0.02 },
+      { c: [0, 0, -0.0230], rx: 0.0120, ry: 0.0124, n: 2.5, wear: 0.04 },
+      { c: [0, 0, -0.0330], rx: 0.0112, ry: 0.0115, n: 2.4, wear: 0.08 },
+    ], m.copy(thumb), 14, 0, 52)
+    thumb.multiply(T(0, 0, -0.0330))
+    thumb.multiply(RY(s * (over ? 0.22 : 0.52)))
+    thumb.multiply(RX(over ? 0.14 : -0.10))
+    b.loftAt('dark', [
+      { c: [0, 0, 0.0030], rx: 0.0104, ry: 0.0107, n: 2.4 },
+      { c: [0, 0, -0.0034], rx: 0.0104, ry: 0.0107, n: 2.4 },
+    ], m.copy(thumb), 12, 0, 60)
+    // Proximal phalanx.
+    b.loftAt('glove', [
+      { c: [0, 0, 0.0022], rx: 0.0116, ry: 0.0118, n: 2.5, wear: 0.10 },
+      { c: [0, 0, -0.0110], rx: 0.0110, ry: 0.0112, n: 2.4, wear: 0.03 },
+      { c: [0, 0, -0.0250], rx: 0.0102, ry: 0.0104, n: 2.4, wear: 0.06 },
+      { c: [0, 0, -0.0312], rx: 0.0094, ry: 0.0096, n: 2.4, wear: 0.18 },
+    ], m.copy(thumb), 12, 0, 56)
+    m2.copy(thumb).multiply(T(-s * 0.0076, 0, 0))
+    b.loftAt('glovePalm', [
+      { c: [0, 0, -0.0030], rx: 0.0046, ry: 0.0090, n: 3.0, wear: 0.08 },
+      { c: [0, 0, -0.0155], rx: 0.0050, ry: 0.0096, n: 3.2, wear: 0.02 },
+      { c: [0, 0, -0.0272], rx: 0.0044, ry: 0.0086, n: 3.0, wear: 0.10 },
+    ], m2, 10, 0, 62)
+    thumb.multiply(T(0, 0, -0.0312))
+    thumb.multiply(RY(s * (over ? 0.30 : 0.86)))
+    b.loftAt('dark', [
+      { c: [0, 0, 0.0026], rx: 0.0092, ry: 0.0094, n: 2.4 },
+      { c: [0, 0, -0.0030], rx: 0.0092, ry: 0.0094, n: 2.4 },
+    ], m.copy(thumb), 12, 0, 60)
+    // Distal phalanx, rounded off at the tip.
+    b.loftAt('glove', [
+      { c: [0, 0, 0.0018], rx: 0.0102, ry: 0.0102, n: 2.5, wear: 0.10 },
+      { c: [0, 0, -0.0095], rx: 0.0100, ry: 0.0098, n: 2.4, wear: 0.05 },
+      { c: [0, 0, -0.0185], rx: 0.0088, ry: 0.0086, n: 2.3, wear: 0.16 },
+      { c: [0, 0, -0.0232], rx: 0.0058, ry: 0.0060, n: 2.2, wear: 0.38 },
+      { c: [0, 0, -0.0258], rx: 0.0003, ry: 0.0003, n: 2, wear: 0.55 },
+    ], m.copy(thumb), 12, 0, 56)
+  }
 
-  // Wrist, cuff and camo sleeve running off frame.
-  const w = o.wrist
+  // --- knuckle armour, wrist cinch and cuff --------------------------------
+  // Moulded pads over the four metacarpal heads plus the bridge that joins
+  // them. This is the single most recognisable feature of a tactical glove and
+  // the only part of the hand allowed a hard edge.
+  for (let f = 0; f < 4; f++) {
+    const F = FINGERS[f]
+    local(0.0125, F.y, F.z + 0.0090, m)
+    m.multiply(RX(-0.10))
+    b.loftAt('rubber', mir([
+      { c: [0, 0, 0.0000], rx: 0.0028, ry: F.r0 * 1.02, n: 3.4, wear: 0.20 },
+      { c: [-0.0016, 0, -0.0075], rx: 0.0038, ry: F.r0 * 1.16, n: 3.6, wear: 0.10 },
+      { c: [-0.0022, 0, -0.0165], rx: 0.0036, ry: F.r0 * 1.10, n: 3.6, wear: 0.14 },
+      { c: [-0.0034, 0, -0.0215], rx: 0.0026, ry: F.r0 * 0.86, n: 3.2, wear: 0.36 },
+    ]), m, 12, 0, 54)
+  }
+  local(0.0118, 0.0010, -0.0170, m)
+  b.loftAt('rubber', [
+    { c: [0, 0, 0.0090], rx: 0.0030, ry: 0.0350, n: 4.0, wear: 0.16 },
+    { c: [0.0004, 0.0006, -0.0020], rx: 0.0034, ry: 0.0392, n: 4.2, wear: 0.06 },
+    { c: [0, 0.0004, -0.0110], rx: 0.0030, ry: 0.0380, n: 4.0, wear: 0.16 },
+  ], m, 14, 0, 50)
+
+  // Forearm: a real wrist section carried on out of the metacarpus rather than
+  // a tube starting somewhere else.
+  //
+  // `o.wrist` is an authored point in *weapon* space and the hand is an
+  // authored point in weapon space, and nothing was keeping the two together:
+  // rendered in isolation the arm was a capped cylinder floating a couple of
+  // centimetres clear of a hand that ended in a flat disc. The wrist is a
+  // property of the hand, so it is derived from the hand's own frame now and
+  // `o.wrist` only aims the forearm.
+  local(0, 0, 0, m)
+  b.loftAt('glove', mir([
+    { c: [0.0002, 0.0006, 0.0378], rx: 0.0158, ry: 0.0302, n: 2.6, wear: 0.02 },
+    { c: [0.0000, 0.0000, 0.0470], rx: 0.0176, ry: 0.0288, n: 2.5, wear: 0.02 },
+    { c: [-0.0004, -0.0006, 0.0570], rx: 0.0198, ry: 0.0272, n: 2.4, wear: 0.04 },
+  ]), m, 16, 0, 46)
+
+  // Cinch strap around the wrist, its hook-and-loop closure standing off the
+  // back of the hand, and the pull tab on the end of it.
+  local(0, 0, 0, m)
+  b.loftAt('dark', mir([
+    { c: [0.0000, 0.0000, 0.0430], rx: 0.0182, ry: 0.0300, n: 2.5, wear: 0.10 },
+    { c: [-0.0002, -0.0003, 0.0490], rx: 0.0192, ry: 0.0292, n: 2.5, wear: 0.04 },
+    { c: [-0.0004, -0.0006, 0.0552], rx: 0.0202, ry: 0.0280, n: 2.4, wear: 0.12 },
+  ]), m, 16, 0, 46)
+  local(0.0198, 0.0055, 0.0490, m)
+  b.addGeom('glove', chamferBox(0.0044, 0.0230, 0.0165, 0.0012), m, 0.24, 56)
+  local(0.0232, 0.0050, 0.0490, m)
+  b.addGeom('dark', chamferBox(0.0022, 0.0170, 0.0120, 0.0006), m, 0.10, 60)
+  local(0.0140, -0.0272, 0.0560, m)
+  m.multiply(RZ(s * 0.35))
+  b.addGeom('glove', chamferBox(0.0034, 0.0135, 0.0090, 0.0010), m, 0.34, 58)
+
+  // Wrist, cuff and camo sleeve running off frame. The run starts at the
+  // hand's own wrist ring and aims at the elbow, so no authored pair of points
+  // can pull the arm off the hand.
+  _b.set(0, 0, 0.0545).applyMatrix4(base)
+  const w: [number, number, number] = [_b.x, _b.y, _b.z]
   const e = o.elbow
-  tubeBetween(b, 'glove', 0.026, 0.024, [w[0], w[1], w[2]], [
+  tubeBetween(b, 'glove', 0.0268, 0.0250, [w[0], w[1], w[2]], [
     w[0] + (e[0] - w[0]) * 0.16, w[1] + (e[1] - w[1]) * 0.16, w[2] + (e[2] - w[2]) * 0.16,
-  ], 12, 0.15, 40)
-  tubeBetween(b, 'dark', 0.0285, 0.0285, [
-    w[0] + (e[0] - w[0]) * 0.14, w[1] + (e[1] - w[1]) * 0.14, w[2] + (e[2] - w[2]) * 0.14,
+  ], 14, 0.10, 40)
+  tubeBetween(b, 'dark', 0.0292, 0.0292, [
+    w[0] + (e[0] - w[0]) * 0.13, w[1] + (e[1] - w[1]) * 0.13, w[2] + (e[2] - w[2]) * 0.13,
   ], [
-    w[0] + (e[0] - w[0]) * 0.26, w[1] + (e[1] - w[1]) * 0.26, w[2] + (e[2] - w[2]) * 0.26,
-  ], 12, 0.3, 40)
+    w[0] + (e[0] - w[0]) * 0.25, w[1] + (e[1] - w[1]) * 0.25, w[2] + (e[2] - w[2]) * 0.25,
+  ], 14, 0.3, 40)
   // The sleeve only exists to carry the arm off the bottom edge of the frame.
   // Running it all the way to the elbow, as both arms used to, put 26cm of cone
   // below the frame on the right hand: geometry no pose can see, but whose
@@ -2306,6 +2858,9 @@ function addRedDot(b: PartBuilder, root: THREE.Group, z: number, railTop: number
   const mountTop = axisY - r - 0.001
   b.box('anodised', [0.026, mountTop - railTop, 0.052], [0, (railTop + mountTop) * 0.5, z], { c: 0.0022, uv: 34, wear: 0.25 })
   b.box('anodised', [0.032, 0.009, 0.034], [0, railTop + 0.004, z + 0.004], { c: 0.0018, uv: 34, wear: 0.35 })
+  // Cap screws clamping the tube into the ring, and the cross-bolt nut behind.
+  for (const dz of [-0.016, 0.016]) addScrew(b, [0.0132, mountTop - 0.004, z + dz], 0.0032, 'x')
+  b.tube('steel', 0.0044, 0.0044, 0.0030, [0.0143, railTop + 0.004, z + 0.004], { axis: 'x', seg: 6, faceted: true, uv: 52, wear: 0.8 })
   // QD throw lever on the left, below the tube. Anodised, not bare steel: it
   // sits just outside the sight window at full ADS, where a polished 20mm
   // block is the brightest thing in an aiming frame — it was reading as a
@@ -2444,6 +2999,60 @@ function addFoldedSights(b: PartBuilder, railTop: number, zFront: number, zRear:
 }
 
 /**
+ * Socket-head cap screw: a chamfered head with a real hex recess in it.
+ *
+ * Every screw on a rifle is a small bright disc with a black hole in the
+ * middle, and a black hole 2mm across next to a lit 5mm head is about as much
+ * local contrast as a single square centimetre of a weapon can carry. There
+ * are a dozen of them on a real carbine — barrel nut, optic mount, gas block,
+ * rail — and the model had none.
+ */
+function addScrew(
+  b: PartBuilder, pos: [number, number, number], r: number,
+  axis: 'x' | 'y' | 'z', rot?: [number, number, number],
+): void {
+  b.tube('steel', r, r, 0.0026, pos, { axis, rot, seg: 8, faceted: true, uv: 52, wear: 0.75 })
+  // The recess sits a third of a millimetre proud of the head's outer face and
+  // half a millimetre inside its back, so the eye sees into it from outside
+  // and never through it from behind.
+  const d = r * 0.52
+  const n: [number, number, number] = [
+    pos[0] + (axis === 'x' ? 0.0004 : 0),
+    pos[1] + (axis === 'y' ? 0.0004 : 0),
+    pos[2] + (axis === 'z' ? 0.0004 : 0),
+  ]
+  b.tube('bore', d, d, 0.0024, n, { axis, rot, seg: 6, caps: false, uv: 56 })
+}
+
+/**
+ * Receiver end plate, castle nut and its staking notches.
+ *
+ * This is the joint between the two halves of the weapon and it sits about
+ * 12cm from the eye at the hip, right where the receiver hands off to the
+ * stock. It was a bare butt between a box and a cylinder. A real one carries a
+ * stamped end plate with a sling loop on it and a six-notch castle nut staked
+ * against rotation, and the notches are the highest-frequency run of geometry
+ * anywhere on the weapon.
+ */
+function addCastleNut(b: PartBuilder, y: number, z: number, rTube: number): void {
+  b.box('phosphate', [0.035, 0.042, 0.0032], [0, y, z], { c: 0.0010, uv: 44, wear: 0.5 })
+  // Ambidextrous sling loop stamped into the plate.
+  b.box('phosphate', [0.0055, 0.0130, 0.0090], [-0.0182, y + 0.011, z + 0.001], { c: 0.0014, uv: 48, wear: 0.7 })
+  b.tube('bore', 0.0034, 0.0034, 0.0060, [-0.0182, y + 0.011, z + 0.001], { axis: 'x', seg: 8, caps: false, uv: 50 })
+  const zn = z + 0.0072
+  b.tube('phosphate', rTube + 0.0042, rTube + 0.0042, 0.0110, [0, y, zn], {
+    seg: 18, faceted: true, caps: false, uv: 44, wear: 0.35,
+  })
+  // Six castle notches around the rim, one of them staked over.
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * Math.PI * 2 + 0.26
+    b.box('dark', [0.0038, 0.0038, 0.0062], [
+      Math.sin(a) * (rTube + 0.0030), y + Math.cos(a) * (rTube + 0.0030), zn + 0.0026,
+    ], { rot: [0, 0, -a], c: 0.0006, uv: 54, wear: 0.05 })
+  }
+}
+
+/**
  * Collapsible carbine stock riding a buffer tube.
  *
  * The stock is the closest and largest thing the camera ever sees. At the hip
@@ -2477,12 +3086,21 @@ function addCarbineStock(b: PartBuilder, zTube0: number, zTube1: number, y: numb
   // and was the hottest strip on the weapon at every hip pose. A mil-spec
   // buffer tube is a matte conversion coating, so it takes `phosphate`.
   b.tube('phosphate', 0.0155, 0.0155, len, [0, y, (zTube0 + zTube1) * 0.5], { seg: 16, faceted: true, caps: false, uv: 34, wear: 0.08 })
-  // Adjustment detent notches along the underside of the tube.
+  // Adjustment detent notches along the underside of the tube, each flanked by
+  // the raised ribs a mil-spec extension is broached with. The tube is a bare
+  // 31mm cylinder for 15cm of its length and the ribs are the only thing that
+  // tells the eye it is a machined part rather than a drawn pipe.
   for (let i = 0; i < 6; i++) {
     const z = zTube0 + 0.035 + i * 0.024
     if (z > zTube1 - 0.01) break
     b.box('dark', [0.010, 0.005, 0.008], [0, y - 0.0155, z], { c: 0.0012, uv: 40, wear: 0.4 })
+    b.box('phosphate', [0.013, 0.0030, 0.0034], [0, y - 0.0158, z - 0.0072], { c: 0.0007, uv: 52, wear: 0.6 })
+    b.box('phosphate', [0.013, 0.0030, 0.0034], [0, y - 0.0158, z + 0.0072], { c: 0.0007, uv: 52, wear: 0.6 })
   }
+  // Index rib along the top of the tube, under the stock's channel.
+  b.box('phosphate', [0.0060, 0.0034, len - 0.020], [0, y + 0.0160, (zTube0 + zTube1) * 0.5], {
+    c: 0.0008, uv: 48, wear: 0.45,
+  })
 
   const zBody = zTube1 - 0.075
   const yBody = y + 0.004
@@ -2513,6 +3131,30 @@ function addCarbineStock(b: PartBuilder, zTube0: number, zTube1: number, y: numb
   for (const dz of [-0.038, -0.013, 0.012, 0.037]) {
     b.box('stock', [0.015, 0.005, 0.009], [0, y + 0.0385, zComb + dz], { rot: [0.05, 0, 0], c: 0.001, uv: 48, wear: 0.16 })
   }
+  // Cheek-weld serrations along the top of each comb rail, and a recessed
+  // panel down the outer flank of each.
+  //
+  // This is the surface with the strongest claim on triangles anywhere on the
+  // weapon: at full ADS the eye sits 26mm above it and the two rails plus the
+  // channel between them fill the bottom fifth of the frame. Flattening the
+  // normal map on `stock` took the false granite off it and would have left
+  // three smooth grey bars in its place, so the relief has to come back as
+  // geometry — 1.2mm ribs at a 7mm pitch, which is one cast texture panel and
+  // resolves as a run of light and shade rather than as noise.
+  for (const sx of [-1, 1]) {
+    for (let i = 0; i < 13; i++) {
+      const dz = -0.042 + i * 0.007
+      b.box('stock', [0.0068, 0.0034, 0.0034], [sx * 0.0112, y + 0.0436, zComb + dz], {
+        rot: [0.05, 0, 0], c: 0.0007, uv: 56, wear: 0.34,
+      })
+    }
+    b.box('dark', [0.0016, 0.0068, 0.098], [sx * 0.0150, y + 0.0375, zComb], {
+      rot: [0.05, 0, 0], c: 0.0004, uv: 56, wear: 0.04,
+    })
+    b.box('stock', [0.0022, 0.0100, 0.098], [sx * 0.0158, y + 0.0375, zComb], {
+      rot: [0.05, 0, 0], c: 0.0006, uv: 52, wear: 0.26,
+    })
+  }
 
   // Toe of the stock, angled, with the moulding ribs down each side.
   b.box('stock', [0.036, 0.030, 0.055], [0, y - 0.030, zBody + 0.020], { rot: [-0.25, 0, 0], c: 0.004, uv: 40, wear: 0.06 })
@@ -2535,9 +3177,25 @@ function addCarbineStock(b: PartBuilder, zTube0: number, zTube1: number, y: numb
   // Rubber buttpad, grooved. Rubber does not polish, so the wear term that had
   // it at 0.35 was putting a sheen on the one part guaranteed to be matte.
   b.box('rubber', [0.044, 0.078, 0.016], [0, y + 0.002, zTube1 + 0.006], { rot: [-0.08, 0, 0], c: 0.004, uv: 40, wear: 0.12 })
-  for (const dy of [-0.024, -0.008, 0.008, 0.024]) {
-    b.box('dark', [0.040, 0.005, 0.004], [0, y + 0.002 + dy, zTube1 + 0.0135], { rot: [-0.08, 0, 0], c: 0.001, uv: 48 })
+  // Moulded tread on the pad face, as a grid rather than four long grooves.
+  //
+  // At the hip this face is the nearest surface in the frame and one of the
+  // largest, and four parallel lines across a flat rectangle is the one
+  // pattern guaranteed to read as a slab with decals on it. A real recoil pad
+  // is a chequer of raised blocks: crossing the grooves turns the same part
+  // into twelve separate lit facets with a shadow around each.
+  for (const dy of [-0.030, -0.015, 0, 0.015, 0.030]) {
+    b.box('dark', [0.041, 0.0042, 0.0040], [0, y + 0.002 + dy, zTube1 + 0.0135], { rot: [-0.08, 0, 0], c: 0.0009, uv: 52 })
   }
+  for (const dx of [-0.0125, 0.0125]) {
+    b.box('dark', [0.0042, 0.070, 0.0040], [dx, y + 0.002, zTube1 + 0.0135], { rot: [-0.08, 0, 0], c: 0.0009, uv: 52 })
+  }
+  // Raised border around the tread field, and the toe cap at the bottom.
+  for (const sx of [-1, 1]) {
+    b.box('rubber', [0.0038, 0.076, 0.0055], [sx * 0.0198, y + 0.002, zTube1 + 0.0130], { rot: [-0.08, 0, 0], c: 0.0010, uv: 48, wear: 0.5 })
+  }
+  b.box('rubber', [0.044, 0.0055, 0.0060], [0, y - 0.0355, zTube1 + 0.0128], { rot: [-0.08, 0, 0], c: 0.0012, uv: 48, wear: 0.55 })
+  b.box('rubber', [0.044, 0.0055, 0.0060], [0, y + 0.0395, zTube1 + 0.0128], { rot: [-0.08, 0, 0], c: 0.0012, uv: 48, wear: 0.55 })
 }
 
 export type WeaponKind = 'rifle' | 'smg' | 'sniper' | 'pistol'
@@ -2657,6 +3315,22 @@ function buildRifle(mats: WeaponMaterials): WeaponModel {
   addTriggerGuard(b, 'gunmetal', -0.014, 0.040, -0.026, 0.036)
   addPistolGrip(b, 'polymer', [0, -0.026, 0.030], 0.115, 0.36)
 
+  // Roll marks on the magwell flank. Engraved rather than printed: a 0.4mm
+  // recess in `dark` reads as a stamp at any angle and needs no decal texture,
+  // and the run of them is the only writing on the weapon.
+  for (let i = 0; i < 4; i++) {
+    b.box('dark', [0.0014, 0.0028, 0.0180 - i * 0.0026], [-0.0178, -0.0455 - i * 0.0052, -0.0640 + i * 0.0012], {
+      c: 0.0003, uv: 64,
+    })
+  }
+  // Trigger and hammer pin heads, both flanks. Small bare-steel discs standing
+  // in a phosphate field: the highest-contrast 5mm on the lower receiver.
+  for (const sx of [-1, 1]) {
+    for (const z of [0.0060, 0.0295]) {
+      b.tube('steel', 0.0040, 0.0040, 0.0022, [sx * 0.0174, -0.0330, z], { axis: 'x', seg: 10, uv: 52, wear: 0.85 })
+    }
+  }
+
   b.into(s.trigger)
   s.trigger.position.set(0, -0.026, 0.014)
   b.box('steel', [0.008, 0.030, 0.010], [0, -0.016, 0.002], { rot: [0.12, 0, 0], c: 0.002, uv: 44, wear: 0.7 })
@@ -2672,8 +3346,15 @@ function buildRifle(mats: WeaponMaterials): WeaponModel {
   b.tube('phosphate', 0.0132, 0.0132, 0.026, [0, 0, -0.162], { seg: 16, uv: 30, wear: 0.3 })
   b.tube('phosphate', 0.0102, 0.0092, 0.290, [0, 0, -0.320], { seg: 16, caps: false, uv: 26 })
   b.tube('phosphate', 0.0112, 0.0102, 0.030, [0, 0, -0.480], { seg: 16, caps: false, uv: 30, wear: 0.2 })
-  // Low-profile gas block and gas tube.
-  b.box('phosphate', [0.024, 0.028, 0.034], [0, 0.004, -0.414], { c: 0.002, uv: 34, wear: 0.35 })
+  // Low-profile gas block: a shouldered body with the two set screws that
+  // clamp it to the barrel, the roll pin through the gas tube, and a chamfered
+  // shelf on top. It lives under the handguard, so it is only seen through the
+  // M-LOK slots and past the front collar — which is exactly the kind of thing
+  // whose absence reads as an empty shell rather than a mechanism.
+  b.box('phosphate', [0.024, 0.028, 0.034], [0, 0.004, -0.414], { c: 0.0026, uv: 34, wear: 0.35 })
+  b.box('phosphate', [0.020, 0.007, 0.030], [0, 0.0155, -0.414], { c: 0.0016, uv: 40, wear: 0.55 })
+  for (const z of [-0.4235, -0.4045]) addScrew(b, [0, -0.0088, z], 0.0034, 'y', [0, 0, Math.PI])
+  b.tube('steel', 0.0016, 0.0016, 0.022, [0, 0.0128, -0.4235], { axis: 'x', seg: 8, uv: 52, wear: 0.85 })
   b.tube('steel', 0.0032, 0.0032, 0.250, [0, 0.0155, -0.290], { seg: 8, caps: false, uv: 40, wear: 0.25 })
 
   // Octagonal free-float handguard, panelled with real M-LOK cut-outs. Facet
@@ -2682,12 +3363,28 @@ function buildRifle(mats: WeaponMaterials): WeaponModel {
     zRear: -0.163, zFront: -0.447, radius: 0.0262,
     slotLen: 0.032, slotGap: 0.013, slotWidth: 0.0086, solidFacets: [2],
   })
-  // QD sling socket on the left facet, forward of the first slot.
+  // QD sling socket on the left facet, forward of the first slot, and a
+  // stamped sling loop on the same panel behind it.
   b.tube('steel', 0.0062, 0.0062, 0.008, [-0.0262, 0.000, -0.428], { axis: 'x', seg: 12, uv: 40, wear: 0.7 })
   b.tube('bore', 0.0036, 0.0036, 0.011, [-0.0272, 0.000, -0.428], { axis: 'x', seg: 10, caps: false, uv: 40 })
+  b.box('anodised', [0.0050, 0.0170, 0.0075], [-0.0272, -0.0110, -0.1880], { rot: [0, 0, 0.5], c: 0.0012, uv: 48, wear: 0.65 })
+  b.tube('bore', 0.0028, 0.0028, 0.0060, [-0.0278, -0.0128, -0.1880], { axis: 'x', seg: 8, caps: false, uv: 52 })
+
+  // Barrel-nut screws clamping the handguard to its shoulder. Six around the
+  // rear collar, only the upper four of which any first person angle sees.
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * Math.PI * 2 + Math.PI / 6
+    addScrew(b, [Math.sin(a) * 0.0250, Math.cos(a) * 0.0250, -0.1660], 0.0034, 'z', [0, 0, -a])
+  }
 
   // Continuous top rail from the receiver to the handguard front.
   addRail(b, 0, railBase, -0.440, 0.100)
+  // Index marks down the left edge of the rail, one every fifth recoil slot.
+  // Engraved T-numbers are unreadable at any first person distance; the run of
+  // ticks is what actually reads, and it is 0.4mm of geometry each.
+  for (let i = 0; i < 9; i++) {
+    b.box('dark', [0.0026, 0.0016, 0.0026], [-0.0093, railBase + 0.0044, -0.408 + i * 0.0510], { c: 0.0004, uv: 64 })
+  }
   addFoldedSights(b, railTop, -0.400, 0.062)
 
   // --- muzzle device ------------------------------------------------------
@@ -2708,6 +3405,7 @@ function buildRifle(mats: WeaponMaterials): WeaponModel {
   // --- stock ---------------------------------------------------------------
   // Second-from-collapsed position: 79cm overall. A fully extended stock puts
   // the buttpad through the near plane in any usable first person framing.
+  addCastleNut(b, 0.004, 0.1120, 0.0155)
   addCarbineStock(b, 0.100, 0.248, 0.004)
 
   // --- charging handle -----------------------------------------------------
@@ -2729,10 +3427,9 @@ function buildRifle(mats: WeaponMaterials): WeaponModel {
   b.into(s.rh)
   addHand(b, {
     side: 1,
-    palm: [0.0325, -0.080, 0.048],
+    palm: [0.0325, -0.0716, 0.0705],
     rot: [-0.36, 0, 0.06],
-    wrist: [0.042, -0.128, 0.084],
-    elbow: [0.185, -0.430, 0.150],
+    elbow: [0.190, -0.430, 0.160],
     curl: 1,
     indexFinger: true,
     // Fully below the bottom edge by 0.21 of the way to the elbow in every
@@ -2744,9 +3441,15 @@ function buildRifle(mats: WeaponMaterials): WeaponModel {
   b.into(s.lh)
   addHand(b, {
     side: -1,
-    palm: [-0.0435, -0.006, -0.300],
-    rot: [-Math.PI / 2 + 0.12, 0, 0.1],
-    wrist: [-0.052, -0.032, -0.252],
+    // The support hand wraps a 52mm handguard, so its geometry is solved
+    // rather than eyeballed: the metacarpal head row has to sit at the tube
+    // radius plus a finger radius (34mm) on the lower-left shoulder, and the
+    // roll about Y is whatever puts the finger chain tangent to the tube
+    // there. That lands the derived wrist level with the bore instead of above
+    // it, which is what keeps the forearm running back toward the elbow
+    // instead of climbing across the frame.
+    palm: [-0.0545, -0.0180, -0.2960],
+    rot: [-Math.PI / 2 + 0.10, 1.25, 0.10],
     elbow: [-0.200, -0.290, -0.040],
     curl: 0.92,
     thumbOver: true,
@@ -2864,9 +3567,8 @@ function buildSmg(mats: WeaponMaterials): WeaponModel {
   b.into(s.rh)
   addHand(b, {
     side: 1,
-    palm: [0.0300, -0.080, 0.046],
+    palm: [0.0300, -0.0729, 0.0689],
     rot: [-0.30, 0, 0.06],
-    wrist: [0.038, -0.124, 0.078],
     elbow: [0.180, -0.420, 0.145],
     curl: 1,
     indexFinger: true,
@@ -2875,9 +3577,8 @@ function buildSmg(mats: WeaponMaterials): WeaponModel {
   b.into(s.lh)
   addHand(b, {
     side: -1,
-    palm: [-0.0295, -0.062, -0.214],
+    palm: [-0.0295, -0.0547, -0.1933],
     rot: [-0.34, 0, -0.12],
-    wrist: [-0.036, -0.104, -0.184],
     elbow: [-0.195, -0.320, -0.020],
     curl: 1,
     sleeveEnd: 1.00,
@@ -2992,9 +3693,8 @@ function buildSniper(mats: WeaponMaterials): WeaponModel {
   b.into(s.rh)
   addHand(b, {
     side: 1,
-    palm: [0.0325, -0.088, 0.070],
+    palm: [0.0325, -0.0832, 0.0935],
     rot: [-0.20, 0, 0.06],
-    wrist: [0.042, -0.134, 0.104],
     elbow: [0.185, -0.430, 0.165],
     curl: 1,
     indexFinger: true,
@@ -3003,9 +3703,8 @@ function buildSniper(mats: WeaponMaterials): WeaponModel {
   b.into(s.lh)
   addHand(b, {
     side: -1,
-    palm: [-0.0430, -0.010, -0.288],
-    rot: [-Math.PI / 2 + 0.10, 0, 0.1],
-    wrist: [-0.050, -0.034, -0.240],
+    palm: [-0.0536, -0.0209, -0.2885],
+    rot: [-Math.PI / 2 + 0.10, 1.25, 0.10],
     elbow: [-0.205, -0.300, -0.030],
     curl: 0.9,
     thumbOver: true,
@@ -3108,9 +3807,8 @@ function buildPistol(mats: WeaponMaterials): WeaponModel {
   b.into(s.rh)
   addHand(b, {
     side: 1,
-    palm: [0.0295, -0.088, 0.058],
+    palm: [0.0295, -0.0814, 0.0811],
     rot: [-0.28, 0, 0.05],
-    wrist: [0.038, -0.132, 0.090],
     elbow: [0.170, -0.420, 0.150],
     curl: 1,
     indexFinger: true,
@@ -3119,9 +3817,8 @@ function buildPistol(mats: WeaponMaterials): WeaponModel {
   b.into(s.lh)
   addHand(b, {
     side: -1,
-    palm: [-0.0295, -0.086, 0.052],
+    palm: [-0.0295, -0.0794, 0.0751],
     rot: [-0.28, 0, -0.05],
-    wrist: [-0.040, -0.128, 0.086],
     elbow: [-0.180, -0.410, 0.150],
     curl: 0.75,
     thumbOver: true,

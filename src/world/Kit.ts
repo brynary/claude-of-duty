@@ -328,6 +328,25 @@ export function impactChip(radius: number, depth: number, seg = 6): THREE.Buffer
   return s.toGeometry()
 }
 
+/**
+ * A single flat rectangle in the XY plane, one winding, two triangles.
+ *
+ * `plate` and `decalQuad` both give a sheet the eye has to look through
+ * *twice*: a plate has a front and a back face, a decal is wound both ways.
+ * That is free on an opaque prop and wrong on a blended one — a pane of glass
+ * built as a plate composites its own alpha over itself and turns a 0.86 pane
+ * into a 0.98 one, which is precisely how a dirty window ends up reading as a
+ * sheet of painted board. The materials this is for are already `DoubleSide`,
+ * so the second winding buys nothing anyway.
+ */
+export function planeQuad(w: number, h: number): THREE.BufferGeometry {
+  const s = new TriSoup()
+  // Wound so the normal is -Z, which is the outward direction every wall in
+  // the kit is authored against.
+  s.quad(v3(-w / 2, -h / 2, 0), v3(-w / 2, h / 2, 0), v3(w / 2, h / 2, 0), v3(w / 2, -h / 2, 0), false)
+  return s.toGeometry()
+}
+
 /** An irregular flat quad hugging a wall — soot, water staining, torn posters. */
 export function decalQuad(w: number, h: number, jitter = 0.12, seed = 1): THREE.BufferGeometry {
   const s = new TriSoup()

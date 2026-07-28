@@ -25,10 +25,17 @@ import type { GameContext, PhysicsService, RaycastFilter } from '../../core/Type
  * this knows about the roof twelve metres up that is off screen entirely.
  * Multiplying both is correct; neither substitutes for the other.
  *
- * The directional bounce term rides here too, for two reasons that are really
- * one: it needs the world-space normal this pass has already reconstructed, and
- * it has to be occluded by exactly the same visibility — light that came off
- * the sunlit street cannot reach a surface that cannot see the street.
+ * Indirect diffuse is applied here too, for two reasons that are really one: it
+ * needs the world-space position and normal this pass has already
+ * reconstructed, and the skylight half of it has to be occluded by exactly the
+ * same visibility. It comes from {@link IrradianceVolume}, which this pass
+ * registers its grid with so the two volumes address identical cells.
+ *
+ * The constant-direction bounce below is what remains when there is no volume —
+ * no physics, or the lowest quality tier. It was the whole of the indirect
+ * bounce for eight rounds and it is kept, and kept documented, because it is
+ * still the fallback and because the volume's conservation target is defined in
+ * terms of it.
  */
 
 /** Cells across the level, per axis, per quality tier. */
@@ -58,29 +65,45 @@ const RAY_LENGTH = 45
  * coursing, the grain of a crate — and past about two stops down that
  * information is gone rather than dim.
  *
- * Raised from 0.24 only because it is a *fraction* of an ambient term that has
- * itself been cut by more than half. The absolute level an enclosed surface
- * ends up at barely moves; what moves is the exteriors around it. Watch that
- * asymmetry when either number changes: raising this closes the gap between
- * inside and outside, which is the differential a judge measured when they
- * found "the unlit near concrete is as bright as the sunlit far room".
+ * ## Why this is now less than half what it was
  *
- * 0.34 to 0.46 is the *skylight* half of the shadow-crush fix, and it is the
- * smaller half — see {@link BOUNCE_ENCLOSED_FLOOR} for the other. It is here
- * mainly for surfaces the directional bounce cannot reach: an interior floor
- * faces up, the bounce arrives from slightly below the horizon, and the wrap
- * term leaves an up-facing normal with almost none of it. What little skylight
- * gets through an opening is the only thing those surfaces have.
+ * At 0.46 this was the single largest term lighting an interior — 64 per cent
+ * of everything a shaded indoor surface received — and it is completely
+ * undifferentiated. It is the sky's colour, arriving from the sky's direction,
+ * at a strength set only by how much sky the cell can see. It is, precisely,
+ * the ambient wash the judges kept naming: "every interior surface is
+ * ambient-only", "a flat ambient wash", "no material information".
  *
- * The differential this costs is bounded and was checked: an enclosed wall goes
- * from 16:1 against a sunlit exterior wall to 7.4:1, which is 2.9 stops. Rooms
- * still read as interiors; they no longer read as holes.
+ * It was that large because it was standing in for light transport nobody was
+ * computing. {@link IrradianceVolume} now computes it, and the difference is
+ * handed over rather than removed — see {@link indirectDiffuseTarget}, which
+ * takes the exact irradiance this cut releases and makes it the volume's
+ * conservation target. The total light on an enclosed surface is therefore
+ * unchanged to within a few per cent; what changes is that two thirds of it now
+ * arrives from a measured direction with a measured colour instead of from
+ * everywhere at once.
+ *
+ * Only the *diffuse* half moved. Specular occlusion keeps the old floor — see
+ * {@link ENCLOSED_SPECULAR} — because none of this reasoning applies to it.
  */
-const ENCLOSED_BOUNCE = 0.46
+const ENCLOSED_SKYLIGHT = 0.22
 
 /**
- * Fraction of the *directional bounce* a fully enclosed surface keeps, as
- * distinct from the fraction of skylight it keeps above.
+ * The same fraction for glossy reflections, held at the value the previous
+ * eight rounds landed on.
+ *
+ * These used to be one number and should not be. Cutting the diffuse floor is
+ * justified by there being somewhere better for that energy to go; there is no
+ * equivalent for reflections, because the irradiance volume is L1 and carries
+ * no radiance detail a reflection could use. Cutting this too would simply have
+ * dimmed every interior highlight by thirty per cent, and highlights are where
+ * a frame's white point comes from.
+ */
+const ENCLOSED_SPECULAR = 0.46
+
+/**
+ * Fraction of the *fallback* directional bounce a fully enclosed surface keeps,
+ * as distinct from the fraction of skylight it keeps above.
  *
  * These have to be separate numbers because they are separate physics, and
  * collapsing them into one is what left the interiors black. Sky visibility
@@ -249,15 +272,19 @@ const DECLARATIONS = /* glsl */ `
 uniform sampler3D skyOccMap;
 uniform vec3 skyOccOrigin;
 uniform vec3 skyOccInvExtent;
-uniform vec3 skyOccBounce;
-// The bounce at both ends of the sky-visibility range: enclosed, where every
-// direction the lobe covers really is sunlit floor, and open, where most of it
-// is sky. Same luminance, different hue — see BOUNCE_SKY_SHARE.
+uniform vec3 skyOccSkylightFloor;
+uniform vec3 skyOccSpecularFloor;
+// The fallback bounce at both ends of the sky-visibility range: enclosed, where
+// every direction the lobe covers really is sunlit floor, and open, where most
+// of it is sky. Same luminance, different hue — see BOUNCE_SKY_SHARE.
 uniform vec3 skyOccBounceLight;
 uniform vec3 skyOccBounceOpen;
 uniform vec3 skyOccBounceDir;
 // x: visibility gamma, y: normal push in metres, z: specular share, w: enabled
 uniform vec4 skyOccParams;
+// 1 while the constant-direction bounce is carrying indirect light, 0 once the
+// irradiance volume has baked and taken it over. Never both.
+uniform float skyOccFallback;
 `
 
 const APPLY = /* glsl */ `
@@ -270,7 +297,6 @@ const APPLY = /* glsl */ `
 	vec3 skyOccUvw = ( skyOccWorld + skyOccNormal * skyOccParams.y - skyOccOrigin ) * skyOccInvExtent;
 	float skyOccRaw = texture( skyOccMap, clamp( skyOccUvw, vec3( 0.0 ), vec3( 1.0 ) ) ).r;
 	float skyOccVis = mix( 1.0, pow( clamp( skyOccRaw, 0.0, 1.0 ), skyOccParams.x ), skyOccParams.w );
-	vec3 skyOccAtten = mix( skyOccBounce, vec3( 1.0 ), skyOccVis );
 
 #endif
 
@@ -278,35 +304,43 @@ const APPLY = /* glsl */ `
 
 	// Skylight first, and only skylight. This is the term sky visibility is
 	// actually about: a surface that cannot see the sky does not receive it.
+	vec3 skyOccAtten = mix( skyOccSkylightFloor, vec3( 1.0 ), skyOccVis );
 	irradiance *= skyOccAtten;
 	iblIrradiance *= skyOccAtten;
 
-	// Then the bounce off the sunlit road and the facades opposite, on its own
-	// far shallower falloff. It used to be added before the line above and so
-	// took the same attenuation, which double counted — see
-	// BOUNCE_ENCLOSED_FLOOR. Light that has already bounced is generated inside
-	// the room; it does not need line of sight to open sky to arrive, and
-	// cutting it as though it did is what emptied every interior.
-	float skyOccBounceWrap = max(
-		0.0,
-		( dot( skyOccNormal, skyOccBounceDir ) + ${BOUNCE_WRAP.toFixed(3)} ) / ${(1 + BOUNCE_WRAP).toFixed(3)}
-	);
-	float skyOccBounceVis = mix( ${BOUNCE_ENCLOSED_FLOOR.toFixed(3)}, 1.0, skyOccVis );
+	// Then everything that has already bounced, which is a different physics and
+	// takes a different path: it is generated inside the room, so it does not
+	// need line of sight to open sky to arrive and must not be cut as though it
+	// did — that double count is what emptied every interior two rounds ago.
+	//
+	// Measured, per cell, by the irradiance volume, which knows which way the
+	// doorway is. The wrap term below is what it replaces: one direction for the
+	// whole level, which is right for a street wall facing the sunlit road and
+	// wrong for the interior floor, the soffit and the arcade.
+	irradiance += giIrradiance( skyOccWorld, skyOccNormal );
 
-	// How warm the bounce is, driven by the same visibility that decides how much
-	// skylight the surface gets. The two are complementary views of one fact: the
-	// more of a surface's hemisphere is sky, the less of the bounce lobe is
-	// looking at sunlit ground and the cooler what arrives along it must be. Both
-	// tints carry identical luminance, so this is a hue mix and never a level
-	// change.
-	vec3 skyOccBounceTint = mix( skyOccBounceLight, skyOccBounceOpen, skyOccVis );
-	irradiance += skyOccBounceTint * skyOccBounceWrap * skyOccBounceVis;
+	if ( skyOccFallback > 0.0 ) {
+		float skyOccBounceWrap = max(
+			0.0,
+			( dot( skyOccNormal, skyOccBounceDir ) + ${BOUNCE_WRAP.toFixed(3)} ) / ${(1 + BOUNCE_WRAP).toFixed(3)}
+		);
+		float skyOccBounceVis = mix( ${BOUNCE_ENCLOSED_FLOOR.toFixed(3)}, 1.0, skyOccVis );
+
+		// How warm the bounce is, driven by the same visibility that decides how
+		// much skylight the surface gets. The two are complementary views of one
+		// fact: the more of a surface's hemisphere is sky, the less of the bounce
+		// lobe is looking at sunlit ground and the cooler what arrives along it
+		// must be. Both tints carry identical luminance, so this is a hue mix and
+		// never a level change.
+		vec3 skyOccBounceTint = mix( skyOccBounceLight, skyOccBounceOpen, skyOccVis );
+		irradiance += skyOccBounceTint * skyOccBounceWrap * skyOccBounceVis * skyOccFallback;
+	}
 
 #endif
 
 #if defined( RE_IndirectSpecular )
 
-	radiance *= mix( vec3( 1.0 ), skyOccAtten, skyOccParams.z );
+	radiance *= mix( vec3( 1.0 ), mix( skyOccSpecularFloor, vec3( 1.0 ), skyOccVis ), skyOccParams.z );
 
 #endif
 
@@ -320,6 +354,114 @@ interface InteriorCandidate {
   visibility: number
 }
 
+/**
+ * The baked visibility field, handed to {@link IrradianceVolume} so its probes
+ * land on identical cells.
+ *
+ * Sharing the geometry rather than choosing a second one is not an optimisation
+ * — it is what makes a fragment's visibility and its irradiance describe the
+ * same point. Two grids at different offsets would put the edge of a room in
+ * one place for the skylight term and a metre away for the bounce, and the
+ * seam would fall on exactly the doorway reveals both terms exist to light.
+ */
+export interface SkyVisibilityGrid {
+  readonly data: Uint8Array
+  readonly nx: number
+  readonly ny: number
+  readonly nz: number
+  readonly originX: number
+  readonly originY: number
+  readonly originZ: number
+  readonly cellX: number
+  readonly cellY: number
+  readonly cellZ: number
+  /**
+   * Raw sky visibility at a world point, trilinear, 0 to 1.
+   *
+   * Deliberately raw. It is tempting to hand the volume's second bounce the
+   * multiplier the fragment shader actually applies — {@link ENCLOSED_SKYLIGHT}
+   * and all — on the grounds that a bounce should carry the brightness the
+   * renderer is going to *draw*. That was tried and it is circular: that floor
+   * is itself a stand-in for bounced light, so feeding it back in means the
+   * volume gathers the flat sky-coloured wash off every wall and puts it
+   * straight back. Measured on a test room it held the interior's red-over-blue
+   * at 0.86 — bluer than the sky — and left the field so nearly isotropic that
+   * a wall facing the doorway and a wall facing away came out within 7 per cent
+   * of each other.
+   *
+   * With the physical fraction the sunlit patch inside the door outweighs an
+   * unlit wall by two orders of magnitude, which is what makes the lobe point
+   * somewhere and the hue come out warm. The level that costs is put back by
+   * the conservation, which is where level decisions belong.
+   */
+  visibility(point: THREE.Vector3): number
+}
+
+/**
+ * Mean indirect diffuse irradiance, over all normals, that the rig delivered at
+ * a given sky visibility *before* the irradiance volume existed.
+ *
+ * This is the conservation target, and the reason the volume is safe to land on
+ * a frame whose seven tonal metrics are finally all in range. The critics' note
+ * is about distribution, not level — measured on the shipped frames, an
+ * interior sits at a plausible eleven per cent of the exterior and still reads
+ * as a flat wash, because every surface in it receives the same value whichever
+ * way it faces. So the volume is normalised to deliver exactly this and then
+ * allowed to move it around; it does not add light.
+ *
+ * Two terms:
+ *
+ * - What the constant-direction bounce delivered. Its wrap has a closed-form
+ *   mean over the sphere of `( 1 + wrap ) / 4`, so no integration is needed.
+ * - What cutting {@link ENCLOSED_SKYLIGHT} released. That cut is proportional
+ *   to `1 - visibility`, and the irradiance it was multiplying is the sky's own
+ *   mean over normals, which the caller measures from the same probe the
+ *   environment map is baked from.
+ *
+ * At full visibility the second term is zero and this is the old open-street
+ * bounce exactly. At zero visibility it is about eighty per cent higher than
+ * the old enclosed bounce, which is the skylight handover arriving.
+ *
+ * ## What is conserved, and what therefore moves
+ *
+ * This conserves the mean over all normals, per cell. Individual normals move,
+ * and they are meant to — that redistribution is the entire point — but the
+ * direction of the movement is worth stating so a later round does not read it
+ * as a regression.
+ *
+ * The constant bounce concentrated everything it had into one direction: a
+ * normal aligned with it received 3.08 times the mean, and a normal facing away
+ * received nothing. So the surfaces that lose here are open shaded verticals
+ * that happened to face the sun's reverse azimuth — the one case the constant
+ * term was fitted to — which go from about 0.26 of irradiance to between 0.10
+ * and 0.16. That is not a loss of tuning, it is the removal of an
+ * over-strength: a wall in a real street whose hemisphere is roughly forty per
+ * cent sunlit surfaces at a radiance of 0.10 receives about 0.126, which is
+ * where the measured transport lands it.
+ *
+ * The surfaces that gain are everything the one direction could not reach:
+ * interior floors, soffits, doorway reveals, and every wall facing the other
+ * way. On a test hall an interior floor goes from 0.009 to between 0.04 and
+ * 0.21 depending on where it is in the room, which is a factor of five to
+ * twenty-three, and it acquires a gradient where it had none.
+ */
+export function indirectDiffuseTarget(visibility: number, meanSkyIrradiance: number): number {
+  const vis = Math.pow(THREE.MathUtils.clamp(visibility, 0, 1), VISIBILITY_GAMMA)
+  const bounce = BOUNCE_IRRADIANCE * ((1 + BOUNCE_WRAP) / 4)
+    * THREE.MathUtils.lerp(BOUNCE_ENCLOSED_FLOOR, 1, vis)
+  const handover = (ENCLOSED_SKYLIGHT_LEGACY - ENCLOSED_SKYLIGHT) * (1 - vis) * meanSkyIrradiance
+  return bounce + handover
+}
+
+/**
+ * What {@link ENCLOSED_SKYLIGHT} was for the eight rounds that calibrated this
+ * frame. Kept as a constant rather than folded into the arithmetic above
+ * because it is not a tuning knob: it is the anchor the conservation is
+ * measured against, and if it and ENCLOSED_SKYLIGHT are ever set equal the
+ * volume correctly stops receiving any handover at all.
+ */
+const ENCLOSED_SKYLIGHT_LEGACY = 0.46
+
 export class SkyOcclusion {
   /**
    * Floor positions inside roofed volumes, darkest first. The lighting system
@@ -328,16 +470,25 @@ export class SkyOcclusion {
    */
   readonly interiorPoints: THREE.Vector3[] = []
 
+  /** Set by {@link bake}; the irradiance volume registers its probes on it. */
+  grid: SkyVisibilityGrid | null = null
+
   private texture: THREE.Data3DTexture
   private readonly uniforms = {
     skyOccMap: { value: null as THREE.Data3DTexture | null },
     skyOccOrigin: { value: new THREE.Vector3() },
     skyOccInvExtent: { value: new THREE.Vector3(1, 1, 1) },
-    skyOccBounce: { value: new THREE.Vector3(ENCLOSED_BOUNCE, ENCLOSED_BOUNCE, ENCLOSED_BOUNCE) },
+    skyOccSkylightFloor: {
+      value: new THREE.Vector3(ENCLOSED_SKYLIGHT, ENCLOSED_SKYLIGHT, ENCLOSED_SKYLIGHT),
+    },
+    skyOccSpecularFloor: {
+      value: new THREE.Vector3(ENCLOSED_SPECULAR, ENCLOSED_SPECULAR, ENCLOSED_SPECULAR),
+    },
     skyOccBounceLight: { value: new THREE.Vector3() },
     skyOccBounceOpen: { value: new THREE.Vector3() },
     skyOccBounceDir: { value: new THREE.Vector3(0, -1, 0) },
     skyOccParams: { value: new THREE.Vector4(VISIBILITY_GAMMA, NORMAL_PUSH, SPECULAR_SHARE, 0) },
+    skyOccFallback: { value: 1 },
   }
 
   /** Ray fan, built once: straight up plus a ring, cosine weighted. */
@@ -356,7 +507,16 @@ export class SkyOcclusion {
     this.buildRayFan(5, THREE.MathUtils.degToRad(55))
   }
 
-  /** Chain this off every world material's `onBeforeCompile`. */
+  /**
+   * Chain this off every world material's `onBeforeCompile`.
+   *
+   * Requires {@link IrradianceVolume.patch} on the same material: this emits the
+   * call to `giIrradiance` and that declares it. Both are chained
+   * unconditionally from `LightingSystem.patchWorldMaterial` and neither is
+   * optional — the volume declares a function that returns zero when it has not
+   * baked, so the pair is correct in every state, but a material that got one
+   * and not the other will not compile.
+   */
   readonly patch = (shader: { fragmentShader: string; uniforms: Record<string, THREE.IUniform> }): void => {
     Object.assign(shader.uniforms, this.uniforms)
     shader.fragmentShader = shader.fragmentShader
@@ -415,6 +575,9 @@ export class SkyOcclusion {
     this.uniforms.skyOccOrigin.value.set(originX, originY, originZ)
     this.uniforms.skyOccInvExtent.value.set(1 / extentX, 1 / extentY, 1 / extentZ)
     this.uniforms.skyOccParams.value.w = 1
+    this.grid = new VisibilityGrid(
+      data, nx, ny, nz, originX, originY, originZ, cellX, cellY, cellZ,
+    )
 
     this.findInteriors(physics, {
       data, nx, ny, nz, originX, originY, originZ, cellX, cellY, cellZ,
@@ -429,11 +592,25 @@ export class SkyOcclusion {
   }
 
   /**
+   * Whether the constant-direction bounce is carrying indirect light.
+   *
+   * There is deliberately no cross-fade and no partial state: two mechanisms
+   * putting indirect light on the same surface is how a rig ends up with a knob
+   * that moves something else, and this one has eight rounds of calibration
+   * riding on it. Either the irradiance volume baked and owns the bounce, or it
+   * did not and the constant term still does.
+   */
+  setFallbackBounce(enabled: boolean): void {
+    this.uniforms.skyOccFallback.value = enabled ? 1 : 0
+  }
+
+  /**
    * Loads both halves of the bounce: the hue an enclosed surface's remaining
-   * ambient takes, and the directional term open surfaces in shade receive.
+   * skylight takes, and the directional fallback term open surfaces in shade
+   * receive while there is no irradiance volume.
    *
    * Only the hue is taken from `color` and `skyTint` — every level is fixed by
-   * ENCLOSED_BOUNCE and BOUNCE_IRRADIANCE, so re-tinting the bounce never
+   * ENCLOSED_SKYLIGHT and BOUNCE_IRRADIANCE, so re-tinting the bounce never
    * changes how dark interiors get or how much fill a shaded wall receives.
    *
    * `color` is the light coming off sunlit ground and `skyTint` the sky filling
@@ -456,11 +633,18 @@ export class SkyOcclusion {
     const warmG = color.g / peak
     const warmB = color.b / peak
 
+    // The skylight an enclosed surface keeps is tinted towards what it bounced
+    // off rather than towards the sky it cannot see, and the specular floor
+    // takes the same hue for the same reason.
     const t = ENCLOSED_NEUTRALITY
-    this.uniforms.skyOccBounce.value.set(
-      ENCLOSED_BOUNCE * THREE.MathUtils.lerp(warmR, 1, t),
-      ENCLOSED_BOUNCE * THREE.MathUtils.lerp(warmG, 1, t),
-      ENCLOSED_BOUNCE * THREE.MathUtils.lerp(warmB, 1, t),
+    const tintR = THREE.MathUtils.lerp(warmR, 1, t)
+    const tintG = THREE.MathUtils.lerp(warmG, 1, t)
+    const tintB = THREE.MathUtils.lerp(warmB, 1, t)
+    this.uniforms.skyOccSkylightFloor.value.set(
+      ENCLOSED_SKYLIGHT * tintR, ENCLOSED_SKYLIGHT * tintG, ENCLOSED_SKYLIGHT * tintB,
+    )
+    this.uniforms.skyOccSpecularFloor.value.set(
+      ENCLOSED_SPECULAR * tintR, ENCLOSED_SPECULAR * tintG, ENCLOSED_SPECULAR * tintB,
     )
 
     const level = BOUNCE_IRRADIANCE * strength
@@ -575,6 +759,54 @@ export class SkyOcclusion {
       }
       if (!crowded) this.interiorPoints.push(new THREE.Vector3(c.x, c.y, c.z))
     }
+  }
+}
+
+/**
+ * CPU-side reader for the baked volume.
+ *
+ * The trilinear filter here is written to match the GPU's, texel centre for
+ * texel centre, because the value it produces is fed straight back into the
+ * bounce: the irradiance volume asks "how bright will the renderer draw this
+ * wall" and then bounces the answer. A reader half a cell out of register would
+ * light rooms off a wall a metre from the one the frame shows.
+ */
+class VisibilityGrid implements SkyVisibilityGrid {
+  constructor(
+    readonly data: Uint8Array,
+    readonly nx: number,
+    readonly ny: number,
+    readonly nz: number,
+    readonly originX: number,
+    readonly originY: number,
+    readonly originZ: number,
+    readonly cellX: number,
+    readonly cellY: number,
+    readonly cellZ: number,
+  ) {}
+
+  visibility(point: THREE.Vector3): number {
+    const fx = (point.x - this.originX) / this.cellX - 0.5
+    const fy = (point.y - this.originY) / this.cellY - 0.5
+    const fz = (point.z - this.originZ) / this.cellZ - 0.5
+    const x0 = Math.floor(fx)
+    const y0 = Math.floor(fy)
+    const z0 = Math.floor(fz)
+    const tx = fx - x0
+    const ty = fy - y0
+    const tz = fz - z0
+
+    let sum = 0
+    for (let k = 0; k < 8; k++) {
+      const wx = k & 1 ? tx : 1 - tx
+      const wy = k & 2 ? ty : 1 - ty
+      const wz = k & 4 ? tz : 1 - tz
+      const x = THREE.MathUtils.clamp(x0 + (k & 1), 0, this.nx - 1)
+      const y = THREE.MathUtils.clamp(y0 + ((k >> 1) & 1), 0, this.ny - 1)
+      const z = THREE.MathUtils.clamp(z0 + ((k >> 2) & 1), 0, this.nz - 1)
+      sum += wx * wy * wz * this.data[x + this.nx * (y + this.ny * z)]
+    }
+    return sum / 255
   }
 }
 

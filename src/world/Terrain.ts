@@ -285,7 +285,16 @@ export interface TerrainResult {
 
 const INNER = 56
 const INNER_CELL = 1.6
-const OUTER = 152
+/**
+ * Half-extent of the modelled ground.
+ *
+ * Exported because the backdrop has to know it: the nearest band of the distant
+ * city stands *inside* this square, so that from anywhere in the level the
+ * ground runs into buildings before it runs out. Put that band outside and its
+ * feet hang over the edge of the world with sky underneath them.
+ */
+export const TERRAIN_EDGE = 152
+const OUTER = TERRAIN_EDGE
 const OUTER_CELL = 8
 const COLLISION_CELL = 3.2
 

@@ -233,7 +233,10 @@ export class Explosions {
     // Dust ripped off the ground and driven outward along it.
     if (!b.grounded) return
     this.tangentBasis(b.groundNormal)
-    const count = Math.max(10, Math.round(26 * P.allowance()))
+    // No floor. A floor is how an unmetered layer walks straight past the
+    // coverage budget, and a blast on top of an already-smoky frame is exactly
+    // the case the budget exists for.
+    const count = Math.round(18 * P.allowance())
     for (let i = 0; i < count; i++) {
       const a = (i / count) * Math.PI * 2 + r.spread(0.12)
       const p = P.params
@@ -266,7 +269,7 @@ export class Explosions {
     const P = this.deps.particles
     const r = this.deps.rand
     const R = b.radius
-    for (let i = 0; i < Math.max(6, Math.round(14 * P.allowance())); i++) {
+    for (let i = 0; i < Math.round(10 * P.allowance()); i++) {
       const p = P.params
       p.position.copy(b.point).add(this.randomInSphere(R * 0.4))
       this.randomDirection(this.dir)
@@ -335,6 +338,10 @@ export class Explosions {
 
   private column(b: Blast, time: number): void {
     const P = this.deps.particles
+    // The column is the longest-lived smoke in the game — six seconds a card —
+    // so it is the layer most able to pool into a veil, and it was the only
+    // explosion layer not metered at all.
+    if (P.allowance() < 0.35) return
     const r = this.deps.rand
     const R = b.radius
     const p = P.params
