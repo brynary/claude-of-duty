@@ -102,8 +102,19 @@ export class FxSystem implements System, FxService {
 
     this.textures = buildFxTextures(ctx.config.anisotropy, ctx.config.seed)
 
-    this.world = new Particles(ctx.scene, Math.floor(budget * 0.9), this.textures, this.softEnabled)
-    this.view = new Particles(ctx.viewmodelScene, Math.min(320, Math.floor(budget * 0.1) + 96), this.textures, false)
+    // The world pool is the one that can bury the frame, so it carries a
+    // coverage budget. The unit is "fraction of the frame covered by live
+    // translucent cards, averaged over their lives". Measured against the
+    // firefight pose — seven scripted shooters, roughly twenty rounds a second
+    // into the geometry around the player — the unthrottled system reached
+    // 0.055, which pooled into the left and centre of the frame as an optical
+    // depth of 0.5 and cost it both its blacks and its white point. 0.030 lets
+    // an ordinary firefight run at full recipe (allowance stays above 0.75) and
+    // only bites when something pathological happens: more shooters, a longer
+    // fight, a grenade on top. The viewmodel pool is four sprites at the barrel
+    // and is never the problem, so it is left uncapped.
+    this.world = new Particles(ctx.scene, Math.floor(budget * 0.9), this.textures, this.softEnabled, 0.030)
+    this.view = new Particles(ctx.viewmodelScene, Math.min(320, Math.floor(budget * 0.1) + 96), this.textures, false, 1e3)
     // No world card may exceed ~20% of screen width, and they start thinning
     // at half of that. Without this a single impact cloud two metres from the
     // lens veils the whole midground.
@@ -190,7 +201,8 @@ export class FxSystem implements System, FxService {
   smokePuff(point: THREE.Vector3, radius: number): void {
     if (!this.ctx) return
     const r = this.rand
-    const count = Math.max(3, Math.round(6 * Math.min(radius, 3)))
+    const allow = this.world.allowance()
+    const count = Math.max(2, Math.round(6 * Math.min(radius, 3) * allow))
     for (let i = 0; i < count; i++) {
       const p = this.world.params
       p.position.copy(point)
@@ -206,7 +218,7 @@ export class FxSystem implements System, FxService {
       p.turbulence = 0.3
       p.colorStart.setHex(0x8d8880, THREE.SRGBColorSpace)
       p.colorEnd.setHex(0x5a5650, THREE.SRGBColorSpace)
-      p.alphaStart = 0.5
+      p.alphaStart = 0.5 * allow
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(0.5)
@@ -230,7 +242,8 @@ export class FxSystem implements System, FxService {
     const strength = THREE.MathUtils.clamp(impact, 0, 1)
     if (strength < 0.12) return
     const r = this.rand
-    const count = Math.round(4 + strength * 10)
+    const allow = this.world.allowance()
+    const count = Math.round((4 + strength * 10) * allow)
     for (let i = 0; i < count; i++) {
       const a = r.range(0, Math.PI * 2)
       const p = this.world.params
@@ -245,7 +258,7 @@ export class FxSystem implements System, FxService {
       p.turbulence = 0.2
       p.colorStart.setHex(0xa89f8d, THREE.SRGBColorSpace)
       p.colorEnd.setHex(0x746c5f, THREE.SRGBColorSpace)
-      p.alphaStart = 0.24 * strength + 0.06
+      p.alphaStart = (0.24 * strength + 0.06) * allow
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(0.7)
@@ -260,7 +273,8 @@ export class FxSystem implements System, FxService {
   private footstep(position: THREE.Vector3, surface: Surface, running: boolean): void {
     if (surface !== 'sand' && surface !== 'dirt' && surface !== 'gravel') return
     const r = this.rand
-    const count = running ? 3 : 2
+    const allow = this.world.allowance()
+    const count = allow < 0.4 ? 1 : running ? 3 : 2
     for (let i = 0; i < count; i++) {
       const p = this.world.params
       p.position.copy(position)
@@ -273,7 +287,7 @@ export class FxSystem implements System, FxService {
       p.gravity = 0.03
       p.colorStart.setHex(surface === 'sand' ? 0xcbbd9d : 0x8e8371, THREE.SRGBColorSpace)
       p.colorEnd.setHex(0x6a6154, THREE.SRGBColorSpace)
-      p.alphaStart = running ? 0.24 : 0.14
+      p.alphaStart = (running ? 0.24 : 0.14) * allow
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.tile = r.int(0, 3)
@@ -373,6 +387,10 @@ export class FxSystem implements System, FxService {
 
   update(dt: number, ctx: GameContext): void {
     this.time = ctx.elapsed
+    // Cost every card against the frame it will actually appear in.
+    const focal = ctx.camera.projectionMatrix.elements[5]
+    this.world.setViewpoint(ctx.camera.position, focal, ctx.camera.aspect)
+    this.view.setViewpoint(ctx.viewmodelCamera.position, focal, ctx.camera.aspect)
     this.explosions.update(ctx, this.time, dt)
     this.shells.update(ctx, this.time, dt)
     this.debris.update(ctx, this.time)
@@ -398,6 +416,7 @@ export class FxSystem implements System, FxService {
     const near = ctx.camera.near
     const far = ctx.camera.far
     this.world.setDepth(depth, near, far)
+    this.tracers.setDepth(depth, near, far)
     this.view.setDepth(null, ctx.viewmodelCamera.near, ctx.viewmodelCamera.far)
     this.world.update(this.time)
     this.view.update(this.time)
@@ -441,7 +460,8 @@ export class FxSystem implements System, FxService {
    */
   private renderDepthPrepass(ctx: GameContext): THREE.DepthTexture | null {
     const target = this.depthTarget
-    if (!target || !this.world.needsDepth(this.time)) return null
+    if (!target) return null
+    if (!this.world.needsDepth(this.time) && !this.tracers.active(this.time)) return null
 
     const gl = ctx.renderer
     const prevTarget = gl.getRenderTarget()

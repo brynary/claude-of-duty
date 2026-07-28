@@ -2,7 +2,7 @@ import * as THREE from 'three'
 import type { MaterialName } from '../MaterialNames'
 import type { SurfaceBuild } from './Bake'
 import type { Noise } from './Noise'
-import type { TriplanarOptions } from './Triplanar'
+import type { DetailOverlayOptions, TriplanarOptions } from './Triplanar'
 import {
   boxBlur,
   clamp,
@@ -80,6 +80,12 @@ export interface MaterialSpec {
   build: (n: Noise, size: number, worldSize: number) => SurfaceBuild
   /** World-space projection settings, or `null` to use the mesh's own UVs. */
   triplanar: Omit<TriplanarOptions, 'scale'> | null
+  /**
+   * Two-scale detail in mesh UV space, for the surfaces the projection does not
+   * serve. Only read when `triplanar` is null. Omit on a surface that genuinely
+   * has no structure below its own texel — glass and still water.
+   */
+  detail?: DetailOverlayOptions
   /** Repeat for UV-mapped materials. Defaults to 1:1 with `worldSize`. */
   repeat?: [number, number]
   physical?: boolean
@@ -2444,6 +2450,7 @@ export const RECIPES: Record<MaterialName, MaterialSpec> = {
     triplanar: {
       macroScale: 0.07, macroAlbedo: 0.13, macroRough: 0.22, mesoRough: 0.2, dustColor: WALL_DUST,
       dustAmount: 0.24, sharpness: 8, detailNormal: 0.4, detailAlbedo: 0.3, detailRough: 0.18, cavityDirt: 0.8, parallax: 0.005,
+      detailCoarseAlbedo: 0.24,
       grimeColor: GRIME, grimeAmount: 0.35, grimeHeight: 0.25,
     },
     normalScale: 1.0, aoIntensity: 1,
@@ -2454,7 +2461,7 @@ export const RECIPES: Record<MaterialName, MaterialSpec> = {
     size: HERO, worldSize: 1.2, build: (n, s, w) => buildMetalPainted(n, s, w),
     triplanar: {
       macroScale: 0.09, macroAlbedo: 0.12, macroRough: 0.12, dustColor: WALL_DUST, dustAmount: 0.22, sharpness: 8,
-      detailNormal: 0.3, detailAlbedo: 0.24, cavityDirt: 0.5, grimeColor: GRIME, grimeAmount: 0.6, grimeHeight: 0.35,
+      detailNormal: 0.3, detailAlbedo: 0.24, detailCoarseAlbedo: 0.3, cavityDirt: 0.5, grimeColor: GRIME, grimeAmount: 0.6, grimeHeight: 0.35,
     },
     normalScale: 1.0, aoIntensity: 1,
   },
@@ -2470,17 +2477,19 @@ export const RECIPES: Record<MaterialName, MaterialSpec> = {
     size: HERO, worldSize: 0.9, build: (n, s, w) => buildCorrugated(n, s, w),
     triplanar: {
       macroScale: 0.08, macroAlbedo: 0.12, macroRough: 0.12, dustColor: WALL_DUST, dustAmount: 0.24, sharpness: 8,
-      detailNormal: 0.25, detailAlbedo: 0.26, cavityDirt: 0.55, grimeColor: GRIME, grimeAmount: 0.6, grimeHeight: 0.4,
+      detailNormal: 0.25, detailAlbedo: 0.26, detailCoarseAlbedo: 0.32, cavityDirt: 0.55, grimeColor: GRIME, grimeAmount: 0.6, grimeHeight: 0.4,
     },
     normalScale: 1.1, aoIntensity: 1,
   },
   steelBrushed: {
-    size: HERO, worldSize: 0.5, build: (n, s, w) => buildSteelBrushed(n, s, w), triplanar: null, repeat: [2, 2],
+    size: HERO, worldSize: 0.5, build: (n, s, w) => buildSteelBrushed(n, s, w), triplanar: null,
+    detail: { freq: 3, albedo: 0.16, rough: 0.14, coarseAlbedo: 0.16 }, repeat: [2, 2],
     normalScale: 0.5, aoIntensity: 0.6,
     params: { envMapIntensity: 0.9 },
   },
   gunmetal: {
-    size: HERO_PLUS, worldSize: 0.3, build: (n, s, w) => buildGunmetal(n, s, w), triplanar: null, repeat: [2, 2],
+    size: HERO_PLUS, worldSize: 0.3, build: (n, s, w) => buildGunmetal(n, s, w), triplanar: null,
+    detail: { freq: 3, albedo: 0.22, rough: 0.16, coarseAlbedo: 0.2 }, repeat: [2, 2],
     normalScale: 0.85, aoIntensity: 0.9,
     params: { envMapIntensity: 0.8 },
   },
@@ -2488,14 +2497,15 @@ export const RECIPES: Record<MaterialName, MaterialSpec> = {
     size: STD, worldSize: 0.4, build: buildChainlink,
     triplanar: {
       macroScale: 0.12, macroAlbedo: 0.1, macroRough: 0.1, dustColor: WALL_DUST, dustAmount: 0.12, sharpness: 8,
-      detailNormal: 0, detailAlbedo: 0.2, cavityDirt: 0.35, grimeAmount: 0,
+      detailNormal: 0, detailAlbedo: 0.2, detailCoarseAlbedo: 0.14, detailCoarseRough: 0.06, cavityDirt: 0.35, grimeAmount: 0,
     },
     repeat: [8, 8],
     normalScale: 1.0, aoIntensity: 0.7,
     params: { alphaTest: 0.5, side: THREE.DoubleSide },
   },
   rebar: {
-    size: SMALL, worldSize: 0.25, build: buildRebar, triplanar: null, repeat: [1, 3],
+    size: SMALL, worldSize: 0.25, build: buildRebar, triplanar: null,
+    detail: { freq: 3, albedo: 0.3, rough: 0.18, coarseAlbedo: 0.26 }, repeat: [1, 3],
     normalScale: 1.1, aoIntensity: 1,
   },
 
@@ -2512,7 +2522,8 @@ export const RECIPES: Record<MaterialName, MaterialSpec> = {
     normalScale: 1.25, aoIntensity: 1,
   },
   woodPainted: {
-    size: HERO_PLUS, worldSize: 1.05, build: (n, s, w) => buildWoodPainted(n, s, w), triplanar: null, repeat: [1, 1],
+    size: HERO_PLUS, worldSize: 1.05, build: (n, s, w) => buildWoodPainted(n, s, w), triplanar: null,
+    detail: { freq: 3, albedo: 0.26, rough: 0.16, coarseAlbedo: 0.26 }, repeat: [1, 1],
     normalScale: 1.2, aoIntensity: 1,
   },
   woodCrate: {
@@ -2520,7 +2531,8 @@ export const RECIPES: Record<MaterialName, MaterialSpec> = {
     build: (n, s, w) => buildWood(n, s, w, {
       rows: 4, cuts: 2, base: L(0xa8875c), dark: L(0x74593a), light: L(0xc0a072), weathered: 0.45, ringFreq: 8, salt: 311,
     }),
-    triplanar: null, repeat: [1, 1],
+    triplanar: null,
+    detail: { freq: 3, albedo: 0.28, rough: 0.16, coarseAlbedo: 0.28 }, repeat: [1, 1],
     normalScale: 1.2, aoIntensity: 1,
   },
   woodBeam: {
@@ -2557,7 +2569,8 @@ export const RECIPES: Record<MaterialName, MaterialSpec> = {
     build: (n, s, w) => buildFabric(n, s, w, {
       threads: 64, base: L(0x9e4038), alt: L(0xc6bda9), stripes: 4, dirt: 1.6, salt: 331, sheenRough: 0.72,
     }),
-    triplanar: null, repeat: [1, 1], physical: true,
+    triplanar: null,
+    detail: { freq: 3.5, albedo: 0.22, rough: 0.12, coarseAlbedo: 0.24 }, repeat: [1, 1], physical: true,
     normalScale: 1.0, aoIntensity: 1,
     params: { side: THREE.DoubleSide, sheen: 0.35, sheenRoughness: 0.75, sheenColor: new THREE.Color(0.5, 0.44, 0.38) },
   },
@@ -2566,17 +2579,20 @@ export const RECIPES: Record<MaterialName, MaterialSpec> = {
     build: (n, s, w) => buildFabric(n, s, w, {
       threads: 32, base: L(0x9b8763), dirt: 1.3, salt: 341, sheenRough: 0.86,
     }),
-    triplanar: null, repeat: [1, 1], physical: true,
+    triplanar: null,
+    detail: { freq: 3, albedo: 0.28, rough: 0.14, coarseAlbedo: 0.28 }, repeat: [1, 1], physical: true,
     normalScale: 1.4, aoIntensity: 1,
     params: { sheen: 0.25, sheenRoughness: 0.9, sheenColor: new THREE.Color(0.45, 0.4, 0.32) },
   },
   tarp: {
-    size: HERO, worldSize: 1.5, build: (n, s, w) => buildTarp(n, s, w), triplanar: null, repeat: [1, 1], physical: true,
+    size: HERO, worldSize: 1.5, build: (n, s, w) => buildTarp(n, s, w), triplanar: null,
+    detail: { freq: 3, albedo: 0.24, rough: 0.16, coarseAlbedo: 0.26 }, repeat: [1, 1], physical: true,
     normalScale: 1.1, aoIntensity: 1,
     params: { side: THREE.DoubleSide, sheen: 0.2, sheenRoughness: 0.5, clearcoat: 0.15, clearcoatRoughness: 0.55 },
   },
   rubber: {
-    size: HERO, worldSize: 0.6, build: (n, s, w) => buildRubber(n, s, w), triplanar: null, repeat: [1, 1],
+    size: HERO, worldSize: 0.6, build: (n, s, w) => buildRubber(n, s, w), triplanar: null,
+    detail: { freq: 3, albedo: 0.2, rough: 0.14, coarseAlbedo: 0.18 }, repeat: [1, 1],
     normalScale: 1.0, aoIntensity: 0.9,
     // A tyre is the darkest dielectric in the scene. At full environment
     // strength the only thing visible on it is a grazing-angle reflection of
@@ -2584,7 +2600,8 @@ export const RECIPES: Record<MaterialName, MaterialSpec> = {
     params: { envMapIntensity: 0.35 },
   },
   foliage: {
-    size: STD, worldSize: 1, build: buildFoliage, triplanar: null, repeat: [1, 1],
+    size: STD, worldSize: 1, build: buildFoliage, triplanar: null,
+    detail: { freq: 3, albedo: 0.22, rough: 0.12, coarseAlbedo: 0.24 }, repeat: [1, 1],
     normalScale: 1.0, aoIntensity: 0.7,
     params: { alphaTest: 0.42, side: THREE.DoubleSide },
   },
@@ -2596,7 +2613,8 @@ export const RECIPES: Record<MaterialName, MaterialSpec> = {
 
   // --- Characters -------------------------------------------------------
   skin: {
-    size: STD, worldSize: 0.5, build: (n, s, w) => buildSkin(n, s, w), triplanar: null, repeat: [1, 1], physical: true,
+    size: STD, worldSize: 0.5, build: (n, s, w) => buildSkin(n, s, w), triplanar: null,
+    detail: { freq: 2.5, albedo: 0.1, rough: 0.1, coarseAlbedo: 0.1 }, repeat: [1, 1], physical: true,
     normalScale: 0.6, aoIntensity: 0.7,
     params: { clearcoat: 0.12, clearcoatRoughness: 0.45, sheen: 0.12, sheenRoughness: 0.6, sheenColor: new THREE.Color(0.5, 0.25, 0.2) },
   },
@@ -2607,21 +2625,25 @@ export const RECIPES: Record<MaterialName, MaterialSpec> = {
       palette: [L(0xa08a66), L(0x7b7450), L(0x5f5a3e), L(0x6a5238), L(0x40402c)],
       blotchFreq: 5, rough: 0.78, salt: 351,
     }),
-    triplanar: null, repeat: [2, 2], physical: true,
+    triplanar: null,
+    detail: { freq: 3, albedo: 0.24, rough: 0.14, coarseAlbedo: 0.26 }, repeat: [2, 2], physical: true,
     normalScale: 1.0, aoIntensity: 1,
     params: { sheen: 0.2, sheenRoughness: 0.85, sheenColor: new THREE.Color(0.4, 0.37, 0.3) },
   },
   webbing: {
-    size: STD, worldSize: 0.35, build: (n, s, w) => buildWebbing(n, s, w), triplanar: null, repeat: [2, 2], physical: true,
+    size: STD, worldSize: 0.35, build: (n, s, w) => buildWebbing(n, s, w), triplanar: null,
+    detail: { freq: 3, albedo: 0.24, rough: 0.14, coarseAlbedo: 0.24 }, repeat: [2, 2], physical: true,
     normalScale: 1.2, aoIntensity: 1,
     params: { sheen: 0.18, sheenRoughness: 0.8, sheenColor: new THREE.Color(0.36, 0.34, 0.28) },
   },
   helmet: {
-    size: STD, worldSize: 0.4, build: (n, s, w) => buildHelmet(n, s, w), triplanar: null, repeat: [1, 1],
+    size: STD, worldSize: 0.4, build: (n, s, w) => buildHelmet(n, s, w), triplanar: null,
+    detail: { freq: 3, albedo: 0.24, rough: 0.16, coarseAlbedo: 0.24 }, repeat: [1, 1],
     normalScale: 0.9, aoIntensity: 1,
   },
   bootLeather: {
-    size: STD, worldSize: 0.35, build: (n, s, w) => buildBootLeather(n, s, w), triplanar: null, repeat: [1, 1],
+    size: STD, worldSize: 0.35, build: (n, s, w) => buildBootLeather(n, s, w), triplanar: null,
+    detail: { freq: 3, albedo: 0.24, rough: 0.14, coarseAlbedo: 0.22 }, repeat: [1, 1],
     normalScale: 1.0, aoIntensity: 1,
   },
 }

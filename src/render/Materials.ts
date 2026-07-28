@@ -5,7 +5,7 @@ import { bakeSurface, type BakedMaps } from './procedural/Bake'
 import { buildDetailNormal } from './procedural/Detail'
 import { Noise } from './procedural/Noise'
 import { RECIPES, type MaterialSpec } from './procedural/Recipes'
-import { applyTriplanar } from './procedural/Triplanar'
+import { applyDetailOverlay, applyTriplanar } from './procedural/Triplanar'
 
 /**
  * Procedural PBR material library.
@@ -170,6 +170,12 @@ export class MaterialSystem implements System, MaterialService {
         scale: 1 / spec.worldSize,
         offset: this.projectionOffset(name),
       })
+    } else if (spec.detail) {
+      // Same texture, same two scales, addressed through the mesh's own UVs.
+      // Without this the weapon, the soldiers and every crate in the level lose
+      // all their surface variation to the mip chain by twenty metres, while
+      // the walls behind them keep theirs.
+      applyDetailOverlay(mat, this.detailMap ?? this.buildDetailMap(), spec.detail)
     }
     return mat
   }

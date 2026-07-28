@@ -16,11 +16,18 @@ import * as THREE from 'three'
  *    a wall running away down an alley, paving under your feet — slope shading
  *    collapses and the surface reads as a photograph of relief rather than
  *    relief. This is the difference.
- * 3. **Apparent texel density is multiplied.** A shared micro-detail texture is
- *    projected at a fixed world frequency on top of every material, adding
- *    grain, gloss breakup and pore cavities an order of magnitude finer than
- *    any material's own bake. It mips out to flat in the distance, so it costs
- *    nothing where it cannot be seen and never aliases.
+ * 3. **Apparent texel density is multiplied, at two scales.** A shared
+ *    micro-detail texture is projected at a fixed world frequency on top of
+ *    every material, adding grain, gloss breakup and pore cavities an order of
+ *    magnitude finer than any material's own bake. It mips out to flat in the
+ *    distance, so it costs nothing where it cannot be seen and never aliases —
+ *    but that also means it does nothing past about three metres. A second
+ *    projection of the same texture, a decade coarser, carries a value-only
+ *    layer of blotching and soiling across the ten-centimetre to one-metre
+ *    band, which is the band an eight-pixel block covers on anything from ten
+ *    to fifty metres away. Between them the two projections put surface
+ *    variation at every scale the camera can resolve, at any distance, and
+ *    because both are mipped textures neither can shimmer.
  * 4. **Light describes the surface.** Roughness is broken up at three separate
  *    scales — metres, decimetres, millimetres — and the baked occlusion is fed
  *    back into the *direct* lighting term as micro-shadowing, not just the
@@ -83,6 +90,34 @@ export interface TriplanarOptions {
   detailRough?: number
   /** How much the micro-detail's pore cavities collect grime, 0..1. */
   detailCavity?: number
+  /**
+   * The coarse projection's frequency, as a fraction of `detailFreq`.
+   *
+   * The two layers have to be far enough apart that the eye cannot see them as
+   * the same picture at two sizes. A decade is the usual answer and it also
+   * lands the texture's own content — which spans roughly three to sixty
+   * cycles per tile — on the ten-centimetre to two-metre band, which is where
+   * the material bakes run out. Their tiles are then coprime with everything
+   * else in the projection, so nothing beats against anything.
+   */
+  detailCoarse?: number
+  /**
+   * Albedo swing from the coarse projection, as a fraction.
+   *
+   * This is the term that holds a surface together at range. Past a few metres
+   * every material's own map has mipped down to its low octaves and the fine
+   * detail layer has mipped away entirely, so a wall thirty metres off is drawn
+   * almost wholly from whatever variation survives above ten centimetres — and
+   * before this layer existed, that was the macro field alone, which turns over
+   * once every ten metres and so is flat across any one eight-pixel block.
+   *
+   * Value only, deliberately. Fine relief at this distance is below a pixel and
+   * would alias; a value field mips cleanly and, like the fine layer's, it is
+   * the one kind of detail that still reads on a surface with no key light.
+   */
+  detailCoarseAlbedo?: number
+  /** Roughness swing from the coarse projection, absolute. */
+  detailCoarseRough?: number
   /** Peak-to-trough depth of the relief, in metres. 0 disables parallax. */
   parallax?: number
   /** Metres at which parallax starts and finishes fading out. */
@@ -121,6 +156,9 @@ uniform float uDetailNormal;
 uniform float uDetailAlbedo;
 uniform float uDetailRough;
 uniform float uDetailCavity;
+uniform float uCoarseFreq;
+uniform float uCoarseAlbedo;
+uniform float uCoarseRough;
 uniform float uParallax;
 uniform vec2 uParallaxFade;
 uniform float uMicroShadow;
@@ -245,7 +283,24 @@ const MAP_FRAGMENT = /* glsl */ `
 	vec2 triDetRH = triDetX.ba * triBlend.x + triDetY.ba * triBlend.y + triDetZ.ba * triBlend.z;
 	// The cavity mask is derived here rather than baked, so the same channel can
 	// also shade the albedo below. Alpha used to carry the mask and nothing else.
-	float triDetCavity = clamp( 1.0 - triDetRH.y * 1.7, 0.0, 1.0 );
+	// The slope is set so the mean cavity comes out where it did before the
+	// height channel's histogram was flattened, which widened its distribution:
+	// same amount of grime, in fewer and better-defined creases.
+	float triDetCavity = clamp( 1.0 - triDetRH.y * 2.25, 0.0, 1.0 );
+
+	// --- The same texture again, a decade coarser --------------------------
+	// Different channel as well as different scale: the fine layer shades from
+	// the relief height and this one from the broadband value field, so the two
+	// are not the same picture drawn twice.
+	vec3 triCp = ( triWorld + uTriOffset.zxy ) * uCoarseFreq;
+	// x = the broadband value field, y = the relief height doing duty as gloss
+	// patchiness: damp and dry, sheltered and scoured. A large surface varies in
+	// gloss at this scale as much as it varies in value, and unlike a fine gloss
+	// break-up this one is tens of pixels wide at any distance, so it describes
+	// the surface instead of twinkling on it.
+	vec2 triCoarse = texture2D( uDetailMap, triCp.zy ).ba * triBlend.x
+		+ texture2D( uDetailMap, triCp.xz ).ba * triBlend.y
+		+ texture2D( uDetailMap, triCp.xy ).ba * triBlend.z;
 
 	float triMacro = triValueNoise( triWorld * uMacroScale ) * 0.62
 		+ triValueNoise( triWorld * uMacroScale * 2.7 + 19.3 ) * 0.38;
@@ -263,6 +318,18 @@ const MAP_FRAGMENT = /* glsl */ `
 	// so it also decorrelates the material's own tile repeat — the same detail
 	// never lands twice in the same place relative to a brick course.
 	triAlbedo.rgb *= 1.0 + ( triDetRH.y - 0.5 ) * uDetailAlbedo;
+
+	// The decimetre band. Both channels are histogram-flattened at bake time, so
+	// their means are exactly 0.5 and neither of these multiplies moves a
+	// surface's exposure — they only spread it.
+	triAlbedo.rgb *= 1.0 + ( triCoarse.x - 0.5 ) * uCoarseAlbedo;
+
+	// The bake clamps albedo to 0.88 because nothing real reflects more, and
+	// three multiplicative layers on top of that can carry the brightest texel
+	// of the brightest material past it. Almost nothing reaches this rail; what
+	// does would be a lone blown texel on a sunlit render wall, which is the
+	// exact shape of the speckle this whole approach exists to avoid.
+	triAlbedo.rgb = min( triAlbedo.rgb, vec3( 0.92 ) );
 
 	// Grime in every cavity. The baked occlusion channel already knows where
 	// the surface dips below its neighbourhood, and the detail map's pore mask
@@ -295,12 +362,13 @@ const MAP_FRAGMENT = /* glsl */ `
 `
 
 const ROUGHNESS_FRAGMENT = /* glsl */ `
-	// Three decades of gloss variation. One is a pattern, two is a texture,
+	// Four decades of gloss variation. One is a pattern, two is a texture,
 	// three is a surface: metres of weathering drift, decimetres of wet/dry
-	// patchiness, millimetres of grain.
+	// patchiness, centimetres of scour, millimetres of grain.
 	float roughnessFactor = roughness * triOrm.g;
 	roughnessFactor *= mix( 1.0 - uMacroRough, 1.0 + uMacroRough, triMacro );
 	roughnessFactor *= mix( 1.0 - uMesoRough, 1.0 + uMesoRough, triMeso );
+	roughnessFactor += ( triCoarse.y - 0.5 ) * uCoarseRough;
 	roughnessFactor += ( triDetRH.x - 0.5 ) * uDetailRough;
 	roughnessFactor = mix( roughnessFactor, 0.95, triFilth );
 	roughnessFactor = mix( roughnessFactor, uDustRough, triDust );
@@ -393,7 +461,7 @@ const VERTEX_NORMAL = /* glsl */ `
 	vTriWorldNormal = transpose( mat3( viewMatrix ) ) * normalize( transformedNormal );
 `
 
-const CACHE_KEY = 'cod-triplanar-v4'
+const CACHE_KEY = 'cod-triplanar-v5'
 
 /** True once `applyTriplanar` has patched this material. */
 export function isTriplanar(material: THREE.Material): boolean {
@@ -409,6 +477,7 @@ export function applyTriplanar(
   const dust = options.dustColor ?? new THREE.Color(0.26, 0.22, 0.17)
   const grime = options.grimeColor ?? new THREE.Color(0.05, 0.044, 0.035)
   const fade = options.parallaxFade ?? [9, 22]
+  const detailFreq = options.detailFreq ?? 1.6
   const uniforms = {
     uDetailMap: { value: detailMap },
     uTriScale: { value: options.scale },
@@ -422,11 +491,18 @@ export function applyTriplanar(
     uDustColor: { value: dust },
     uDustAmount: { value: options.dustAmount ?? 0 },
     uDustRough: { value: options.dustRough ?? 0.94 },
-    uDetailFreq: { value: options.detailFreq ?? 1.6 },
+    uDetailFreq: { value: detailFreq },
     uDetailNormal: { value: options.detailNormal ?? 0 },
-    uDetailAlbedo: { value: options.detailAlbedo ?? 0.44 },
-    uDetailRough: { value: options.detailRough ?? 0.22 },
+    // Trimmed from 0.44 when the detail map's height channel was flattened:
+    // that roughly doubled the channel's mean deviation at the same extremes,
+    // so a smaller coefficient now delivers more surface variation than the
+    // larger one used to, with a *lower* peak swing.
+    uDetailAlbedo: { value: options.detailAlbedo ?? 0.38 },
+    uDetailRough: { value: options.detailRough ?? 0.2 },
     uDetailCavity: { value: options.detailCavity ?? 0.5 },
+    uCoarseFreq: { value: detailFreq * (options.detailCoarse ?? 0.09) },
+    uCoarseAlbedo: { value: options.detailCoarseAlbedo ?? 0.38 },
+    uCoarseRough: { value: options.detailCoarseRough ?? 0.16 },
     uParallax: { value: options.parallax ?? 0 },
     uParallaxFade: { value: new THREE.Vector2(fade[0], fade[1]) },
     uMicroShadow: { value: options.microShadow ?? 0.85 },
@@ -455,4 +531,95 @@ export function applyTriplanar(
   }
   // Patched and unpatched materials must not share a compiled program.
   material.customProgramCacheKey = () => CACHE_KEY
+}
+
+// --- The same detail, for surfaces that are not projected ------------------
+
+/**
+ * How a mesh-UV material samples the shared detail texture.
+ *
+ * Frequencies are multiples of the material's own tile, not of a metre, because
+ * these surfaces have no world-space projection to measure metres against — a
+ * weapon receiver, a sandbag and a packing crate are each authored at whatever
+ * texel density their own tile implies.
+ */
+export interface DetailOverlayOptions {
+  /** Detail tiles per material tile, for the fine layer. */
+  freq: number
+  /** Albedo swing of the fine layer, as a fraction. */
+  albedo?: number
+  /** Roughness swing of the fine layer, absolute. */
+  rough?: number
+  /** Coarse layer frequency, as a fraction of `freq`. */
+  coarse?: number
+  /** Albedo swing of the coarse layer, as a fraction. */
+  coarseAlbedo?: number
+}
+
+const OVERLAY_HELPERS = /* glsl */ `
+uniform sampler2D uDetailMap;
+uniform vec2 uOverlayFreq;
+uniform vec3 uOverlayAmount;
+`
+
+// `vMapUv` already carries the material's repeat, so these frequencies are in
+// tiles of the material's own texture.
+const OVERLAY_MAP = /* glsl */ `
+	// Neutral by default so the roughness patch below still compiles on a
+	// material that has no albedo map and therefore no UV varying.
+	vec2 ovFine = vec2( 0.5 );
+	float ovCoarse = 0.5;
+	#ifdef USE_MAP
+		ovFine = texture2D( uDetailMap, vMapUv * uOverlayFreq.x ).ba;
+		ovCoarse = texture2D( uDetailMap, vMapUv * uOverlayFreq.y + 0.37 ).b;
+		diffuseColor.rgb *= 1.0 + ( ovFine.y - 0.5 ) * uOverlayAmount.x;
+		diffuseColor.rgb *= 1.0 + ( ovCoarse - 0.5 ) * uOverlayAmount.z;
+	#endif
+`
+
+const OVERLAY_ROUGHNESS = /* glsl */ `
+	roughnessFactor = clamp( roughnessFactor + ( ovFine.x - 0.5 ) * uOverlayAmount.y, 0.06, 1.0 );
+`
+
+const OVERLAY_CACHE_KEY = 'cod-detail-overlay-v1'
+
+/**
+ * Gives a mesh-UV material the same two-scale detail the projected ones get.
+ *
+ * Two thirds of the library is not triplanar — the viewmodel, the soldiers,
+ * every crate, sandbag, tarp and barrel — and measured across the mip chain
+ * those are the materials whose contrast collapses hardest with distance:
+ * brushed steel falls from 0.059 to 0.019, a helmet from 0.091 to 0.028, a
+ * packing crate from 0.077 to 0.045. They have no world-space layer to fall
+ * back on, so once their own map has mipped down there is nothing left.
+ *
+ * Two texture reads and four multiplies fixes that. Both layers are value only
+ * — no normal, no metalness — for the same reason the projected coarse layer
+ * is: a value step has no specular lobe, so it holds up under any key light
+ * without ever becoming a highlight that flickers.
+ */
+export function applyDetailOverlay(
+  material: THREE.MeshStandardMaterial,
+  detailMap: THREE.Texture,
+  options: DetailOverlayOptions,
+): void {
+  const coarse = options.freq * (options.coarse ?? 0.1)
+  const uniforms = {
+    uDetailMap: { value: detailMap },
+    uOverlayFreq: { value: new THREE.Vector2(options.freq, coarse) },
+    uOverlayAmount: {
+      value: new THREE.Vector3(options.albedo ?? 0.3, options.rough ?? 0.16, options.coarseAlbedo ?? 0.26),
+    },
+  }
+  material.userData.detailOverlay = true
+  material.userData.detailOverlayUniforms = uniforms
+
+  material.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, uniforms)
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\n${OVERLAY_HELPERS}`)
+      .replace('#include <map_fragment>', `#include <map_fragment>\n${OVERLAY_MAP}`)
+      .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>\n${OVERLAY_ROUGHNESS}`)
+  }
+  material.customProgramCacheKey = () => OVERLAY_CACHE_KEY
 }

@@ -17,12 +17,17 @@ import type { Rand } from '../core/Rand'
  * actually brighten when the gun goes off. That single detail is most of what
  * separates a convincing weapon from a glowing sprite.
  *
- * **Energy budget.** Bloom keys off scene luminance above 1.6, and the sun is
- * 2.1. The layers are authored so the summed core sits a little over the bloom
- * threshold and rolls off warm through the tonemapper, rather than clipping to
- * flat white with a wide halo — a flash that erases the soldier holding it is
- * worse than no flash. The light is 5cd at 6.5m to match the intensity the AI
- * muzzle lights already use, so the player's gun and an enemy's read alike.
+ * **Energy budget.** Bloom keys off scene luminance above 1.6 and the sun is
+ * 2.1, so what matters is not each layer's brightness but the *sum* where they
+ * overlap — they are additive and concentric, and that sum used to reach 6.4 in
+ * red, four times the bloom threshold, which is how a flash ends up as a clipped
+ * white disc with a halo that eats the shooter. The three layers are now
+ * authored against their sum: (1.5,1.05,0.52) + 0.85·(0.9,0.42,0.14) +
+ * 0.8·(0.78,0.52,0.24) = (2.89,1.82,0.83). That is comfortably over the bloom
+ * threshold in red, under it in blue, so the flash blooms *warm* and rolls off
+ * through the tonemapper instead of clipping. The light is 5cd at 6.5m to match
+ * the intensity the AI muzzle lights already use, so the player's gun and an
+ * enemy's read alike.
  */
 
 export class MuzzleFlash {
@@ -119,11 +124,11 @@ export class MuzzleFlash {
       const p = P.params
       p.position.copy(origin).addScaledVector(forward, 0.035 * flashScale)
       p.life = 0.035
-      p.sizeStart = 0.075 * flashScale
-      p.sizeEnd = 0.105 * flashScale
+      p.sizeStart = 0.07 * flashScale
+      p.sizeEnd = 0.098 * flashScale
       p.drag = 6
-      p.colorStart.setRGB(3.2, 2.4, 1.3)
-      p.colorEnd.setRGB(1.4, 0.85, 0.32)
+      p.colorStart.setRGB(1.5, 1.05, 0.52)
+      p.colorEnd.setRGB(0.62, 0.34, 0.11)
       p.alphaStart = 1
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
@@ -138,12 +143,12 @@ export class MuzzleFlash {
       const p = P.params
       p.position.copy(origin).addScaledVector(forward, 0.075 * flashScale)
       p.life = 0.055
-      p.sizeStart = 0.13 * flashScale
-      p.sizeEnd = 0.22 * flashScale
+      p.sizeStart = 0.115 * flashScale
+      p.sizeEnd = 0.19 * flashScale
       p.drag = 8
-      p.colorStart.setRGB(1.75, 0.78, 0.22)
-      p.colorEnd.setRGB(0.55, 0.15, 0.02)
-      p.alphaStart = 0.9
+      p.colorStart.setRGB(0.9, 0.42, 0.14)
+      p.colorEnd.setRGB(0.3, 0.09, 0.015)
+      p.alphaStart = 0.85
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(6)
@@ -158,12 +163,12 @@ export class MuzzleFlash {
       const p = P.params
       p.position.copy(origin).addScaledVector(forward, 0.05 * flashScale)
       p.life = 0.045
-      p.sizeStart = 0.23 * flashScale * r.range(0.8, 1.35)
-      p.sizeEnd = p.sizeStart * 1.25
+      p.sizeStart = 0.19 * flashScale * r.range(0.8, 1.3)
+      p.sizeEnd = p.sizeStart * 1.22
       p.drag = 8
-      p.colorStart.setRGB(1.9, 1.25, 0.55)
-      p.colorEnd.setRGB(0.6, 0.22, 0.05)
-      p.alphaStart = 0.85
+      p.colorStart.setRGB(0.78, 0.52, 0.24)
+      p.colorEnd.setRGB(0.26, 0.1, 0.02)
+      p.alphaStart = 0.8
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(2)
@@ -198,8 +203,11 @@ export class MuzzleFlash {
     }
 
     // 5. Propellant smoke always lives in world space so it hangs where it was
-    //    made instead of riding the camera.
-    const smokeCount = 2 + (r.bool(0.4) ? 1 : 0)
+    //    made instead of riding the camera. Automatic fire puts ten of these a
+    //    second within a metre of the lens, so it is metered against the same
+    //    coverage budget as impact dust.
+    const allow = this.worldParticles.allowance()
+    const smokeCount = allow < 0.45 ? 1 : 2 + (r.bool(0.4) ? 1 : 0)
     for (let i = 0; i < smokeCount; i++) {
       const p = this.worldParticles.params
       p.position.copy(this.worldOrigin).addScaledVector(this.worldForward, r.range(0.04, 0.3) * flashScale)
@@ -219,7 +227,7 @@ export class MuzzleFlash {
       p.turbulence = 0.22
       p.colorStart.setHex(0xc4beb2, THREE.SRGBColorSpace)
       p.colorEnd.setHex(0x7f7a73, THREE.SRGBColorSpace)
-      p.alphaStart = 0.24
+      p.alphaStart = 0.24 * allow
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(1.4)

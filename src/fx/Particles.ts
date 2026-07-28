@@ -183,7 +183,14 @@ void main() {
   vec2 cell = vec2(mod(tf, uSheet.x), floor(tf / uSheet.x));
   vUv = vec2((uv.x + cell.x) / uSheet.x, 1.0 - (cell.y + 1.0 - uv.y) / uSheet.y);
 
-  float alpha = mix(aColA.a, aColB.a, u) * smoothstep(0.0, 0.055, u) * cover;
+  // Fade in at birth and out at death. The tail fade is unconditional: solid
+  // debris is authored to stay opaque for its whole life so it reads as a
+  // fragment rather than a ghost, and without this it simply blinks out — which
+  // in a frozen capture means a frame full of full-opacity flecks.
+  float alpha = mix(aColA.a, aColB.a, u)
+    * smoothstep(0.0, 0.055, u)
+    * (1.0 - smoothstep(0.74, 1.0, u))
+    * cover;
   vColor = vec4(mix(aColA.rgb, aColB.rgb, ease), alpha);
   // A big card needs a correspondingly long depth fade, otherwise a 1.5m puff
   // still cuts a visible line where it meets the floor.
@@ -402,6 +409,17 @@ class ParticleGroup {
   }
 }
 
+/** Slots in the coverage ledger. Roughly ten seconds of sustained fire. */
+const LEDGER = 1024
+/**
+ * Cards covering less of the frame than this are not tracked. It exists to keep
+ * the ledger's slots for the cards that can actually veil the frame: a 2cm chip
+ * at 2.5m is 4e-6 of the frame and there are hundreds of them, while a 0.5m
+ * dust puff at 5m is 8e-5 and there are hundreds of those too — one group is
+ * the problem and the other is rounding error.
+ */
+const LEDGER_FLOOR = 2e-5
+
 export class Particles {
   /** Shared scratch used by every emitter; never allocate to spawn. */
   readonly p = new ParticleParams()
@@ -411,7 +429,25 @@ export class Particles {
   /** Latest time at which a depth-fading particle is still alive. */
   private softUntil = -1
 
-  constructor(scene: THREE.Scene, budget: number, textures: FxTextureSet, soft: boolean) {
+  // --- screen coverage ledger ------------------------------------------------
+  // `uScreenLimit` stops one card from owning the frame. Nothing stopped a
+  // thousand of them from owning it together, which is exactly what a squad
+  // firing twenty rounds a second produces: every round spawns a fresh handful
+  // of half-metre dust puffs, they pool, and the frame ends up behind a
+  // translucent sheet with no blacks and no white point. This tracks how much
+  // of the frame live translucent cards already cover so emitters can back off.
+  private readonly ledgerExpiry = new Float32Array(LEDGER)
+  private readonly ledgerAmount = new Float32Array(LEDGER)
+  private ledgerHead = 0
+  private coverage = 0
+  private readonly viewpoint = new THREE.Vector3()
+  /** projectionMatrix[1][1], i.e. 1 / tan(vfov / 2). */
+  private focal = 1.19
+  private aspect = 16 / 9
+  private readonly budget: number
+
+  constructor(scene: THREE.Scene, budget: number, textures: FxTextureSet, soft: boolean, coverageBudget = 0.030) {
+    this.budget = Math.max(1e-4, coverageBudget)
     const clamp = (n: number) => Math.max(48, Math.floor(n))
     const specs: [GroupKey, THREE.Texture, boolean, number, number][] = [
       ['smoke', textures.smokeSheet, false, clamp(budget * 0.30), 10],
@@ -437,11 +473,13 @@ export class Particles {
   emit(key: GroupKey, time: number): void {
     const g = this.groups.get(key)
     if (!g) return
-    g.emit(this.p, time)
-    if (this.p.soft > 0) {
-      const until = time + this.p.life
+    const p = this.p
+    g.emit(p, time)
+    if (p.soft > 0) {
+      const until = time + p.life
       if (until > this.softUntil) this.softUntil = until
     }
+    this.charge(p, time)
   }
 
   /** True while any depth-fading particle is alive, so the prepass can idle. */
@@ -451,6 +489,78 @@ export class Particles {
 
   update(time: number): void {
     for (const g of this.groups.values()) g.flush(time)
+    this.settle(time)
+  }
+
+  // --- screen coverage ledger ------------------------------------------------
+
+  /**
+   * Where the frame is being viewed from, so a card's screen coverage can be
+   * costed at the moment it is spawned. One call per frame; being a frame stale
+   * is irrelevant at these magnitudes.
+   */
+  setViewpoint(position: THREE.Vector3, focal: number, aspect: number): void {
+    this.viewpoint.copy(position)
+    this.focal = focal
+    this.aspect = aspect
+  }
+
+  /**
+   * The fraction of the frame this card will cover, averaged over its life.
+   * A disc of world radius `r` at distance `d` occupies `pi (r f / d)^2` of the
+   * NDC box's area of `4 * aspect`; the 0.48 accounts for the circular mask the
+   * fragment shader applies inside the quad, and 0.42 for the fact that a mask
+   * is nowhere near solid across its own footprint.
+   */
+  private coverageOf(p: ParticleParams): number {
+    const dist = this.viewpoint.distanceTo(p.position)
+    if (dist < 0.05) return 0
+    const size = (p.sizeStart + p.sizeEnd) * 0.5
+    const r = 0.48 * size * this.focal / dist
+    const alpha = (p.alphaStart + p.alphaEnd) * 0.5
+    return (Math.PI * r * r) / (4 * this.aspect) * alpha * 0.42
+  }
+
+  private charge(p: ParticleParams, time: number): void {
+    const amount = this.coverageOf(p)
+    if (amount < LEDGER_FLOOR) return
+    const i = this.ledgerHead
+    this.ledgerHead = (this.ledgerHead + 1) % LEDGER
+    this.coverage += amount - this.ledgerAmount[i]
+    this.ledgerAmount[i] = amount
+    this.ledgerExpiry[i] = time + p.life
+  }
+
+  /** Retires expired entries. Fixed cost, no allocation, once per frame. */
+  private settle(time: number): void {
+    let sum = 0
+    for (let i = 0; i < LEDGER; i++) {
+      if (this.ledgerAmount[i] === 0) continue
+      if (this.ledgerExpiry[i] <= time) {
+        this.ledgerAmount[i] = 0
+        continue
+      }
+      sum += this.ledgerAmount[i]
+    }
+    this.coverage = sum
+  }
+
+  /** How much of the frame live translucent cards already cover, 0..n. */
+  get load(): number {
+    return this.coverage
+  }
+
+  /**
+   * The multiplier an emitter should fold into the count and opacity of any
+   * *cloud* layer — dust, propellant smoke, haze. It is 1 while the frame is
+   * clear and falls away as the budget fills, so a firefight with seven
+   * shooters produces a scene with smoke in it rather than a scene behind
+   * smoke. Hard effects (sparks, chips, decals) ignore it: they are what makes
+   * the impact read, and they cost almost nothing in coverage.
+   */
+  allowance(): number {
+    const k = 1 - this.coverage / this.budget
+    return k < 0.1 ? 0.1 : k > 1 ? 1 : k
   }
 
   setDepth(depth: THREE.Texture | null, near: number, far: number): void {

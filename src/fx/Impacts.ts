@@ -41,6 +41,19 @@ export class Impacts {
   private readonly boxSize = new THREE.Vector3()
   private readonly shattered = new Set<number>()
 
+  /**
+   * Exponentially decayed count of recent impacts, and the multiplier derived
+   * from it. A squad of seven puts twenty rounds a second into the geometry
+   * around the player; at the full recipe that is well over a thousand live
+   * cards, and the frame ends up behind them rather than in front. Twenty
+   * simultaneous impacts read as a storm whether each one spends thirty cards
+   * or eight, so under sustained fire each one spends fewer.
+   */
+  private rate = 0
+  private rateTime = -1
+  /** Cloud attenuation for the impact currently being dressed. */
+  private cloud = 1
+
   constructor(private readonly deps: ImpactDeps) {}
 
   /** Builds an orthonormal tangent frame around the surface normal. */
@@ -72,8 +85,24 @@ export class Impacts {
   impact(ctx: GameContext, point: THREE.Vector3, normal: THREE.Vector3, surface: Surface, time: number): void {
     const dist = ctx.camera.position.distanceTo(point)
     if (dist > 140) return
-    const density = THREE.MathUtils.clamp(ctx.config.particleBudget / 8000, 0.35, 1.7)
+
+    if (this.rateTime >= 0 && time > this.rateTime) this.rate *= Math.exp(-(time - this.rateTime) / 0.7)
+    this.rateTime = time
+    this.rate += 1
+    const sustained = THREE.MathUtils.clamp(1 - (this.rate - 3) / 22, 0.35, 1)
+
+    const density = THREE.MathUtils.clamp(ctx.config.particleBudget / 8000, 0.35, 1.25)
       * THREE.MathUtils.clamp(1 - (dist - 25) / 90, 0.28, 1)
+      * sustained
+
+    // Dust puffs are sized in metres but paid for in pixels, and a half-metre
+    // puff two metres from the lens covers sixteen times the frame that the
+    // same puff covers at eight. Near-field impacts therefore spend the same
+    // *screen* budget as far ones instead of the same world budget — this is
+    // the single largest contributor to `nearFieldLift`. `sustained` is already
+    // in `density`, so it is deliberately not applied twice: twenty impacts a
+    // second should still look like twenty impacts a second.
+    this.cloud = this.deps.particles.allowance() * THREE.MathUtils.clamp(dist / 4.5, 0.3, 1)
 
     this.basis(normal)
     this.incoming.copy(point).sub(ctx.camera.position)
@@ -166,8 +195,10 @@ export class Impacts {
     const P = this.deps.particles
     const r = this.deps.rand
 
-    // 1. Hard initial burst, gone in a couple of frames.
-    for (let i = 0; i < Math.ceil(4 * density); i++) {
+    // 1. Hard initial burst, gone in a couple of frames. Not metered against
+    //    the coverage budget: it lives for a fifth of a second, so it costs the
+    //    frame almost nothing, and it is what makes the hit read at all.
+    for (let i = 0; i < Math.ceil(3 * density); i++) {
       const p = P.params
       p.position.copy(point).addScaledVector(this.n, 0.03)
       this.cone(this.n, 1.0, this.dir)
@@ -179,7 +210,7 @@ export class Impacts {
       p.gravity = 0.1
       p.colorStart.setHex(0xf2ede2, THREE.SRGBColorSpace)
       p.colorEnd.setHex(hot, THREE.SRGBColorSpace)
-      p.alphaStart = 0.95
+      p.alphaStart = 0.9
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(3)
@@ -191,7 +222,7 @@ export class Impacts {
     }
 
     // 2. Chips flying, velocity-stretched so they read as solid fragments.
-    for (let i = 0; i < Math.ceil(7 * density); i++) {
+    for (let i = 0; i < Math.ceil(5 * density); i++) {
       const p = P.params
       p.position.copy(point).addScaledVector(this.n, 0.02)
       this.cone(this.n, 1.15, this.dir).lerp(this.reflected, 0.35).normalize()
@@ -216,21 +247,21 @@ export class Impacts {
     //    landing on cover two metres from the lens does not veil the frame:
     //    incoming fire hits close to the camera constantly, and this is the
     //    single largest source of near-field haze in the game.
-    for (let i = 0; i < Math.ceil(3 * density); i++) {
+    for (let i = 0; i < Math.ceil(3 * density * this.cloud); i++) {
       const p = P.params
       p.position.copy(point).addScaledVector(this.n, r.range(0.05, 0.22))
       this.cone(this.n, 1.3, this.dir)
       p.velocity.copy(this.dir).multiplyScalar(r.range(0.35, 1.3))
       p.velocity.y += 0.35
       p.life = r.range(1.4, 2.6)
-      p.sizeStart = r.range(0.16, 0.28)
-      p.sizeEnd = r.range(0.5, 0.9)
+      p.sizeStart = r.range(0.14, 0.24)
+      p.sizeEnd = r.range(0.42, 0.72)
       p.drag = 2.2
       p.gravity = -0.03
       p.turbulence = 0.16
       p.colorStart.setHex(hot, THREE.SRGBColorSpace)
       p.colorEnd.setHex(cool, THREE.SRGBColorSpace)
-      p.alphaStart = 0.3
+      p.alphaStart = 0.28 * this.cloud
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(0.6)
@@ -271,7 +302,7 @@ export class Impacts {
 
     // Sparks: hot, stretched, and they bounce because gravity plus low drag
     // sends them skittering along the floor.
-    for (let i = 0; i < Math.ceil(16 * density); i++) {
+    for (let i = 0; i < Math.ceil(11 * density); i++) {
       const p = P.params
       p.position.copy(point).addScaledVector(this.n, 0.015)
       this.cone(this.reflected, 0.85, this.dir).lerp(this.n, 0.2).normalize()
@@ -287,12 +318,12 @@ export class Impacts {
       p.alphaEnd = 0
       p.stretch = 0.055
       p.tile = SPRITE.streak
-      p.soft = 0
+      p.soft = 0.05
       P.emit('spriteAdd', time)
     }
 
     // Tangential spray hugging the surface — the giveaway that a round skipped.
-    for (let i = 0; i < Math.ceil(8 * density); i++) {
+    for (let i = 0; i < Math.ceil(5 * density); i++) {
       const p = P.params
       p.position.copy(point).addScaledVector(this.n, 0.01)
       const a = r.range(0, Math.PI * 2)
@@ -310,24 +341,24 @@ export class Impacts {
       p.alphaEnd = 0
       p.stretch = 0.07
       p.tile = SPRITE.streak
-      p.soft = 0
+      p.soft = 0.05
       P.emit('spriteAdd', time)
     }
 
     // A little paint dust / smoke so it is not pure sparks.
-    for (let i = 0; i < Math.ceil(2 * density); i++) {
+    for (let i = 0; i < Math.ceil(2 * density * this.cloud); i++) {
       const p = P.params
       p.position.copy(point).addScaledVector(this.n, 0.05)
       this.cone(this.n, 1.2, this.dir)
       p.velocity.copy(this.dir).multiplyScalar(r.range(0.5, 1.6))
       p.life = r.range(0.5, 1.1)
-      p.sizeStart = 0.07
-      p.sizeEnd = r.range(0.24, 0.42)
+      p.sizeStart = 0.06
+      p.sizeEnd = r.range(0.2, 0.36)
       p.drag = 3
       p.gravity = -0.02
       p.colorStart.setHex(thin ? 0x8d8d90 : 0x6f6e70, THREE.SRGBColorSpace)
       p.colorEnd.setHex(0x4a4a4c, THREE.SRGBColorSpace)
-      p.alphaStart = 0.34
+      p.alphaStart = 0.32 * this.cloud
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(1.5)
@@ -343,7 +374,7 @@ export class Impacts {
     const P = this.deps.particles
     const r = this.deps.rand
 
-    for (let i = 0; i < Math.ceil(9 * density); i++) {
+    for (let i = 0; i < Math.ceil(6 * density); i++) {
       const p = P.params
       p.position.copy(point).addScaledVector(this.n, 0.02)
       this.cone(this.n, 1.0, this.dir).lerp(this.reflected, 0.3).normalize()
@@ -364,20 +395,20 @@ export class Impacts {
       P.emit('sprite', time)
     }
 
-    for (let i = 0; i < Math.ceil(5 * density); i++) {
+    for (let i = 0; i < Math.ceil(4 * density * this.cloud); i++) {
       const p = P.params
       p.position.copy(point).addScaledVector(this.n, r.range(0.02, 0.14))
       this.cone(this.n, 1.2, this.dir)
       p.velocity.copy(this.dir).multiplyScalar(r.range(1, 4))
       p.life = r.range(0.8, 1.8)
-      p.sizeStart = r.range(0.08, 0.16)
-      p.sizeEnd = r.range(0.32, 0.62)
+      p.sizeStart = r.range(0.07, 0.14)
+      p.sizeEnd = r.range(0.28, 0.52)
       p.drag = 3.2
       p.gravity = 0.05
       p.turbulence = 0.14
       p.colorStart.setHex(0xb0916a, THREE.SRGBColorSpace)
       p.colorEnd.setHex(0x6d5638, THREE.SRGBColorSpace)
-      p.alphaStart = 0.42
+      p.alphaStart = 0.4 * this.cloud
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(1.2)
@@ -398,7 +429,7 @@ export class Impacts {
     const P = this.deps.particles
     const r = this.deps.rand
 
-    for (let i = 0; i < Math.ceil(18 * density); i++) {
+    for (let i = 0; i < Math.ceil(11 * density); i++) {
       const p = P.params
       p.position.copy(point).addScaledVector(this.n, 0.02)
       // A fan, not a sphere: granular material sprays forward off the surface.
@@ -419,20 +450,20 @@ export class Impacts {
       P.emit('sprite', time)
     }
 
-    for (let i = 0; i < Math.ceil(5 * density); i++) {
+    for (let i = 0; i < Math.ceil(4 * density * this.cloud); i++) {
       const p = P.params
       p.position.copy(point).addScaledVector(this.n, r.range(0.04, 0.2))
       this.cone(this.n, 0.8, this.dir)
       p.velocity.copy(this.dir).multiplyScalar(r.range(1.2, 3.6))
-      p.life = r.range(1.1, 2.4)
-      p.sizeStart = r.range(0.12, 0.22)
-      p.sizeEnd = r.range(0.45, 0.85)
+      p.life = r.range(1.1, 2.2)
+      p.sizeStart = r.range(0.10, 0.19)
+      p.sizeEnd = r.range(0.38, 0.68)
       p.drag = 2.6
       p.gravity = 0.06
       p.turbulence = 0.2
       p.colorStart.setHex(hot, THREE.SRGBColorSpace)
       p.colorEnd.setHex(cool, THREE.SRGBColorSpace)
-      p.alphaStart = 0.36
+      p.alphaStart = 0.32 * this.cloud
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(0.8)

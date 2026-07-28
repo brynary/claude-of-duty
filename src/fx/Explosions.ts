@@ -233,7 +233,7 @@ export class Explosions {
     // Dust ripped off the ground and driven outward along it.
     if (!b.grounded) return
     this.tangentBasis(b.groundNormal)
-    const count = 26
+    const count = Math.max(10, Math.round(26 * P.allowance()))
     for (let i = 0; i < count; i++) {
       const a = (i / count) * Math.PI * 2 + r.spread(0.12)
       const p = P.params
@@ -266,7 +266,7 @@ export class Explosions {
     const P = this.deps.particles
     const r = this.deps.rand
     const R = b.radius
-    for (let i = 0; i < 14; i++) {
+    for (let i = 0; i < Math.max(6, Math.round(14 * P.allowance())); i++) {
       const p = P.params
       p.position.copy(b.point).add(this.randomInSphere(R * 0.4))
       this.randomDirection(this.dir)

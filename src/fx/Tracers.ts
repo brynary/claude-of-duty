@@ -26,12 +26,16 @@ varying vec2  vUv;
 varying float vFade;
 varying float vHot;
 varying float vDist;
+varying vec4  vScreen;
+varying float vViewZ;
 
 void main() {
   vUv = uv;
   vFade = 0.0;
   vHot = 0.0;
   vDist = 0.0;
+  vScreen = vec4(0.0, 0.0, 1.0, 1.0);
+  vViewZ = -1.0;
 
   float life = aParams.w;
   float t = uTime - aStart.w;
@@ -67,6 +71,8 @@ void main() {
 
   vec4 mv = vec4(p, 1.0);
   gl_Position = projectionMatrix * mv;
+  vScreen = gl_Position;
+  vViewZ = mv.z;
 
   // Fade in over the first few metres so the tracer does not pop at the muzzle,
   // and out at the end of its flight.
@@ -80,14 +86,20 @@ void main() {
 const FRAG = /* glsl */ `
 precision highp float;
 
-uniform vec3  uCore;
-uniform vec3  uEdge;
-uniform float uIntensity;
+uniform vec3      uCore;
+uniform vec3      uEdge;
+uniform float     uIntensity;
+uniform sampler2D uDepth;
+uniform float     uHasDepth;
+uniform float     uNear;
+uniform float     uFar;
 
 varying vec2  vUv;
 varying float vFade;
 varying float vHot;
 varying float vDist;
+varying vec4  vScreen;
+varying float vViewZ;
 
 #ifdef USE_FOG
 uniform vec3 fogColor;
@@ -112,6 +124,20 @@ void main() {
   float alpha = (body * 0.55 + core * 0.9) * along * vFade * uIntensity;
   vec3 colour = mix(uEdge, uCore, core * 0.85 + headGlow * 0.35);
   colour *= 1.0 + headGlow * 1.4 + vHot * 0.35;
+
+  // A ribbon that runs into a wall must dissolve into it, not stop dead on the
+  // polygon edge. Without this a tracer disappearing behind cover is a hard
+  // diagonal line terminated mid-air, which is exactly what it looks like.
+  // The fade distance is short — a fifth of a metre — because the ribbon is
+  // aimed at the surface rather than lying across it, so a long fade would
+  // simply shorten every tracer instead of softening where it lands.
+  if (uHasDepth > 0.5) {
+    vec2 suv = vScreen.xy / vScreen.w * 0.5 + 0.5;
+    float d = texture2D(uDepth, suv).x;
+    float sceneZ = (uNear * uFar) / ((uFar - uNear) * d - uFar);
+    float fade = clamp((vViewZ - sceneZ) / 0.22, 0.0, 1.0);
+    alpha *= fade * fade * (3.0 - 2.0 * fade);
+  }
 
 #ifdef USE_FOG
   #ifdef FOG_EXP2
@@ -142,6 +168,7 @@ export class Tracers {
   private wrapped = false
   private dirtyMin = Infinity
   private dirtyMax = -Infinity
+  private liveUntil = -1
 
   private readonly d = new THREE.Vector3()
 
@@ -181,6 +208,10 @@ export class Tracers {
           uCore: { value: new THREE.Color().setRGB(3.4, 2.5, 1.35) },
           uEdge: { value: new THREE.Color().setRGB(1.5, 0.42, 0.09) },
           uIntensity: { value: 1 },
+          uDepth: { value: null },
+          uHasDepth: { value: 0 },
+          uNear: { value: 0.06 },
+          uFar: { value: 900 },
         },
       ]),
       vertexShader: VERT,
@@ -231,6 +262,7 @@ export class Tracers {
     this.params[o + 1] = trail
     this.params[o + 2] = bright ? 0.028 : 0.014
     this.params[o + 3] = life
+    if (time + life > this.liveUntil) this.liveUntil = time + life
 
     if (i < this.dirtyMin) this.dirtyMin = i
     if (i > this.dirtyMax) this.dirtyMax = i
@@ -250,6 +282,19 @@ export class Tracers {
     }
     this.geometry.instanceCount = this.wrapped ? this.capacity : this.head
     this.material.uniforms.uTime.value = time
+  }
+
+  setDepth(depth: THREE.Texture | null, near: number, far: number): void {
+    const u = this.material.uniforms
+    u.uDepth.value = depth
+    u.uHasDepth.value = depth ? 1 : 0
+    u.uNear.value = near
+    u.uFar.value = far
+  }
+
+  /** True while any tracer is alive, so the depth prepass knows to run. */
+  active(time: number): boolean {
+    return time < this.liveUntil
   }
 
   setVisible(v: boolean): void {
