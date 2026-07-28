@@ -88,7 +88,12 @@ async function main() {
     }
   }
 
-  const profileDir = join(root, '.chrome-profile-play')
+  // A profile directory unique to this invocation. A fixed one intermittently
+  // fails to launch with a bare "Code: null" — a stale lock survives a killed
+  // Chrome, and the next run inherits it. That failure surfaces as a boot
+  // timeout, which reads exactly like the game failing to start, so it is worth
+  // eliminating the class rather than retrying through it.
+  const profileDir = join(root, `.chrome-profile-play-${process.pid}`)
   rmSync(profileDir, { recursive: true, force: true })
   mkdirSync(profileDir, { recursive: true })
 
@@ -165,6 +170,7 @@ async function main() {
   writeFileSync(join(outDir, 'runs.json'), JSON.stringify(runs, null, 2))
   await browser.close()
   if (server) server.kill()
+  rmSync(profileDir, { recursive: true, force: true })
 
   console.log(`[play] wrote ${runs.length} run(s) to ${outDir}`)
   process.exit(failed ? 1 : 0)
