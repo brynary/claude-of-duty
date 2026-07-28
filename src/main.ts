@@ -12,6 +12,8 @@ import { HudSystem } from './ui/HudSystem'
 import { PostFxSystem } from './render/PostFX'
 import { PlayBotSystem } from './core/PlayBot'
 import { TelemetrySystem } from './core/Telemetry'
+import { MatchDirector } from './game/MatchDirector'
+import { difficulty } from './game/Difficulty'
 
 /**
  * Registration order is both init order and update order, so a system is
@@ -40,6 +42,14 @@ async function boot(): Promise<void> {
     .add(bot)
     .add(new PlayerSystem())
     .add(new AiSystem())
+    // Difficulty holds the preset tables that AI and behaviour already import
+    // as a singleton; registering it is what makes its dynamic adjustment run
+    // at all. Unregistered, the presets worked and the adaptation was dead code.
+    .add(difficulty)
+    // The match owns wave cadence. It must come after AiSystem because it calls
+    // ai.spawnWave, and after LevelSystem so the encounter director's staging
+    // is fresh in the same frame.
+    .add(new MatchDirector())
     .add(new WeaponSystem())
     .add(new HudSystem())
     .add(new PostFxSystem())

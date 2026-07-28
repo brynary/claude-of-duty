@@ -228,7 +228,7 @@ export class CameraRig {
       }
     }
 
-    const speedNorm = THREE.MathUtils.clamp(speed / MOVE.run, 0, 1.5)
+    const speedNorm = THREE.MathUtils.clamp(speed / MOVE.walk, 0, 1.5)
     const bobTarget = moving ? speedNorm : 0
     this.bobWeight += (bobTarget - this.bobWeight) * approach(moving ? 9 : 6, dt)
     const bobGain = this.bobWeight * (1 - adsEase * 0.94)
@@ -265,6 +265,10 @@ export class CameraRig {
     if (loco.justSlid) {
       this.fovSpring.pulse(8)
       this.landDip.pulse(-0.035)
+      // The slide is now 550ms rather than 1250ms, so the roll has to arrive on
+      // the first frame instead of easing in over a third of a second. The
+      // spring alone was still climbing when the slide was already half over.
+      this.punchRoll.pulse(3.6 * DEG * Math.sign(strafeInput || 1))
     }
     if (loco.justJumped) this.landDip.pulse(0.02)
 
@@ -414,7 +418,7 @@ export class CameraRig {
     ctx.events.emit('player:footstep', {
       position: loco.position.clone(),
       surface: loco.groundSurface,
-      running: loco.speed > MOVE.run * 0.92,
+      running: loco.speed > MOVE.walk * 0.92,
     })
   }
 }

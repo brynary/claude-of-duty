@@ -63,8 +63,15 @@ export class WeaponSystem implements System, WeaponService {
   private reloadEmpty = false
   private magOutFired = false
   private magInFired = false
+  /** Normalised time in the reload at which the rounds become usable. */
+  private creditAt = 1
+  private ammoCredited = false
   private pendingSwitch = -1
   private switchTimer = -1
+  /** Counts down after a sprint ends; firing is locked out until it hits 0. */
+  private sprintOutLeft = 0
+  /** One dry click per trigger pull, not one every `fireTimer` expiry. */
+  private dryLatched = false
 
   private baseFov = 80
   private baseVmFov = 60
@@ -151,15 +158,48 @@ export class WeaponSystem implements System, WeaponService {
     this.updateSwitch(dt)
     this.updateReload(dt, ctx)
 
+    // The magazine reloads itself the instant it runs dry, whether or not the
+    // trigger is still down. Doing this only on the fire path left the weapon
+    // sitting empty whenever the player let go, so the next trigger pull was a
+    // dry click instead of a shot.
+    if (state.mag <= 0 && state.reserve > 0) this.tryReload()
+
+    // --- sprint-out -------------------------------------------------------
+    // §3.2 `[stated]`: sprint-out is 160-230 ms and is "the number that
+    // determines whether a game feels twitchy or committed". Nothing enforced
+    // it before — `sprinting` here already goes false the moment the trigger is
+    // touched, so the weapon fired the same frame. Movement tracks its own
+    // sprint-out but does not publish it, so the timer lives here, per weapon.
+    // §3.1: the ADS and sprint-out timers run concurrently, not additively.
+    if (player?.isSprinting) this.sprintOutLeft = def.sprintOutTime
+    else if (this.sprintOutLeft > 0) this.sprintOutLeft = Math.max(0, this.sprintOutLeft - dt)
+
     // --- firing -----------------------------------------------------------
     this.fireTimer = Math.max(this.fireTimer - dt, -0.5)
     this.burstCooldown = Math.max(this.burstCooldown - dt, 0)
-    if (!trigger) this.semiLatched = false
+    if (!trigger) {
+      this.semiLatched = false
+      this.dryLatched = false
+    }
 
     if (scripted?.forceShot) this.fireTimer = Math.min(this.fireTimer, 0)
 
+    // A reload can be fired out of once the rounds are actually in the gun.
+    // §3.3: the gap between `reloadAddTime` and `reloadTime` is a free cancel
+    // window, and "reload canceling ... can save up to 1 second".
+    if (trigger && this.reloadTimer >= 0 && this.ammoCredited && state.mag > 0) {
+      this.cancelReload(ctx)
+    }
+
     const blocked = this.reloadTimer >= 0 || this.switchTimer >= 0
-    const sprintBlocked = sprinting
+    // Two sprint-out clocks exist and both are wanted. This one is per weapon;
+    // the movement system's also covers leaving a slide (400ms), a mantle and
+    // tactical sprint (310ms), which a weapon-side timer cannot see. They run
+    // concurrently rather than in sequence, so the union is correct and does
+    // not double-charge — §3.1 [measured] is explicit that ADS and sprint-out
+    // overlap rather than sum, and the same holds here.
+    const movementSprintOut = (player as { sprintOutRemaining?: number } | undefined)?.sprintOutRemaining ?? 0
+    const sprintBlocked = sprinting || this.sprintOutLeft > 0 || movementSprintOut > 0
     let firing = false
 
     if (this.burstLeft > 0 && !blocked && !sprintBlocked) {
@@ -179,13 +219,16 @@ export class WeaponSystem implements System, WeaponService {
       let shotsThisFrame = 0
       while (this.fireTimer <= 0 && shotsThisFrame < 3) {
         if (state.mag <= 0) {
-          if (!this.wasFiring || state.mode !== 'auto') {
+          // One click per trigger pull. Running the magazine dry mid-burst is
+          // not a dry fire — the auto-reload below covers it — and holding the
+          // trigger on an empty gun used to emit five clicks a second.
+          if (!this.dryLatched && (!this.wasFiring || state.mode !== 'auto')) {
+            this.dryLatched = true
             ctx.events.emit('weapon:dryFire', { weapon: def.id })
           }
           this.fireTimer = 0.2
           this.burstLeft = 0
           firing = false
-          // Auto-reload the moment the magazine runs dry, as CoD does.
           this.tryReload()
           break
         }
@@ -292,15 +335,30 @@ export class WeaponSystem implements System, WeaponService {
     ctx.services.ai?.notifyNoise(origin, def.noiseRadius)
   }
 
+  /**
+   * FEEL_TARGET §3.6 `[stated]`: "All weapons in Call of Duty ... are perfectly
+   * accurate at an infinite range while aiming down the sights", corroborated by
+   * `adsSpread 0` on every weapon in the shipped files. It is the single most
+   * important accuracy fact about the series, and the previous version broke it
+   * three separate ways: a non-zero `spreadAds`, movement and jump multipliers
+   * that kept applying at full ADS, and 45% of the sustained-fire penalty
+   * bleeding through. All three are gone — the whole cone is now the *hipfire*
+   * cone, faded out by how far into the sights you are, and at full ADS the
+   * result is exactly `def.spreadAds`, which is 0 on everything that is not a
+   * shotgun.
+   */
   private currentSpread(def: WeaponDef, ctx: GameContext): number {
+    const ads = this.adsFraction
+    const hip = 1 - ads
+    if (hip <= 1e-4) return def.spreadAds
+
     const player = ctx.services.player
-    const base = def.spreadHip + (def.spreadAds - def.spreadHip) * this.adsFraction
     let mul = 1
     const speed = Math.min(player?.speedFraction ?? 0, 1)
     mul *= 1 + (def.spreadMoveMul - 1) * speed
     if (player?.isCrouching) mul *= def.spreadCrouchMul
     if (player && !player.onGround) mul *= def.spreadJumpMul
-    return base * mul + this.spread * (1 - this.adsFraction * 0.55)
+    return (def.spreadHip * mul + this.spread) * hip + def.spreadAds * ads
   }
 
   // ---------------------------------------------------------------- reloads
@@ -313,9 +371,13 @@ export class WeaponSystem implements System, WeaponService {
 
     this.reloadEmpty = state.mag <= 0
     this.reloadDur = this.reloadEmpty ? def.reloadEmptyTime : def.reloadTime
+    // The rounds become usable when the magazine seats — except on an empty
+    // reload, where nothing is chambered until the bolt goes forward.
+    this.creditAt = this.reloadEmpty ? def.chargeAt : def.magInAt
     this.reloadTimer = 0
     this.magOutFired = false
     this.magInFired = false
+    this.ammoCredited = false
     this.isReloading = true
     this.vm.beginReload(this.reloadDur, this.reloadEmpty)
     this.ctx.events.emit('weapon:reload', { weapon: def.id, phase: 'start' })
@@ -325,7 +387,6 @@ export class WeaponSystem implements System, WeaponService {
     if (this.reloadTimer < 0) return
     const def = this.def
     const state = this.state
-    const prev = this.reloadTimer / this.reloadDur
     this.reloadTimer += dt
     const t = this.reloadTimer / this.reloadDur
 
@@ -338,19 +399,44 @@ export class WeaponSystem implements System, WeaponService {
       this.magInFired = true
       ctx.events.emit('weapon:reload', { weapon: def.id, phase: 'magIn' })
     }
+    if (!this.ammoCredited && t >= this.creditAt) {
+      // Rounds are credited part-way through, not when the animation finishes.
+      // §3.3: `reloadAddTime` is a separate, earlier field from `reloadTime` in
+      // every shipped weapon file, and the gap between them is a free cancel
+      // window worth "up to 1 second". Crediting only at the end made the whole
+      // animation dead time and made reloading in a lull a losing trade.
+      this.ammoCredited = true
+      this.creditAmmo(def, state)
+      ctx.events.emit('weapon:ammo', { mag: state.mag, reserve: state.reserve })
+    }
 
     if (t >= 1) {
-      // A tactical reload keeps the round already in the chamber.
-      const target = def.magSize + (this.reloadEmpty || state.mag <= 0 ? 0 : 1)
-      const take = Math.min(state.reserve, Math.max(0, target - state.mag))
-      state.mag += take
-      state.reserve -= take
+      this.ammoCredited = true
+      this.creditAmmo(def, state)
       this.reloadTimer = -1
       this.isReloading = false
-      this.ammoDirty = true
       ctx.events.emit('weapon:reload', { weapon: def.id, phase: 'end' })
       ctx.events.emit('weapon:ammo', { mag: state.mag, reserve: state.reserve })
     }
+  }
+
+  /** Idempotent: the cancel window means this can run twice in one reload. */
+  private creditAmmo(def: WeaponDef, state: AmmoState): void {
+    // A tactical reload keeps the round already in the chamber.
+    const target = def.magSize + (this.reloadEmpty ? 0 : 1)
+    const take = Math.min(state.reserve, Math.max(0, target - state.mag))
+    if (take <= 0) return
+    state.mag += take
+    state.reserve -= take
+    this.ammoDirty = true
+  }
+
+  private cancelReload(ctx: GameContext): void {
+    if (this.reloadTimer < 0) return
+    this.reloadTimer = -1
+    this.isReloading = false
+    this.vm.cancelReload()
+    ctx.events.emit('weapon:reload', { weapon: this.def.id, phase: 'end' })
   }
 
   private spawnDroppedMag(ctx: GameContext): void {

@@ -655,6 +655,22 @@ If a match runs the full 10 minutes to 100 kills, that is 10 kills/min across 12
 
 The derivation is sound but the input assumption (that kills distribute evenly across players) is not — real CoD lobbies are heavily skewed. Treat 25–45 s as the *average* pacing target, not a per-player experience.
 
+**Do not use this figure as a target for scheduled downtime.** It measures how often a player *resolves* an engagement in a continuous-respawn deathmatch, where there is no scheduled quiet at all — the gap is filled with traversal, repositioning and approach, not with silence. A wave-survival or round-based mode is a different quantity entirely, and Call of Duty tunes it far lower:
+
+> **Round-based inter-round break: 10–15 seconds.** `[measured]`
+
+Zombies gives "a short respite of 10 to 15 seconds between rounds, where transition music is played and the round number slowly increments by one, before the next round starts." The Black Ops III mod tools expose this directly as `zombie_between_round_time`, documented in community examples set to **10** `[measured]`. Within a round, the zombie spawn delay starts at **2 s** and decays to **0.1 s** by round 60 `[measured]` — escalation is expressed as spawn cadence, not as a longer break.
+
+So the two numbers answer different questions:
+
+| Quantity | Value | Applies to |
+| --- | --- | --- |
+| Engagement cadence | 25–45 s `[estimated]` | Continuous-respawn multiplayer; gap is filled with movement, not quiet |
+| Scheduled inter-round break | 10–15 s `[measured]` | Round/wave-based modes; genuine silence |
+| Intra-round spawn cadence | 2.0 s → 0.1 s across 60 rounds `[measured]` | Round/wave-based modes |
+
+If a wave-based mode needs to feel like Call of Duty's engagement *rhythm* rather than its round structure, the extra quiet has to come from inside the encounter — approach distance, disengagement, flanking time — not from a longer break. A 30 s break in a wave mode reads as a bug.
+
 ### 6.2 Time from spawn to first contact
 
 **No published figure exists.** `[estimated]`: with sprint at ~6.3 m/s and typical 6v6 map dimensions (§6.4), spawn to the contested middle of the map is roughly 30–60 m of travel, giving **5–10 seconds**. Shipment — the series' smallest map — is described as taking "a mere ten seconds" to cross end to end `[measured]`, which bounds the low end.
@@ -872,7 +888,7 @@ Everything below is a genuine gap. If a number here appears elsewhere in this pr
 **Survivability and pacing**
 - **BO6 health regeneration delay and rate.** The 3.5 s / 40 HP/s figures circulate on secondary guide sites with no citation and do not appear in any BO6 patch note I examined. Treat as unverified.
 - **MW2019 and MWII health regeneration values.** Not found.
-- **Time between engagements** — no published telemetry. The 25–45 s figure in §6.1 is derived from TDM score and time limits and assumes even kill distribution, which is false in practice.
+- **Time between engagements** — no published telemetry. The 25–45 s figure in §6.1 is derived from TDM score and time limits and assumes even kill distribution, which is false in practice. It is *engagement cadence in a continuous-respawn mode*, not scheduled downtime; see the warning in §6.1 before applying it to a wave or round structure. The round-based 10–15 s break in the same section is separately sourced and is the correct figure for that case.
 - **Time from spawn to first contact** — no published figure. The 5–10 s estimate is derived from sprint speed and estimated map size.
 - **Map dimensions in metres.** Only Nuketown's *area* has been calculated (by a YouTuber, method not fully documented), and other maps only as a multiple of it. No official map is published with linear dimensions.
 

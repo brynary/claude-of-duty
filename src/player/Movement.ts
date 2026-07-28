@@ -10,6 +10,11 @@ const UP = new THREE.Vector3(0, 1, 0)
 /**
  * Locomotion tuning. All distances in metres, speeds in m/s, angles in radians.
  * These numbers are the feel; treat them as the design document.
+ *
+ * Every value carries the confidence marker from `.ai/FEEL_TARGET.md`:
+ * `[stated]` is a developer figure or a shipped engine dvar, `[measured]` is
+ * datamined or frame-counted, `[estimated]` is derived and the derivation is
+ * given. Anything unmarked is a judgement call with no source behind it.
  */
 export const MOVE = {
   radius: 0.32,
@@ -20,41 +25,85 @@ export const MOVE = {
   eyeCrouch: 1.05,
   eyeSlide: 0.84,
 
-  walk: 3.2,
-  run: 4.8,
+  // --- speeds ---------------------------------------------------------------
+  /** Hold-to-walk. No published figure; roughly two thirds of a walk. */
+  slowWalk: 3.2,
+  /** Base locomotion. `[stated]` BO6 4.7, MWIII 5.1-5.5; classic engine 4.826. */
+  walk: 4.8,
+  /** `[stated]` BO6 6.0-6.7 by weapon class. */
   sprint: 6.6,
-  tacSprint: 8.2,
-  crouch: 2.1,
-  ads: 2.4,
+  /** `[stated]` "tactical sprint moves you roughly +1 m/s over regular sprint". */
+  tacSprint: 7.6,
+  /** `[measured]` classic stance multiplier: crouch is 60% of base. */
+  crouchScale: 0.60,
+  /** 0.5625 x 4.8 = 2.70 m/s. `[stated]` BO6 2.7, MWIII 2.7-2.9. */
+  adsScale: 0.5625,
+  /** `[stated]` `player_strafeSpeedScale 0.8`. */
+  strafeScale: 0.80,
+  /** `[stated]` `player_backSpeedScale 0.7`. */
+  backScale: 0.70,
 
-  /** Exponential rate constants — 1 - e^(-k dt). ~0.1s to full speed. */
-  groundAccel: 23,
-  groundDecel: 30,
+  // --- ground friction and acceleration -------------------------------------
+  /** `[stated]` `friction "5.5"`. */
+  friction: 5.5,
+  /** `[stated]` `stopspeed "100"` u/s. Below this, friction is constant. */
+  stopSpeed: 2.54,
+  /**
+   * `[estimated]` — CoD publishes no acceleration dvar; this is the Quake 3
+   * default of 10, which the engine lineage makes the defensible guess. The
+   * model accelerates at `accel * wishspeed` = 48 m/s^2 at a walk.
+   */
+  accel: 10,
+  /** Air steering rate for the exponential approach. No published figure. */
   airAccel: 3.2,
   slopeAccel: 9,
 
-  gravity: 21.0,
-  /** 6.3 m/s against 21 m/s^2 is a 0.95m apex in 0.3s — CoD's jump, not Quake's. */
-  jumpSpeed: 6.3,
+  // --- gravity and jump -----------------------------------------------------
+  /** `[stated]` `g_gravity "800"` u/s^2 = 20.32 m/s^2, 2.07x real gravity. */
+  gravity: 20.32,
+  /** `[stated]` `jump_height "39"` u = 0.991 m apex, 0.625 s of air time. */
+  jumpApex: 0.991,
   terminalSpeed: 55,
   coyoteTime: 0.12,
   jumpBufferTime: 0.16,
-  stepHeight: 0.36,
+  /** `[stated]` `jump_stepSize "18"` u — walked over with no animation. */
+  stepHeight: 0.457,
   maxSlope: 50 * DEG,
   slideSlope: 40 * DEG,
 
-  slideEntrySpeed: 5.2,
-  slideBoost: 8.7,
-  slideMinTime: 0.26,
-  slideMaxTime: 1.35,
-  slideExitSpeed: 2.9,
-  slideCooldown: 0.5,
-  /** Turn rate available while sliding, rad/s. */
+  // --- slide ----------------------------------------------------------------
+  /** Must be moving faster than a walk, i.e. actually sprinting. */
+  slideEntrySpeed: 5.0,
+  /** Capped at tac sprint so sliding is never the fastest way to travel. */
+  slideBoost: 7.6,
+  /** `[stated]` `player_sliding_friction "1.5"` against a standing 5.5. */
+  slideFriction: 1.5,
+  slideMinTime: 0.22,
+  /** Cancelling between `slideMinTime` and here keeps the momentum. */
+  slideCancelEnd: 0.45,
+  slideMaxTime: 0.75,
+  slideExitSpeed: 3.0,
+  /** `[stated]` `dive_recharge "1000"` ms. Long enough that spam is not a move. */
+  slideCooldown: 1.0,
+  /** Turn rate available while sliding, rad/s (66 deg/s). */
   slideSteer: 1.15,
 
-  /** Below this the autostep handles it; above it we play the climb. */
-  mantleMinHeight: 0.42,
+  // --- sprint-out: how long the weapon stays unusable ------------------------
+  /** `[stated]` BO6 160-215 ms, MWIII 206-231 ms. */
+  sprintOutTime: 0.19,
+  /** `[stated]` BO6 270-330 ms — tac sprint costs 105-160 ms more. */
+  tacSprintOutTime: 0.31,
+  /** `[stated]` BO6 slide-to-fire 330-410 ms. */
+  slideOutTime: 0.37,
+
+  // --- mantle ---------------------------------------------------------------
+  /** Just above the auto-step: below this the step handles it silently. */
+  mantleMinHeight: 0.47,
   mantleMaxHeight: 1.45,
+  /** `[stated]` `mantle_check_range "20"` u = 0.508 m of forward reach. */
+  mantleReach: 0.51,
+  /** `[stated]` `mantle_check_angle "60"` degrees off the surface normal. */
+  mantleMaxAngle: 60 * DEG,
   mantleCooldown: 0.3,
 
   fallHurtSpeed: 11.5,
@@ -63,6 +112,21 @@ export const MOVE = {
   /** Seconds of tactical sprint before it drops back to a normal sprint. */
   tacSprintTime: 2.6,
 } as const
+
+/**
+ * Launch velocity for the stated 0.991 m apex under the stated gravity.
+ * `[estimated]` from two stated constants: v = sqrt(2 g h) = 6.345 m/s.
+ */
+const JUMP_SPEED = Math.sqrt(2 * MOVE.gravity * MOVE.jumpApex)
+
+/** Cosine of the mantle approach limit, hoisted so the check costs nothing. */
+const MANTLE_COS = Math.cos(MOVE.mantleMaxAngle)
+
+/** Seconds a failed mantle probe is remembered for. See `probeRested`. */
+const MANTLE_PROBE_REST = 0.12
+
+/** Seconds for the tactical-sprint meter to refill from empty. */
+const TAC_REFILL = 4.0
 
 export type Stance = 'stand' | 'crouch' | 'slide' | 'mantle'
 
@@ -75,6 +139,7 @@ export interface MoveIntent {
   yaw: number
   jumpPressed: boolean
   crouchHeld: boolean
+  /** Rising edge only — a held crouch key must not re-trigger a slide. */
   crouchPressed: boolean
   sprintHeld: boolean
   tacSprint: boolean
@@ -101,6 +166,33 @@ function easeOutCubic(t: number): number {
 /** Framerate-independent exponential approach factor. */
 function approach(k: number, dt: number): number {
   return 1 - Math.exp(-k * dt)
+}
+
+/**
+ * The Quake ground-friction model the Call of Duty engine inherited, integrated
+ * exactly rather than stepped with Euler so the curve is identical at 30fps and
+ * 240fps.
+ *
+ * The engine's rule is `drop = max(speed, stopspeed) * friction * dt`. Above
+ * `stopspeed` that is exponential decay at rate `friction`; below it, a constant
+ * `friction * stopspeed` deceleration. Solving both pieces in closed form and
+ * handling the crossing inside one frame gives, at the stated constants
+ * (friction 5.5, stopspeed 2.54 m/s), a full walk to a dead stop in 0.30 s with
+ * half the speed shed in the first 0.126 s.
+ *
+ * That front-loaded shape is the whole point: an ordinary exponential can be
+ * fast off the mark or slow to settle, never both, and a controller tuned to
+ * stop in 0.13 s flat — which this one did — reads as weightless.
+ */
+function applyFriction(speed: number, friction: number, dt: number): number {
+  if (speed <= 0 || friction <= 0) return speed
+  const floor = MOVE.stopSpeed * friction
+  if (speed > MOVE.stopSpeed) {
+    const cross = Math.log(speed / MOVE.stopSpeed) / friction
+    if (dt <= cross) return speed * Math.exp(-friction * dt)
+    return Math.max(0, MOVE.stopSpeed - floor * (dt - cross))
+  }
+  return Math.max(0, speed - floor * dt)
 }
 
 /**
@@ -135,9 +227,20 @@ export class Locomotion {
   isTacSprinting = false
   /** 0..1 sprint fatigue, feeds the breathing amplitude. */
   fatigue = 0
+  /** 0..1 tactical sprint left before it drops to a normal sprint. */
+  tacSprintLeft = 1
+
+  /**
+   * Seconds until the weapon is usable again after sprinting, sliding or
+   * mantling. This is the movement half of Call of Duty's sprint-out time; the
+   * weapon system owns refusing to fire while it is above zero.
+   */
+  sprintOut = 0
 
   isSliding = false
   slideTime = 0
+  /** True while releasing crouch would end the slide with the speed intact. */
+  slideCancelOpen = false
   /** 0..1 how hard the slide is still driving; drives the camera roll. */
   slideIntensity = 0
 
@@ -175,6 +278,12 @@ export class Locomotion {
   private mantleDur = 0.5
   private readonly mantleFrom = new THREE.Vector3()
   private readonly mantleTo = new THREE.Vector3()
+
+  /** Negative-result memo for the mantle probe; see `probeRested`. */
+  private mantleProbeRest = 0
+  private mantleProbeYaw = 0
+  private mantleProbeHigh = false
+  private readonly mantleProbePos = new THREE.Vector3()
 
   private readonly wish = new THREE.Vector3()
   private readonly slideDir = new THREE.Vector3()
@@ -231,7 +340,10 @@ export class Locomotion {
     // Let the next frame re-seat the feet on whatever floor is actually there.
     this.spawnResolved = false
     this.isSliding = false
+    this.slideCancelOpen = false
+    this.sprintOut = 0
     this.mantleProgress = 0
+    this.mantleProbeRest = 0
     this.crouchAmount = 0
     this.height = MOVE.standHeight
     this.eyeHeight = MOVE.eyeStand
@@ -252,6 +364,7 @@ export class Locomotion {
     this.slideCooldown = Math.max(0, this.slideCooldown - dt)
     this.mantleCooldown = Math.max(0, this.mantleCooldown - dt)
     this.forceCrouch = Math.max(0, this.forceCrouch - dt)
+    this.sprintOut = Math.max(0, this.sprintOut - dt)
     this.jumpBuffer = m.jumpPressed ? MOVE.jumpBufferTime : Math.max(0, this.jumpBuffer - dt)
     this.coyote = this.onGround ? MOVE.coyoteTime : Math.max(0, this.coyote - dt)
 
@@ -303,10 +416,24 @@ export class Locomotion {
     } else {
       const target = this.targetSpeed(m, wlen)
       if (this.onGround && !this.steepGround) {
-        const k = wlen > 0.05 ? MOVE.groundAccel : MOVE.groundDecel
-        const f = approach(k, dt)
-        this.velocity.x += (wx * target - this.velocity.x) * f
-        this.velocity.z += (wz * target - this.velocity.z) * f
+        // Friction first, then acceleration along the wish direction only.
+        // Doing it in that order is what makes the top speed exact — friction
+        // takes a bite each frame and the clamped acceleration puts back
+        // precisely as much as was lost — and what gives a direction change its
+        // weight: the old heading is shed by friction, not overwritten.
+        const speed = Math.hypot(this.velocity.x, this.velocity.z)
+        if (speed > 1e-5) {
+          const scale = applyFriction(speed, MOVE.friction, dt) / speed
+          this.velocity.x *= scale
+          this.velocity.z *= scale
+        }
+        const along = this.velocity.x * wx + this.velocity.z * wz
+        const deficit = target - along
+        if (deficit > 0) {
+          const add = Math.min(MOVE.accel * target * dt, deficit)
+          this.velocity.x += wx * add
+          this.velocity.z += wz * add
+        }
       } else {
         // Air control: steer without adding speed you did not already have.
         const f = approach(MOVE.airAccel, dt)
@@ -341,10 +468,13 @@ export class Locomotion {
     // Jump, with coyote time and a buffered press.
     if (this.jumpBuffer > 0 && (this.onGround || this.coyote > 0) && this.canStand(true)) {
       const boost = this.isSliding ? 1.12 : 1
-      if (this.isSliding) this.endSlide(0.18)
+      if (this.isSliding) this.endSlide(true)
       this.velocity.x *= boost
       this.velocity.z *= boost
-      this.velocity.y = MOVE.jumpSpeed
+      // Half a gravity step is added back because the integrator takes one off
+      // before the body has moved at all; without it the apex lands 10% short
+      // of the stated 0.991 m and drifts with the frame rate.
+      this.velocity.y = JUMP_SPEED + MOVE.gravity * dt * 0.5
       this.onGround = false
       this.coyote = 0
       this.jumpBuffer = 0
@@ -362,7 +492,7 @@ export class Locomotion {
     this.snapGround(this.velocity.y <= 0.05)
 
     // Vault before moving, so the approach reads as one continuous motion.
-    if (!this.isSliding && this.tryMantle(m)) {
+    if (!this.isSliding && this.tryMantle(m, dt)) {
       this.stepMantle(dt)
       return
     }
@@ -379,14 +509,32 @@ export class Locomotion {
 
   private targetSpeed(m: MoveIntent, wlen: number): number {
     if (wlen < 0.05) return 0
-    let s: number = MOVE.run
-    if (m.walkHeld) s = MOVE.walk
-    if (this.crouchAmount > 0.55) s = MOVE.crouch
-    if (m.ads > 0.05) s = Math.min(s, lerp(MOVE.run, MOVE.ads, m.ads))
-    if (this.isSprinting) s = this.isTacSprinting ? MOVE.tacSprint : MOVE.sprint
-    // Strafing and backing up are slower, as they should be.
-    const dirScale = m.forward < -0.1 ? 0.78 : (Math.abs(m.strafe) > 0.5 && Math.abs(m.forward) < 0.5 ? 0.88 : 1)
-    return s * dirScale
+    if (this.isSprinting) {
+      const s = this.isTacSprinting ? MOVE.tacSprint : MOVE.sprint
+      return s * this.directionScale(m, wlen)
+    }
+    let s: number = m.walkHeld ? MOVE.slowWalk : MOVE.walk
+    // Stance and aim multiply, the way the engine's weapon-class and stance
+    // tables do, so crouch-aiming is slower than either alone and the crouch
+    // penalty arrives with the crouch instead of snapping on at a threshold.
+    s *= lerp(1, MOVE.crouchScale, this.crouchAmount)
+    s *= lerp(1, MOVE.adsScale, THREE.MathUtils.clamp(m.ads, 0, 1))
+    return s * this.directionScale(m, wlen)
+  }
+
+  /**
+   * Elliptical speed envelope: full speed forward, 0.8 sideways, 0.7 backwards,
+   * blending smoothly through the diagonals rather than stepping between three
+   * fixed multipliers.
+   */
+  private directionScale(m: MoveIntent, wlen: number): number {
+    const n = Math.max(1, wlen)
+    const f = m.forward / n
+    const s = m.strafe / n
+    const len = Math.hypot(f, s)
+    if (len < 1e-4) return 1
+    const fs = f >= 0 ? f : f * MOVE.backScale
+    return Math.hypot(fs, s * MOVE.strafeScale) / len
   }
 
   private updateSprintState(dt: number, m: MoveIntent, wlen: number): void {
@@ -396,9 +544,16 @@ export class Locomotion {
       !this.isSliding && m.sprintHeld && m.forward > 0.4 && wlen > 0.1 && !m.busy &&
       m.ads < 0.2 && this.crouchAmount < 0.4 && !this.steepGround
     if (!wantsSprint) {
+      // Dropping out of a sprint is the moment the sprint-out timer starts. It
+      // is charged here rather than by the weapon system so that every way of
+      // leaving a sprint — releasing the key, aiming, cresting a slope — pays
+      // the same price.
+      if (this.isSprinting) {
+        this.chargeSprintOut(this.isTacSprinting ? MOVE.tacSprintOutTime : MOVE.sprintOutTime)
+      }
       this.isSprinting = false
       this.isTacSprinting = false
-      this.tacSprintTimer = 0
+      this.refillTacSprint(dt)
       return
     }
     this.isSprinting = true
@@ -406,9 +561,24 @@ export class Locomotion {
       this.tacSprintTimer += dt
       this.isTacSprinting = this.tacSprintTimer < MOVE.tacSprintTime
     } else {
-      this.tacSprintTimer = 0
       this.isTacSprinting = false
+      this.refillTacSprint(dt)
     }
+    this.tacSprintLeft = THREE.MathUtils.clamp(1 - this.tacSprintTimer / MOVE.tacSprintTime, 0, 1)
+  }
+
+  /** Refills over `TAC_REFILL` seconds rather than snapping back to full,
+   * because the HUD arc under the reticle reads this directly. */
+  private refillTacSprint(dt: number): void {
+    if (this.tacSprintTimer > 0) {
+      this.tacSprintTimer = Math.max(0, this.tacSprintTimer - dt * (MOVE.tacSprintTime / TAC_REFILL))
+    }
+    this.tacSprintLeft = THREE.MathUtils.clamp(1 - this.tacSprintTimer / MOVE.tacSprintTime, 0, 1)
+  }
+
+  /** The longest pending lockout wins; a slide never shortens a sprint's. */
+  private chargeSprintOut(seconds: number): void {
+    if (seconds > this.sprintOut) this.sprintOut = seconds
   }
 
   // --- slide ---------------------------------------------------------------
@@ -416,21 +586,38 @@ export class Locomotion {
   private startSlide(): void {
     const s = Math.hypot(this.velocity.x, this.velocity.z)
     this.slideDir.set(this.velocity.x / s, 0, this.velocity.z / s)
+    // Boost to the tac-sprint ceiling and no further. A slide that outruns the
+    // fastest sustained movement turns slide-cancelling into the only sensible
+    // way to cross a map, which is the exact failure MWIII spent a season
+    // patching out.
     const boosted = Math.max(s, MOVE.slideBoost)
     this.velocity.x = this.slideDir.x * boosted
     this.velocity.z = this.slideDir.z * boosted
     this.isSliding = true
     this.slideTime = 0
+    this.slideCancelOpen = false
     this.stance = 'slide'
     this.isSprinting = false
     this.isTacSprinting = false
     this.justSlid = true
+    // Slide-to-fire is measured from the moment the slide starts, so a slide
+    // ridden to the end hands the weapon back before the player is up again.
+    this.chargeSprintOut(MOVE.slideOutTime)
   }
 
-  private endSlide(cooldownScale = 1): void {
+  /**
+   * The trade the cancel window buys: ride the slide out and it ends at walking
+   * pace with the weapon already back up, or cancel inside the window and keep
+   * roughly 2.5 m/s more speed at the cost of an ordinary sprint-out on top.
+   * Speed or the gun, and the cooldown is flat either way so repetition is
+   * still bounded at one slide a second.
+   */
+  private endSlide(cancelled: boolean): void {
     this.isSliding = false
     this.slideTime = 0
-    this.slideCooldown = MOVE.slideCooldown * cooldownScale
+    this.slideCancelOpen = false
+    this.slideCooldown = MOVE.slideCooldown
+    if (cancelled) this.chargeSprintOut(MOVE.sprintOutTime)
   }
 
   private stepSlide(dt: number, m: MoveIntent): void {
@@ -450,10 +637,13 @@ export class Locomotion {
       this.slideDir.set(nx, 0, nz)
     }
 
-    // Friction curve: almost frictionless for the first third, then it bites.
+    // Sliding friction is 1.5 against a standing 5.5, so a slide sheds speed at
+    // a bit over a quarter of the rate of a walk stop — that ratio is what makes
+    // it carry. It ramps back to standing friction over the back half so the
+    // slide ends decisively rather than trailing off into a crouch-walk.
     const t = this.slideTime / MOVE.slideMaxTime
-    const friction = lerp(1.1, 7.5, smoothstep(THREE.MathUtils.clamp(t * 1.25, 0, 1)))
-    speed = Math.max(0, speed - friction * dt)
+    const bite = smoothstep(THREE.MathUtils.clamp((t - 0.45) / 0.55, 0, 1))
+    speed = applyFriction(speed, lerp(MOVE.slideFriction, MOVE.friction, bite), dt)
 
     // Downhill keeps you going, uphill kills it fast.
     const grade = -(this.groundNormal.x * this.slideDir.x + this.groundNormal.z * this.slideDir.z)
@@ -462,57 +652,117 @@ export class Locomotion {
     this.velocity.x = this.slideDir.x * speed
     this.velocity.z = this.slideDir.z * speed
 
-    const released = !m.crouchHeld && this.slideTime > MOVE.slideMinTime
+    this.slideCancelOpen =
+      this.slideTime >= MOVE.slideMinTime && this.slideTime <= MOVE.slideCancelEnd
+    const released = !m.crouchHeld && this.slideTime >= MOVE.slideMinTime
     if (speed < MOVE.slideExitSpeed || this.slideTime > MOVE.slideMaxTime || released || !this.onGround) {
-      this.endSlide(released ? 0.6 : 1)
+      this.endSlide(released && this.slideCancelOpen)
     }
   }
 
   // --- mantle / vault ------------------------------------------------------
 
-  private tryMantle(m: MoveIntent): boolean {
+  /**
+   * A failed probe against a wall that is simply too tall would otherwise cost
+   * three shape queries every frame for as long as the player leans on it. Once
+   * one fails, do not ask again until they have moved or turned — which at a
+   * walk is the very next frame, so an approach never loses a frame of
+   * responsiveness while standing still costs almost nothing.
+   */
+  private probeRested(m: MoveIntent, dt: number): boolean {
+    if (this.mantleProbeRest <= 0) return false
+    this.mantleProbeRest -= dt
+    const moved = this.position.distanceToSquared(this.mantleProbePos) > 0.03 * 0.03
+    const turned = Math.abs(this.mantleProbeYaw - m.yaw) > 0.09
+    if (moved || turned) {
+      this.mantleProbeRest = 0
+      return false
+    }
+    return true
+  }
+
+  private failProbe(m: MoveIntent): false {
+    this.mantleProbeRest = MANTLE_PROBE_REST
+    this.mantleProbeYaw = m.yaw
+    this.mantleProbePos.copy(this.position)
+    return false
+  }
+
+  private tryMantle(m: MoveIntent, dt: number): boolean {
     // Intent, not achieved speed: walking into a wall leaves you at zero speed,
-    // and that is exactly the moment the player expects to climb it.
-    if (this.mantleCooldown > 0 || m.forward < 0.4 || !this.physics) return false
+    // and that is exactly the moment the player expects to climb it. The
+    // threshold is deliberately low so that a diagonal approach still counts.
+    if (this.mantleCooldown > 0 || m.forward < 0.25 || !this.physics) return false
+    if (this.probeRested(m, dt)) return false
 
     const fx = -Math.sin(m.yaw)
     const fz = -Math.cos(m.yaw)
     const feetY = this.position.y
+    const reach = MOVE.radius + MOVE.mantleReach
 
-    // 1. Is something solid in front, at shin height? (Catches low crates too.)
-    this.v1.set(this.position.x, feetY + 0.32, this.position.z)
+    // 1. Is something solid in front? Shin height catches crates, low walls and
+    //    sills, whose face runs down to the floor. Waist height catches railings
+    //    and table tops, which have a gap underneath and are invisible to a shin
+    //    ray. The two heights alternate frame to frame so the common case — open
+    //    ground, nothing in front — still costs exactly one query, at the price
+    //    of at most one frame of latency on a class of obstacle that could not
+    //    be mantled at all before.
+    this.mantleProbeHigh = !this.mantleProbeHigh
     this.v2.set(fx, 0, fz)
-    const wall = this.physics.raycast(this.v1, this.v2, MOVE.radius + 0.5)
-    if (!wall || Math.abs(wall.normal.y) > 0.5) return false
+    this.v1.set(this.position.x, feetY + (this.mantleProbeHigh ? 0.80 : 0.30), this.position.z)
+    const wall = this.physics.raycast(this.v1, this.v2, reach)
+    // Nothing in front is the cheap answer and is not worth remembering; only a
+    // wall that was found and then rejected earns a rest.
+    if (!wall) return false
+    if (Math.abs(wall.normal.y) > 0.5) return this.failProbe(m)
 
-    // 2. Find its top edge by dropping a ray just past the face.
-    const px = wall.point.x + fx * 0.3
-    const pz = wall.point.z + fz * 0.3
+    // Approach must be within 60 degrees of the surface normal, or a grazing
+    // contact would sling the player sideways along a wall they were running
+    // past rather than climbing.
+    const facing = -(fx * wall.normal.x + fz * wall.normal.z)
+    if (facing < MANTLE_COS) return this.failProbe(m)
+
+    // 2. Find the top edge by dropping a ray just past the face. Just past, not
+    //    a third of a metre past: a handrail or a fence is thinner than that,
+    //    and probing beyond it finds the floor on the far side and reports no
+    //    ledge at all. The ray starts above the obstacle and travels straight
+    //    down, so it cannot graze the vertical face however close in it is.
+    const px = wall.point.x + fx * 0.06
+    const pz = wall.point.z + fz * 0.06
     const drop = MOVE.mantleMaxHeight + 0.5
     this.v1.set(px, feetY + drop, pz)
     const top = this.physics.raycast(this.v1, DOWN, drop + 0.15)
-    if (!top || top.normal.y < 0.55) return false
+    if (!top || top.normal.y < 0.55) return this.failProbe(m)
     const rise = top.point.y - feetY
-    if (rise < MOVE.mantleMinHeight || rise > MOVE.mantleMaxHeight) return false
+    if (rise < MOVE.mantleMinHeight || rise > MOVE.mantleMaxHeight) return this.failProbe(m)
 
-    // 3. Sphere-cast upward from the landing spot for headroom.
-    const ex = px + fx * 0.28
-    const ez = pz + fz * 0.28
+    // 3. Sphere-cast upward from the landing spot for headroom. The landing
+    //    clears the player's own radius past the face, so a thin obstacle ends
+    //    with the player over the far side and falling — a vault — while a solid
+    //    one ends with them standing on it.
+    const ex = wall.point.x + fx * (MOVE.radius + 0.12)
+    const ez = wall.point.z + fz * (MOVE.radius + 0.12)
     this.v1.set(ex, top.point.y + 0.42, ez)
     const ceiling = this.physics.sphereCast(this.v1, UP, 0.28, 0.85)
-    if (ceiling && ceiling.distance < 0.22) return false
+    if (ceiling && ceiling.distance < 0.22) return this.failProbe(m)
     if (ceiling && ceiling.distance < 0.8) this.forceCrouch = 1.0
 
     this.mantleFrom.copy(this.position)
     this.mantleTo.set(ex, top.point.y + 0.02, ez)
     this.mantleHeight = rise
-    this.mantleDur = 0.3 + rise * 0.32
+    // 0.37 s over a knee-high crate, 0.62 s over a chest-high wall — inside the
+    // 500 ms `g_mantleBlockTimeBuffer` for the common case, and faster than it
+    // was, following BO6's "increased all mantle speeds".
+    this.mantleDur = 0.24 + rise * 0.26
     this.mantleT = 0
     this.mantleProgress = 0.0001
+    this.mantleProbeRest = 0
     this.stance = 'mantle'
     this.isSliding = false
     this.onGround = false
     this.justMantled = true
+    // The weapon comes back up as the feet land, not after.
+    this.chargeSprintOut(this.mantleDur * 0.8)
     return true
   }
 

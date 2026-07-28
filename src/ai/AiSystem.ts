@@ -3,8 +3,9 @@ import type { AiService, Damageable, GameContext, System } from '../core/Types'
 import type { PhysicsSystem } from '../physics/Physics'
 import { Rand } from '../core/Rand'
 import { POSES } from '../core/Poses'
+import { difficulty } from '../game/Difficulty'
 import { NavGrid, Steering } from './Navigation'
-import { Behaviour, Squad, groundBelow } from './Behaviour'
+import { AI_CADENCE, Behaviour, Squad, groundBelow } from './Behaviour'
 import { Soldier, type SoldierWorld } from './Soldier'
 import { buildSoldierAsset, type SoldierAsset } from './SoldierMesh'
 
@@ -23,6 +24,43 @@ const CORPSE_FADE_START = 9
 const CORPSE_LIFETIME = 12
 const MAX_LIVE = 10
 const FLASH_LIGHTS = 3
+
+/**
+ * Quiet between waves when nothing else is driving the encounter.
+ *
+ * Downtime between engagements measured **2.39 s** against a 10-40 s target,
+ * with the longest lull in a minute lasting two seconds — 34 engagements in 60
+ * seconds, which is not a firefight with any shape, it is a treadmill. The
+ * cause was here: reinforcements went out six seconds after the field dropped
+ * to two, so the next squad arrived while the last one was still shooting and
+ * a lull could never open.
+ *
+ * A wave is now cleared before the next is sent, and the gap is deliberate.
+ * §6.1 is explicit that the 25-45 s engagement cadence is the wrong target for
+ * this: it is derived from continuous-respawn deathmatch where the gap is
+ * filled with movement rather than silence, and "a 30 s break in a wave mode
+ * reads as a bug". The number for a wave mode is the round-based inter-round
+ * break, **10-15 s** `[measured]` (`zombie_between_round_time`), and this sits
+ * inside it. The rest of the measured downtime comes from the 5-10 s (§6.2) the
+ * next squad spends walking in.
+ *
+ * `MatchDirector` overrides all of this the moment it sets `autoReinforce`
+ * false; this is the fallback for running the level on its own.
+ */
+const LULL_MIN = 11
+const LULL_MAX = 15
+
+/**
+ * Seconds a wave may go without anyone holding contact before the survivors are
+ * told where the player is.
+ *
+ * `ai_noPathToEnemyGiveupTime "6000"` `[stated]` §7.4 gives up on an
+ * unreachable player after 6 s and repositions, which is the right behaviour
+ * and also how a wave stalls: one soldier that cannot find the player leaves
+ * the encounter parked. Twice the give-up time, then the survivors get a
+ * heading.
+ */
+const HUNT_AFTER = 12
 
 /** Minimum bearing separation between two live soldiers, radians. */
 const MIN_SCREEN_SEPARATION = 0.115
@@ -103,6 +141,16 @@ export class AiSystem implements System, AiService {
 
   enemies: Damageable[] = []
 
+  /**
+   * Whether this system sends its own reinforcements.
+   *
+   * `MatchDirector` sets this false to take the encounter over: it owns wave
+   * sizes, concurrency and the breaks between waves, and two schedulers running
+   * at once would produce neither. Left true, the level still plays on its own
+   * with the pacing in {@link LULL_MIN}.
+   */
+  autoReinforce = true
+
   private ctx!: GameContext
   private physics!: PhysicsSystem
   private nav = new NavGrid()
@@ -122,6 +170,8 @@ export class AiSystem implements System, AiService {
 
   private waveTimer = 4
   private waveIndex = 0
+  /** Seconds since anyone in the current wave held contact with the player. */
+  private quietFor = 0
   private spawnCandidates: THREE.Vector3[] = []
   private observer = new THREE.Vector3()
   private observerYaw = 0
@@ -179,6 +229,10 @@ export class AiSystem implements System, AiService {
       }
     }
 
+    // Before the first `buildSpawnCandidates`: it orders candidates differently
+    // for a composed frame than for live play.
+    this.scripted = ctx.config.pose !== null
+
     this.resolveObserver()
     this.buildSpawnCandidates()
 
@@ -193,8 +247,20 @@ export class AiSystem implements System, AiService {
 
     ctx.services.ai = this
 
-    this.scripted = ctx.config.pose !== null
-    this.spawnWave(this.scripted ? 7 : 6)
+    // A capture pose is a composed frame rather than a fight the player has to
+    // survive, and the player is damage-immune while one is active, so the
+    // attacker clamp is relaxed to keep muzzles lit across the composition.
+    this.squad.attackerLimit = this.scripted ? 4 : 0
+
+    // Keep the difficulty model's reported time-to-die honest: it defaults to
+    // the cadence this file had before the clamp, which is three times what it
+    // now delivers.
+    difficulty.setAttackerCadence(
+      AI_CADENCE.roundsPerSecond * AI_CADENCE.exposedFraction,
+      AI_CADENCE.meanDamagePerHit,
+    )
+
+    this.spawnWave(this.scripted ? 7 : 5)
   }
 
   // -------------------------------------------------------------------------
@@ -267,6 +333,32 @@ export class AiSystem implements System, AiService {
       }
       this.spawnCandidates.push(this.tmpA.clone())
     }
+
+    // In live play, hostiles the player is already looking at appear out of
+    // nothing. The authored spawn points that are *not* in view move ahead of
+    // the composed arc, in the 12-30 m band the level was built for, so a wave
+    // walks into the fight instead of materialising in it. A capture pose wants
+    // the opposite and keeps the arc order it was given.
+    if (this.scripted) return
+    let write = 0
+    for (let i = 0; i < this.spawnCandidates.length; i++) {
+      const c = this.spawnCandidates[i]
+      const d = Math.hypot(c.x - this.observer.x, c.z - this.observer.z)
+      if (d < 12 || d > 30 || this.seesChestAt(c)) continue
+      const tmp = this.spawnCandidates[write]
+      this.spawnCandidates[write++] = c
+      this.spawnCandidates[i] = tmp
+    }
+  }
+
+  /** Whether the observer has a clear line to a chest standing at `p`. */
+  private seesChestAt(p: THREE.Vector3): boolean {
+    this.tmpB.set(p.x, p.y + 1.3, p.z)
+    this.tmpC.copy(this.tmpB).sub(this.observer)
+    const dist = this.tmpC.length()
+    if (dist < 0.5) return true
+    this.tmpC.divideScalar(dist)
+    return this.physics.raycast(this.observer, this.tmpC, dist - 0.4, { characters: false }) === null
   }
 
   spawnWave(count: number): void {
@@ -309,8 +401,17 @@ export class AiSystem implements System, AiService {
         b.forceEngage(this.observer)
         b.holdPosition(30)
         b.role = i < 2 ? 'suppress' : i === 2 ? 'advance' : 'suppress'
+      } else {
+        // Hostiles walk in to contact rather than standing where they were
+        // put waiting to be noticed. This is what turns the gap between waves
+        // into a lull the player can feel — the next squad is on its way for
+        // five to ten seconds before anything is shooting — and it is how a
+        // Call of Duty encounter works: soldiers spawn at a trigger and move
+        // to a scripted destination (§7.4).
+        b.alertTo(this.observer)
       }
     }
+    this.quietFor = 0
   }
 
   private pickSpawn(index: number, wave: number): THREE.Vector3 | null {
@@ -416,6 +517,11 @@ export class AiSystem implements System, AiService {
       this.corpses.push(s)
       const ei = this.enemies.indexOf(s)
       if (ei >= 0) this.enemies.splice(ei, 1)
+      // The falling edge of contact has to be emitted here: Behaviour.update
+      // returns early once its soldier is dead, so a soldier killed while it
+      // held the player never closes its own contact and every consumer counts
+      // it as still watching for the rest of the run.
+      this.byId.get(s.id)?.onKilled()
       const bi = this.squad.members.findIndex((b) => b.soldier === s)
       if (bi >= 0) this.squad.members.splice(bi, 1)
       this.byId.delete(s.id)
@@ -428,6 +534,7 @@ export class AiSystem implements System, AiService {
       s.update(dt)
       if (s.deadTime > CORPSE_LIFETIME) {
         s.dispose()
+        this.ctx.entities.delete(s.id)
         this.corpses.splice(i, 1)
       } else if (s.deadTime > CORPSE_FADE_START) {
         s.setFade(1 - (s.deadTime - CORPSE_FADE_START) / (CORPSE_LIFETIME - CORPSE_FADE_START))
@@ -435,15 +542,48 @@ export class AiSystem implements System, AiService {
     }
   }
 
+  /**
+   * Wave pacing, and the reason downtime measured 2.39 s.
+   *
+   * Two rules, in this order:
+   *
+   * 1. **A wave that has lost the player gets a heading.** Otherwise one
+   *    soldier stuck somewhere the player never goes holds the whole encounter
+   *    open, and the run turns into a walk with a gun.
+   * 2. **The next wave goes out only once the field is clear**, then after a
+   *    deliberate lull. Overlapping waves is what made a fight with no shape.
+   */
   private updateWaves(dt: number): void {
-    if (this.soldiers.length > 2) {
-      this.waveTimer = 6
+    let contact = false
+    for (const b of this.squad.members) {
+      if (b.soldier.alive && b.hasContact) { contact = true; break }
+    }
+    this.quietFor = contact ? 0 : this.quietFor + dt
+
+    if (this.soldiers.length > 0) {
+      if (this.quietFor > HUNT_AFTER) {
+        this.quietFor = 0
+        const player = this.ctx.services.player
+        this.tmpA.copy(player ? player.eye : this.ctx.camera.position)
+        for (const b of this.squad.members) if (b.soldier.alive) b.alertTo(this.tmpA)
+      }
+      // Negative means "the field is busy"; the lull is only rolled once, on
+      // the transition to empty, so the shared PRNG is not advanced every frame
+      // by a timer that is not running.
+      this.waveTimer = -1
       return
     }
+
+    if (!this.autoReinforce) return
+    if (this.waveTimer < 0) this.waveTimer = this.rng.range(LULL_MIN, LULL_MAX)
     this.waveTimer -= dt
     if (this.waveTimer <= 0) {
-      this.waveTimer = 12
-      this.spawnWave(4)
+      this.waveTimer = -1
+      // Four or five: at a 0.20-0.35 s time to kill a wave is over quickly, and
+      // kills per minute wants 3-15. Five hostiles per ~30 s cycle is ten a
+      // minute, mid-band, and stays under the concurrency the attacker clamp
+      // makes readable.
+      this.spawnWave(4 + (this.waveIndex % 2))
     }
   }
 

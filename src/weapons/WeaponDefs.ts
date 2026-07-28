@@ -108,25 +108,36 @@ export interface WeaponDef {
   slideLock: boolean
 }
 
+/**
+ * Recoil bias curves, as [pitch, yaw] multipliers per shot index.
+ *
+ * These used to be memorisable spray paths with a full-amplitude horizontal
+ * S-curve. FEEL_TARGET §3.5 is explicit that Call of Duty does not work that
+ * way: "this is a randomised cone with a directional bias, not a memorisable
+ * fixed spray pattern like CS or Battlefield. Two shots from the same weapon
+ * never trace the same path." So the horizontal term here is a gentle lean that
+ * the per-shot jitter (which is larger than it) rides on top of, and the
+ * vertical term only makes the opening shots heavier than the settled tail.
+ */
 const RIFLE_PATTERN: readonly (readonly [number, number])[] = [
-  [1.35, 0.10], [1.05, -0.15], [0.95, -0.35], [0.90, -0.55], [0.85, -0.70],
-  [0.80, -0.60], [0.78, -0.25], [0.76, 0.25], [0.74, 0.70], [0.72, 0.95],
-  [0.70, 1.00], [0.68, 0.80], [0.66, 0.45], [0.64, 0.05], [0.62, -0.35],
-  [0.60, -0.70], [0.58, -0.90], [0.56, -0.80], [0.54, -0.45], [0.52, 0.00],
+  [1.15, 0.05], [1.00, -0.10], [0.95, -0.18], [0.92, -0.26], [0.90, -0.30],
+  [0.89, -0.26], [0.88, -0.14], [0.88, 0.04], [0.88, 0.20], [0.88, 0.30],
+  [0.88, 0.32], [0.88, 0.26], [0.88, 0.14], [0.88, 0.00], [0.88, -0.14],
+  [0.88, -0.26], [0.88, -0.32], [0.88, -0.28], [0.88, -0.16], [0.88, 0.00],
 ]
 
 const SMG_PATTERN: readonly (readonly [number, number])[] = [
-  [1.15, -0.20], [0.95, -0.45], [0.88, -0.70], [0.84, -0.85], [0.80, -0.70],
-  [0.78, -0.30], [0.76, 0.20], [0.74, 0.65], [0.72, 0.95], [0.70, 1.05],
-  [0.68, 0.85], [0.66, 0.40], [0.64, -0.10], [0.62, -0.55], [0.60, -0.85],
+  [1.10, -0.06], [0.98, -0.14], [0.94, -0.22], [0.92, -0.28], [0.90, -0.24],
+  [0.90, -0.10], [0.90, 0.06], [0.90, 0.20], [0.90, 0.30], [0.90, 0.34],
+  [0.90, 0.28], [0.90, 0.14], [0.90, -0.02], [0.90, -0.18], [0.90, -0.28],
 ]
 
 const SNIPER_PATTERN: readonly (readonly [number, number])[] = [
-  [1.0, 0.35], [1.0, -0.4], [1.0, 0.25],
+  [1.0, 0.18], [1.0, -0.20], [1.0, 0.12],
 ]
 
 const PISTOL_PATTERN: readonly (readonly [number, number])[] = [
-  [1.0, 0.3], [0.95, -0.45], [0.92, 0.5], [0.9, -0.3], [0.88, 0.2],
+  [1.0, 0.10], [0.95, -0.16], [0.92, 0.18], [0.90, -0.10], [0.88, 0.06],
 ]
 
 export const WEAPONS: readonly WeaponDef[] = [
@@ -135,17 +146,33 @@ export const WEAPONS: readonly WeaponDef[] = [
     displayName: 'M4A1',
     kind: 'rifle',
     sfx: 'rifle',
-    damage: 33, damageMin: 22, falloffStart: 24, falloffEnd: 52,
-    headMult: 1.55, chestMult: 1, stomachMult: 1.05, limbMult: 0.85,
+    // 100 HP target, 26 dmg: 4 shots to kill inside 22.2 m, 5 past ~36 m.
+    // 780 RPM -> 76.9 ms per shot -> TTK = 3 x 76.9 = 231 ms, inside the
+    // 200-300 ms band (FEEL_TARGET §2.1) and next to BO6's XM4 at 296 ms.
+    // Band edges are the GPR 91's stated 22.2 m / 45.7 m.
+    damage: 26, damageMin: 19, falloffStart: 22.2, falloffEnd: 45.7,
+    // §2.4: classic ARs are 1.4 head / 1.0 everywhere else; modern reintroduced
+    // sub-1.0 limbs at 0.9-0.98. NOTE these are overridden today — Soldier.ts
+    // applies its own REGION_MULT and Ballistics defers to it.
+    headMult: 1.4, chestMult: 1, stomachMult: 1, limbMult: 0.95,
     penetration: 1, maxPenetrations: 2, range: 320,
     rpm: 780, pellets: 1,
     modes: ['auto', 'burst', 'semi'], burstCount: 3, burstDelay: 0.2,
     magSize: 30, reserve: 210, muzzleVelocity: 880, noiseRadius: 45,
-    spreadHip: 0.0295, spreadAds: 0.0028, spreadPerShot: 0.0021, spreadMax: 0.055,
+    // spreadAds is 0 on every weapon here: §3.6 [stated], "all weapons in Call
+    // of Duty ... are perfectly accurate at an infinite range while aiming down
+    // the sights", corroborated by `adsSpread 0` in the shipped weapon files.
+    spreadHip: 0.0295, spreadAds: 0, spreadPerShot: 0.0021, spreadMax: 0.055,
     spreadDecay: 0.10, spreadMoveMul: 1.7, spreadCrouchMul: 0.72, spreadJumpMul: 2.4,
+    // Budget: the sights must still be on a 0.35 m torso at the 26 m designed
+    // rifle distance after the 4 shots that make the kill, so the open-loop
+    // climb at shot 4 has to stay under 0.77 deg. adsScale is 1.0 because CoD4
+    // ships identical hip and ADS view kick [measured]; ADS buys spread, not
+    // recoil. `permanent` is 0 because CameraRig already folds 30% of every
+    // kick into the aim — carrying a second permanent term double-counted it.
     recoil: {
-      pitch: 0.0125, yaw: 0.0042, jitter: 0.18, pattern: RIFLE_PATTERN,
-      snap: 38, recovery: 9, permanent: 0.12, adsScale: 0.72,
+      pitch: 0.0038, yaw: 0.0013, jitter: 0.45, pattern: RIFLE_PATTERN,
+      snap: 38, recovery: 1.2, settle: 6.0, permanent: 0, adsScale: 1,
       kickBack: 0.014, kickUp: 0.055, kickRoll: 0.030, visualSnap: 26,
     },
     // Eye relief is deliberately longer than the optic's real 60mm: it sets how
@@ -162,9 +189,13 @@ export const WEAPONS: readonly WeaponDef[] = [
     // centre column at 0.255, the glass is open from 42% to 53% of frame
     // height, the mount, folded rear sight and charging handle run 60-75%, the
     // rail ladder 77-87%, and the comb is the bottom 10%.
-    adsTime: 0.18, eyeRelief: 0.255, adsFovScale: 0.72, adsVmFov: 46,
-    reloadTime: 2.1, reloadEmptyTime: 2.6, magOutAt: 0.30, magInAt: 0.56, chargeAt: 0.80,
-    drawTime: 0.5, holsterTime: 0.32, sprintOutTime: 0.16, inspectTime: 2.4,
+    adsTime: 0.24, eyeRelief: 0.255, adsFovScale: 0.72, adsVmFov: 46,
+    // CoD4 AK-47 [measured]: 2.50 s tactical, 3.25 s empty, ammo credited at
+    // 1.50 s — 60% of the animation — leaving a 1.00 s free cancel window.
+    // magInAt is that credit point, and WeaponSystem lets you fire out of the
+    // reload once it passes.
+    reloadTime: 2.4, reloadEmptyTime: 3.25, magOutAt: 0.30, magInAt: 0.60, chargeAt: 0.82,
+    drawTime: 0.55, holsterTime: 0.35, sprintOutTime: 0.16, inspectTime: 2.4,
     // Measured against a 60 degree viewmodel camera at 16:9: 28.8% of screen
     // width, top of the optic at 52% height, magazine tip on the bottom edge,
     // nothing closer than 24cm to the eye.
@@ -182,22 +213,28 @@ export const WEAPONS: readonly WeaponDef[] = [
     displayName: 'MP9-K',
     kind: 'smg',
     sfx: 'smg',
-    damage: 26, damageMin: 15, falloffStart: 12, falloffEnd: 30,
-    headMult: 1.4, chestMult: 1, stomachMult: 1.05, limbMult: 0.9,
+    // BO6 Kompakt 92 exactly: 20 dmg, 5 shots to kill against 100 HP. 920 RPM
+    // -> 65.2 ms per shot -> TTK = 4 x 65.2 = 261 ms, between the Kompakt 92's
+    // 220 ms and the PP-919's 288 ms. Max-damage band ends at its stated 11.4 m.
+    damage: 20, damageMin: 15, falloffStart: 11.4, falloffEnd: 20,
+    headMult: 1.4, chestMult: 1, stomachMult: 1, limbMult: 0.95,
     penetration: 0.55, maxPenetrations: 1, range: 200,
     rpm: 920, pellets: 1,
     modes: ['auto', 'semi'], burstCount: 3, burstDelay: 0.18,
     magSize: 32, reserve: 224, muzzleVelocity: 400, noiseRadius: 38,
-    spreadHip: 0.0225, spreadAds: 0.0060, spreadPerShot: 0.0020, spreadMax: 0.060,
+    spreadHip: 0.0225, spreadAds: 0, spreadPerShot: 0.0020, spreadMax: 0.060,
     spreadDecay: 0.13, spreadMoveMul: 1.35, spreadCrouchMul: 0.80, spreadJumpMul: 2.0,
+    // Budget: 5 shots on a 0.35 m torso at the 13 m designed SMG distance,
+    // so the open-loop climb at shot 5 stays under 0.8 deg.
     recoil: {
-      pitch: 0.0092, yaw: 0.0040, jitter: 0.26, pattern: SMG_PATTERN,
-      snap: 42, recovery: 11, permanent: 0.08, adsScale: 0.76,
+      pitch: 0.0034, yaw: 0.0012, jitter: 0.50, pattern: SMG_PATTERN,
+      snap: 42, recovery: 1.4, settle: 6.0, permanent: 0, adsScale: 1,
       kickBack: 0.010, kickUp: 0.042, kickRoll: 0.026, visualSnap: 30,
     },
-    adsTime: 0.14, eyeRelief: 0.235, adsFovScale: 0.80, adsVmFov: 50,
-    reloadTime: 1.95, reloadEmptyTime: 2.45, magOutAt: 0.28, magInAt: 0.54, chargeAt: 0.80,
-    drawTime: 0.42, holsterTime: 0.28, sprintOutTime: 0.13, inspectTime: 2.2,
+    adsTime: 0.21, eyeRelief: 0.235, adsFovScale: 0.80, adsVmFov: 50,
+    // CoD4 MP5 [measured]: 2.33 s tactical, 3.30 s empty, ammo at 1.77 s (76%).
+    reloadTime: 2.35, reloadEmptyTime: 3.30, magOutAt: 0.28, magInAt: 0.76, chargeAt: 0.88,
+    drawTime: 0.50, holsterTime: 0.28, sprintOutTime: 0.15, inspectTime: 2.2,
     hip: { pos: [0.124, -0.106, -0.470], rot: [0.016, 0.052, 0.104] },
     sprint: { pos: [0.106, -0.160, -0.440], rot: [-0.44, 0.66, 0.38] },
     lowReady: { pos: [0.118, -0.098, -0.500], rot: [-0.095, 0.175, 0.100] },
@@ -212,22 +249,29 @@ export const WEAPONS: readonly WeaponDef[] = [
     displayName: 'SR-338',
     kind: 'sniper',
     sfx: 'sniper',
-    damage: 145, damageMin: 110, falloffStart: 90, falloffEnd: 220,
-    headMult: 2.0, chestMult: 1, stomachMult: 1, limbMult: 0.72,
+    // BO6 LR 7.62 exactly: 104 / 102 / 95 by band, one shot to the torso.
+    // §2.3 [stated]: a one-shot weapon kills in 0 ms — the first round leaves
+    // the barrel instantly. §2.4: snipers carry extra torso multipliers so a
+    // body hit at range still resolves in one or two.
+    damage: 104, damageMin: 95, falloffStart: 63.5, falloffEnd: 88.9,
+    headMult: 1.5, chestMult: 1.5, stomachMult: 1.1, limbMult: 0.9,
     penetration: 2.4, maxPenetrations: 3, range: 600,
-    rpm: 52, pellets: 1,
+    // CoD4 M40A3 [measured]: 0.05 s fire + 0.866 s rechamber ~= 65 RPM.
+    rpm: 62, pellets: 1,
     modes: ['semi'], burstCount: 1, burstDelay: 0,
     magSize: 7, reserve: 42, muzzleVelocity: 915, noiseRadius: 90,
-    spreadHip: 0.085, spreadAds: 0.0003, spreadPerShot: 0.010, spreadMax: 0.12,
+    spreadHip: 0.085, spreadAds: 0, spreadPerShot: 0.010, spreadMax: 0.12,
     spreadDecay: 0.20, spreadMoveMul: 2.2, spreadCrouchMul: 0.60, spreadJumpMul: 3.0,
+    // One round per second, so the centre speed has 0.97 s to recentre: the
+    // scope is back on the aim point well before the next shot is chambered.
     recoil: {
-      pitch: 0.052, yaw: 0.010, jitter: 0.22, pattern: SNIPER_PATTERN,
-      snap: 30, recovery: 6, permanent: 0.0, adsScale: 0.9,
+      pitch: 0.030, yaw: 0.008, jitter: 0.25, pattern: SNIPER_PATTERN,
+      snap: 30, recovery: 4.0, settle: 4.0, permanent: 0, adsScale: 1,
       kickBack: 0.040, kickUp: 0.150, kickRoll: 0.045, visualSnap: 15,
     },
-    adsTime: 0.34, eyeRelief: 0.300, adsFovScale: 0.30, adsVmFov: 40,
-    reloadTime: 2.7, reloadEmptyTime: 3.2, magOutAt: 0.28, magInAt: 0.55, chargeAt: 0.82,
-    drawTime: 0.72, holsterTime: 0.45, sprintOutTime: 0.26, inspectTime: 2.8,
+    adsTime: 0.50, eyeRelief: 0.300, adsFovScale: 0.30, adsVmFov: 40,
+    reloadTime: 2.7, reloadEmptyTime: 3.2, magOutAt: 0.28, magInAt: 0.62, chargeAt: 0.84,
+    drawTime: 0.85, holsterTime: 0.50, sprintOutTime: 0.30, inspectTime: 2.8,
     hip: { pos: [0.136, -0.120, -0.505], rot: [0.012, 0.044, 0.102] },
     sprint: { pos: [0.116, -0.176, -0.470], rot: [-0.38, 0.58, 0.34] },
     lowReady: { pos: [0.130, -0.110, -0.545], rot: [-0.090, 0.160, 0.100] },
@@ -242,22 +286,28 @@ export const WEAPONS: readonly WeaponDef[] = [
     displayName: 'M17',
     kind: 'pistol',
     sfx: 'pistol',
-    damage: 30, damageMin: 17, falloffStart: 11, falloffEnd: 28,
-    headMult: 1.6, chestMult: 1, stomachMult: 1, limbMult: 0.85,
+    // CoD4 M9 [measured]: 40 -> 20 damage, 3 shots close / 5 far, max damage to
+    // 6.35 m. 34 dmg keeps the 3-shot kill against 100 HP with headroom for the
+    // AI's chest multiplier. CoD4 patch 1.40 clamped semi-autos to 444-566 RPM;
+    // 480 RPM -> 125 ms per shot -> TTK = 2 x 125 = 250 ms, inside the 210-270
+    // ms the same source derives for a 3-shot kill.
+    damage: 34, damageMin: 20, falloffStart: 6.35, falloffEnd: 12.7,
+    headMult: 1.4, chestMult: 1, stomachMult: 1, limbMult: 0.95,
     penetration: 0.5, maxPenetrations: 1, range: 140,
-    rpm: 430, pellets: 1,
+    rpm: 480, pellets: 1,
     modes: ['semi', 'burst'], burstCount: 3, burstDelay: 0.22,
     magSize: 17, reserve: 68, muzzleVelocity: 360, noiseRadius: 32,
-    spreadHip: 0.0230, spreadAds: 0.0040, spreadPerShot: 0.0045, spreadMax: 0.070,
+    spreadHip: 0.0230, spreadAds: 0, spreadPerShot: 0.0045, spreadMax: 0.070,
     spreadDecay: 0.16, spreadMoveMul: 1.4, spreadCrouchMul: 0.78, spreadJumpMul: 2.2,
     recoil: {
-      pitch: 0.0165, yaw: 0.0055, jitter: 0.3, pattern: PISTOL_PATTERN,
-      snap: 44, recovery: 13, permanent: 0.05, adsScale: 0.8,
+      pitch: 0.0098, yaw: 0.0026, jitter: 0.50, pattern: PISTOL_PATTERN,
+      snap: 44, recovery: 2.4, settle: 5.0, permanent: 0, adsScale: 1,
       kickBack: 0.012, kickUp: 0.075, kickRoll: 0.020, visualSnap: 32,
     },
-    adsTime: 0.16, eyeRelief: 0.320, adsFovScale: 0.82, adsVmFov: 50,
-    reloadTime: 1.65, reloadEmptyTime: 2.2, magOutAt: 0.26, magInAt: 0.56, chargeAt: 0.80,
-    drawTime: 0.36, holsterTime: 0.24, sprintOutTime: 0.11, inspectTime: 2.0,
+    adsTime: 0.13, eyeRelief: 0.320, adsFovScale: 0.82, adsVmFov: 50,
+    // CoD4 M9 [measured]: 1.63 s tactical, 1.92 s empty, ammo at 1.20 s (74%).
+    reloadTime: 1.63, reloadEmptyTime: 1.92, magOutAt: 0.26, magInAt: 0.74, chargeAt: 0.88,
+    drawTime: 0.45, holsterTime: 0.28, sprintOutTime: 0.10, inspectTime: 2.0,
     hip: { pos: [0.104, -0.116, -0.330], rot: [0.028, 0.052, 0.088] },
     sprint: { pos: [0.088, -0.166, -0.305], rot: [-0.46, 0.56, 0.32] },
     lowReady: { pos: [0.098, -0.104, -0.360], rot: [-0.120, 0.180, 0.082] },

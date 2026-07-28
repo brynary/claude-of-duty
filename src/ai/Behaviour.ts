@@ -2,6 +2,7 @@ import * as THREE from 'three'
 import type { GameContext, HitInfo } from '../core/Types'
 import type { Rand } from '../core/Rand'
 import type { PhysicsSystem } from '../physics/Physics'
+import { difficulty } from '../game/Difficulty'
 import type { NavGrid, Steering } from './Navigation'
 import type { Soldier } from './Soldier'
 
@@ -15,17 +16,172 @@ export type Role = 'hold' | 'suppress' | 'advance' | 'flank'
 const DOWN = new THREE.Vector3(0, -1, 0)
 
 const VIEW_RANGE = 55
-/** Cosine of the vision half-angle before and after a soldier is alerted. */
+/**
+ * Cosine of the vision half-angle before and after a soldier is alerted.
+ * `sv_botFov "65"` `[stated]` §7.5 is a 32.5° half-angle, which is what an
+ * unalerted soldier gets (1.05 rad ≈ 60° is wider than that and stays, because
+ * a bot that cannot see the player walk past it at 45° reads as blind rather
+ * than as unaware). Once alerted the cone opens to 1.65 rad.
+ */
 const COS_FOV_CALM = Math.cos(1.05)
 const COS_FOV_ALERT = Math.cos(1.65)
 
-const PLAYER_RADIUS = 0.4
+/**
+ * `ai_threatUpdateInterval "500"` `[stated]` §7.2. The squad re-evaluates who
+ * is allowed to shoot at this rate rather than every frame; that latency is
+ * what gives the player a window to break contact.
+ */
+const THREAT_TICK = 0.5
+
+/**
+ * How long an attacker token is held.
+ *
+ * `[estimated]`. Nothing in §7 gives a dwell time — only the clamp itself and
+ * the 500 ms re-evaluation tick. The floor stops the pair flickering between
+ * soldiers every tick (which would read as six enemies each firing one round);
+ * the ceiling is what "hand the token round" means, so the same two soldiers
+ * cannot own the fight while four others watch.
+ */
+const TOKEN_MIN_HOLD = 2.5
+const TOKEN_MAX_HOLD = 7
+
+/**
+ * Burst length: `sv_botMinFireTime "400"` / `sv_botMaxFireTime "600"` `[stated]`
+ * §7.5, at a 0.105 s round spacing (571 RPM — the player's rifle is 780 RPM,
+ * and an enemy that out-cycles the player's own weapon sounds wrong). 0.4–0.6 s
+ * is therefore a 4–6 round burst.
+ */
+const BURST_MIN = 0.4
+const BURST_MAX = 0.6
+const SHOT_INTERVAL = 0.105
+
+/**
+ * Gap between bursts. **Not sourced** — §7.5 gives the burst length and no
+ * pause, so this is the free variable, and it is the one that sets how much
+ * damage two attackers deliver. See {@link PLAYER_DAMAGE} for the budget it is
+ * solved against.
+ */
+const BURST_PAUSE_MIN = 1.6
+const BURST_PAUSE_MAX = 2.6
+
+/**
+ * Damage one enemy round does to the player before the difficulty multiplier.
+ *
+ * This is the single lethality knob. Deaths per minute measured **7.77** against
+ * a 0.3–1.5 target, and the structural changes do most of the work:
+ *
+ * | factor | before | after |
+ * |---|---|---|
+ * | soldiers whose rounds can hit the player | ~6 | **2** (`ai_maxAttackerCount`) |
+ * | rounds per second each, sustained | ~3.0 | 5 rounds / 2.63 s = **1.9** |
+ * | fraction of the time a token holder is exposed | ~1 | **~0.55** (peek cycle, reloads) |
+ * | chance a round is allowed to land at 18 m | ~0.3 geometric | **0.5** (§7.1, explicit roll) |
+ *
+ * **Do not set this from the average.** Two attackers at 0.96 hits/s and 5 HP a
+ * round is 4.8 HP/s, which says 100 HP lasts 21 s — and that number is wrong by
+ * a factor of two to fourteen, because the player regenerates **75 HP/s after a
+ * 3 s gap** (`PlayerSystem`, MWIII Season 2 patch notes `[stated]` §5.2). The
+ * fight is not an averaging process, it is a race between sustained pressure
+ * and a very fast reset, and burst pauses of 1.6–2.6 s plus hide phases of
+ * 1.2–2.2 s open 3 s gaps often. Simulating the actual cycles — two attackers,
+ * their burst and peek timers, 30-round magazines, a 2.5 s reload, the 0.5 roll,
+ * against 100 HP with that regen — gives time-to-die at 5 HP a round:
+ *
+ * | where the two attackers are fighting from | time to die | deaths/min at 40–55% of the run under fire |
+ * |---|---|---|
+ * | both in cover, peek-cycling | 48.6 s | 0.49 – 0.68 |
+ * | one in cover, one in the open | 25.5 s | 0.94 – 1.30 |
+ * | both in the open | 13.7 s | 1.75 – 2.40 |
+ *
+ * 5 HP puts the middle row — the one a real fight spends most of its time in —
+ * across the middle of the target band, and keeps the cover row inside it.
+ * The bottom row is over, and is meant to be: two enemies standing in the open
+ * shooting at you *should* be the thing that kills you, and it is also the case
+ * where the player kills them fastest and so spends least time in it.
+ *
+ * Sensitivity, from the same simulation and worth knowing before touching this:
+ * dropping the effective hit chance from 0.5 to 0.4 doubles the time to die,
+ * and 0.3 quadruples it. Anything that keeps attackers from having a clear line
+ * — losing the token, engagements past 20 m, cover that hides them from
+ * themselves — pushes deaths down hard and this number up.
+ */
+const PLAYER_DAMAGE = 5.0
+
+/**
+ * How wide a deliberate miss passes, in metres at the target.
+ *
+ * `ai_eventDistBullet "96"` = **2.44 m** `[stated]` §7.3 is the distance at
+ * which a passing round registers as an event on an AI, so it is the series'
+ * own answer to "how close is close enough to notice". Misses are placed inside
+ * that band: far enough outside the 0.4 m player capsule that the roll decides
+ * the outcome and not the geometry, close enough that the player hears rounds
+ * crack past and can tell where they came from.
+ */
+const MISS_MIN = 0.85
+const MISS_MAX = 2.4
+
+/**
+ * `sv_botSprintDistance "512"` = **13.0 m** `[stated]` §7.5: a bot sprints only
+ * when it is further than this from where it is going. Inside it, it walks.
+ *
+ * This is the second-largest lever in the file after the attacker clamp, and it
+ * is aimed at the 5.4% player accuracy. A soldier crossing the frame at 5.1 m/s
+ * at 18 m sweeps 0.28 rad/s, and the synthetic player's aim converges at 9/s,
+ * so it sits a steady 0.031 rad — **0.56 m at that range** — behind a target
+ * whose torso is 0.35 m wide. It cannot hit that, ever, however good its aim.
+ */
+const SPRINT_DISTANCE = 13
+const WALK_SPEED = 3.2
+const SPRINT_SPEED = 5.1
+
+/**
+ * What one attacker actually delivers, published so the difficulty model can
+ * report an honest time-to-die instead of quoting the cadence this file had
+ * before the clamp. Rounds per second is the burst cycle: five rounds at
+ * 0.105 s inside a 0.4-0.6 s burst, then a 1.6-2.6 s pause.
+ *
+ * `exposedFraction` is the part a reader would otherwise get wrong. A token
+ * holder is only shooting while it is stepped out of cover and not reloading,
+ * which is a little over half the time, so the sustained figure reaching the
+ * player is roughly half of `roundsPerSecond`.
+ *
+ * Note that a time-to-die computed from these — as `Difficulty.effective` does
+ * — is an average and will read about twice as lethal as the simulated figures
+ * in {@link PLAYER_DAMAGE}, because it cannot see the player's health regen
+ * winning back the gaps between bursts.
+ */
+export const AI_CADENCE = {
+  roundsPerSecond: 5 / (0.5 + (BURST_PAUSE_MIN + BURST_PAUSE_MAX) / 2),
+  meanDamagePerHit: PLAYER_DAMAGE,
+  exposedFraction: 0.55,
+} as const
+
+/** Stance dwell: `sv_botMinCrouchTime "2000"` / `Max "4000"` `[stated]` §7.5. */
+const HIDE_MIN = 2.0
+const HIDE_MAX = 4.0
 
 interface CoverSpot {
   pos: THREE.Vector3
   score: number
-  /** Which way to lean out of it: +1, -1 or 0 for no firing line. */
+  /** Which way the soldier leans when it steps out: +1 or -1. */
   peek: number
+  /**
+   * Where the soldier stands to shoot from this cover.
+   *
+   * Cover used to be a position plus a lean, and the two did not agree. The
+   * spot is chosen so that a ray from the player to the soldier's chest is
+   * *blocked*, and the peek was `leanTarget = ±0.9`, which the spine solves as
+   * 0.35+0.4+0.3 = 1.05 × 0.42 × 0.9 = 0.4 rad spread over three bones. Solved
+   * against the bind pose that moves the chest hitbox **5.1 cm** sideways and
+   * the head 15.0 cm — against the 0.75 m step-out the cover test assumed. So a
+   * soldier in cover was never exposed at the chest at all, while its own
+   * firing test used the muzzle, which sits 0.6 m further forward and clears
+   * the corner. The AI could shoot out of cover the player could not shoot
+   * into, which is most of where 5.4% player accuracy came from.
+   *
+   * The soldier now walks the 0.75 m out and back, and this is where to.
+   */
+  peekPos: THREE.Vector3
 }
 
 /** Shared scratch — behaviour runs for every soldier every frame. */
@@ -41,18 +197,31 @@ export class Squad {
   members: Behaviour[] = []
   /** Rises while anyone has eyes on the player; drives group aggression. */
   alert = 0
+  /** How many attacker tokens are out. Read by the HUD-facing debug only. */
+  attackers = 0
+  /** Raised for capture poses, where the frame wants more muzzles lit. */
+  attackerLimit = 0
+
+  private clock = 0
+  private threatTimer = 0
   private roleTimer = 0
   private engagedTime = 0
   private ranked: Behaviour[] = []
 
   update(dt: number, playerPos: THREE.Vector3): void {
+    this.clock += dt
     let seeing = 0
     for (const m of this.members) if (m.soldier.alive && m.hasContact) seeing++
 
     this.alert = seeing > 0 ? Math.min(1, this.alert + dt * 1.5) : Math.max(0, this.alert - dt * 0.25)
     if (seeing > 0) this.engagedTime += dt
 
-    this.assignFocus(playerPos)
+    // §7.2: threat is re-evaluated on a 500 ms tick, not every frame.
+    this.threatTimer -= dt
+    if (this.threatTimer <= 0) {
+      this.threatTimer = THREAT_TICK
+      this.assignAttackers(playerPos)
+    }
 
     this.roleTimer -= dt
     if (this.roleTimer > 0) return
@@ -69,9 +238,14 @@ export class Squad {
     )
 
     // A firefight where everyone charges is chaos; one where nobody moves is a
-    // diorama. One flanker, one or two closers, everyone else pinning.
-    const maxAdvance = this.ranked.length >= 4 ? 2 : 1
-    const allowFlank = this.ranked.length >= 3 && this.engagedTime > 3
+    // diorama. One flanker, one closer, everyone else pinning.
+    //
+    // Two closers became one when the movement speeds came down: a soldier
+    // walking in at 3.2 m/s is on screen and shootable for twice as long as one
+    // sprinting at 4.7, so half as many of them produce the same pressure and
+    // the player can actually resolve who is where.
+    const maxAdvance = 1
+    const allowFlank = this.ranked.length >= 4 && this.engagedTime > 5
     let advancing = 0
     let flanked = false
     for (let i = 0; i < this.ranked.length; i++) {
@@ -90,32 +264,67 @@ export class Squad {
   }
 
   /**
-   * At most two soldiers shoot to hit at any moment; the rest walk their rounds
-   * past the player. Six enemies all firing accurately kills the player in a
-   * second and reads as unfair rather than intense, and this is the lever every
-   * shooter actually pulls to control difficulty.
+   * `ai_maxAttackerCount "2"` `[stated]` §7.2 — the single most important AI
+   * constant in the research, and the reason a Call of Duty firefight can put a
+   * dozen enemies on screen and stay survivable.
+   *
+   * At most two soldiers hold an attacker token. Only a token holder's rounds
+   * are allowed to damage the player; everyone else suppresses, repositions or
+   * waits its turn. This replaces a "two nearest soldiers aim properly, the
+   * other four aim roughly" arrangement, which was not the same thing at all:
+   * the other four aimed 1.0–2.5 m off, 45% of that offset went into the
+   * *vertical* against a target 1.6 m tall, and the aim cone then put a fair
+   * share of it back onto the player. Six soldiers firing produced roughly 2.8
+   * soldiers' worth of incoming damage, and the player died every 7.7 s.
+   *
+   * The token is handed round rather than owned. A holder keeps it for at least
+   * {@link TOKEN_MIN_HOLD} — below that the pair flickers every tick and reads
+   * as six enemies each firing one round — and gives it up after
+   * {@link TOKEN_MAX_HOLD} if anyone else is waiting, so the fight moves around
+   * the squad instead of being a duel with two soldiers while four watch.
    */
-  private assignFocus(playerPos: THREE.Vector3): void {
-    let firstD = Infinity
-    let secondD = Infinity
-    let first: Behaviour | null = null
-    let second: Behaviour | null = null
+  private assignAttackers(playerPos: THREE.Vector3): void {
+    const limit = Math.max(this.attackerLimit, difficulty.maxAttackers())
+
+    let held = 0
+    let waiting = 0
     for (const m of this.members) {
-      m.focus = false
-      if (!m.soldier.alive || !m.hasContact) continue
-      const d = m.soldier.position.distanceToSquared(playerPos)
-      if (d < firstD) {
-        secondD = firstD
-        second = first
-        firstD = d
-        first = m
-      } else if (d < secondD) {
-        secondD = d
-        second = m
+      if (m.attacker) held++
+      else if (m.readyToAttack()) waiting++
+    }
+
+    // Revoke. Losing sight for a moment must not drop the token — a soldier
+    // behind cover loses line of sight the instant it ducks, and revoking on
+    // that alone hands the fight back and forth twice a second — so the grip is
+    // held for {@link TOKEN_MIN_HOLD} past the last sighting.
+    for (const m of this.members) {
+      if (!m.attacker) continue
+      const heldFor = this.clock - m.tokenSince
+      const spent = !m.soldier.alive || !m.alerted || m.sightLostFor > TOKEN_MIN_HOLD
+      if (spent || (waiting > 0 && heldFor >= TOKEN_MAX_HOLD)) {
+        m.releaseToken(this.clock)
+        held--
       }
     }
-    if (first) first.focus = true
-    if (second) second.focus = true
+
+    // Fill the free slots. Order: whoever has waited longest since last holding
+    // a token, then whoever is closest. Distance alone always hands it straight
+    // back to the soldier it was just taken from.
+    while (held < limit) {
+      let best: Behaviour | null = null
+      let bestKey = -Infinity
+      for (const m of this.members) {
+        if (m.attacker || !m.readyToAttack()) continue
+        const d = Math.sqrt(m.soldier.position.distanceToSquared(playerPos))
+        const key = (this.clock - m.tokenReleasedAt) - d * 0.12
+        if (key > bestKey) { bestKey = key; best = m }
+      }
+      if (!best) break
+      best.takeToken(this.clock)
+      held++
+    }
+
+    this.attackers = held
   }
 }
 
@@ -133,8 +342,14 @@ export class Behaviour {
   role: Role = 'hold'
   alerted = false
   hasContact = false
-  /** Set by the squad: this soldier is currently allowed to shoot to hit. */
-  focus = false
+  /**
+   * Holds one of the two attacker tokens: this soldier's rounds are the only
+   * ones allowed to damage the player. See {@link Squad.assignAttackers}.
+   */
+  attacker = false
+  /** Squad clock when the token was taken and when it was last given up. */
+  tokenSince = 0
+  tokenReleasedAt = -99
 
   /** Last position the player was seen or heard at. */
   lastKnown = new THREE.Vector3()
@@ -142,6 +357,21 @@ export class Behaviour {
   private timeInState = 0
   private losTimer = 0
   private losClear = false
+  /** Whether the player's eye has a clear line to *this soldier's* chest. */
+  private exposed = false
+  /**
+   * May shoot at the player this frame: contact, exposed and a clear muzzle.
+   * Cached once per frame in {@link update} because the muzzle test is a
+   * raycast and the engage tick asks twice.
+   *
+   * The `exposed` term is the one rule that makes a firefight fair — a soldier
+   * may only shoot at the player from a position the player could shoot back
+   * at. `muzzleClear` alone is not that test: the muzzle sits about 0.6 m
+   * forward of the chest and off to the right shoulder, so it clears a corner
+   * the body is still behind, which is how the AI came to be firing out of
+   * cover that return fire could not reach.
+   */
+  private engageable = false
   private contactTime = 0
   private lostTime = 99
 
@@ -163,6 +393,21 @@ export class Behaviour {
   private burstLeft = 4
   private fireTimer = 0
   private burstPause = 0
+  /**
+   * Seconds left of the sighting-to-first-shot window. Rolled from the
+   * difficulty preset — 500–1000 ms on Regular, `[stated]` §7.5 — on the rising
+   * edge of contact, and it gates every trigger pull, so the measured reaction
+   * time is the rolled number rather than whatever the burst timers happened to
+   * be doing.
+   */
+  private reactionTimer = 0
+  /**
+   * The first burst after acquiring the player never lands. `[estimated]`, and
+   * it is a deliberate addition to §7.1's per-shot roll: the rounds that warn
+   * you are being shot at have to arrive before the rounds that hurt, or there
+   * is nothing to react to. It is also what makes breaking contact pay.
+   */
+  private rangingBurst = true
   /** Cone half-angle in radians; tightens the longer a target is held. */
   private aimError = 0.11
   private suppressAim = new THREE.Vector3()
@@ -170,6 +415,8 @@ export class Behaviour {
   private patrolTarget = new THREE.Vector3()
   private hasPatrol = false
   private idleLook = 0
+  /** Seconds left of a standing order to close on {@link lastKnown}. */
+  private huntFor = 0
 
   // Player state cached once per frame so tick methods never fight over scratch.
   private pPos = new THREE.Vector3()
@@ -218,8 +465,26 @@ export class Behaviour {
         }
       }
       this.losClear = visible
+
+      // Exposure is a second, separate line: from the player's eye to this
+      // soldier's chest. The two disagree constantly — a soldier behind a low
+      // wall sees over it with its head while its chest stays covered — and the
+      // difference is exactly the unfairness this file used to ship. Firing is
+      // gated on this one, so an enemy shooting at the player is always an
+      // enemy the player can shoot back at.
+      this.exposed = false
+      if (visible) {
+        s.chest(T4)
+        T2.copy(T4).sub(this.pEye)
+        const cd = T2.length()
+        if (cd > 0.01) {
+          T2.divideScalar(cd)
+          this.exposed = !this.d.physics.raycast(this.pEye, T2, cd - 0.3, { characters: false })
+        }
+      }
     }
 
+    const lostFor = this.lostTime
     if (this.losClear) {
       this.lastKnown.copy(this.pEye)
       const dist = this.soldier.position.distanceTo(this.pEye)
@@ -245,6 +510,21 @@ export class Behaviour {
       if (this.hasContact) {
         this.contactAt = this.d.ctx.elapsed
         this.firedSinceContact = false
+        // Sighting → first shot, 500-1000 ms on Regular. Rolled here so the
+        // measured number is this one and not an artefact of burst timing, and
+        // deliberately slower than the 200-350 ms the player needs to kill:
+        // "the player, once they see the bot, kills it faster than the bot's
+        // own reaction window" is the asymmetry that makes the player the
+        // protagonist. Only a fresh sighting re-arms it — a soldier that ducks
+        // and pops back up inside a second does not get to be surprised again.
+        if (lostFor > 1.5) {
+          this.reactionTimer = difficulty.sampleReactionTime(this.d.rng)
+          this.rangingBurst = true
+        }
+        // A soldier that spots the player from behind cover comes out to fight
+        // rather than finishing the hide it was in the middle of; otherwise its
+        // first shot lands a hide-length after its reaction window closed.
+        if (this.state === 'suppress' && !this.peeking && this.peekTimer > 0.3) this.peekTimer = 0.3
         this.d.ctx.events.emit('ai:contact', {
           id: this.soldier.id,
           position: this.soldier.position.clone(),
@@ -262,6 +542,65 @@ export class Behaviour {
   /** Wall-clock time of the current contact, for reaction-time measurement. */
   private contactAt = 0
   private firedSinceContact = false
+
+  /** Seconds since this soldier last had eyes on the player. */
+  get sightLostFor(): number {
+    return this.lostTime
+  }
+
+  /** Eligible to be handed an attacker token right now. */
+  readyToAttack(): boolean {
+    return this.soldier.alive && this.alerted && this.hasContact
+  }
+
+  takeToken(clock: number): void {
+    this.attacker = true
+    this.tokenSince = clock
+    // A soldier that has been waiting its turn behind cover leans out when it
+    // gets one, rather than finishing whatever hide it was in the middle of.
+    if (this.state === 'suppress' && !this.peeking) this.peekTimer = 0
+  }
+
+  releaseToken(clock: number): void {
+    this.attacker = false
+    this.tokenReleasedAt = clock
+  }
+
+  /**
+   * A soldier killed while holding contact never reaches `updatePerception`
+   * again — `update` returns early once it is dead — so the falling edge has to
+   * be emitted from the outside or the event stream never closes the contact.
+   * Telemetry counts open contacts to decide whether the run is quiet, so a
+   * missing edge silently pins `idleFraction` at zero for the rest of the run.
+   */
+  onKilled(): void {
+    this.attacker = false
+    if (!this.hasContact) return
+    this.hasContact = false
+    this.d.ctx.events.emit('ai:lostContact', {
+      id: this.soldier.id,
+      heldFor: this.contactAt > 0 ? this.d.ctx.elapsed - this.contactAt : 0,
+    })
+  }
+
+  /**
+   * Sends this soldier toward a point as if it had been told the player is
+   * there. Used when a wave arrives: hostiles walk in to contact rather than
+   * standing where they spawned waiting to be found. §7.4 `[measured]` — Call
+   * of Duty enemies spawn from a trigger volume and move to a scripted
+   * destination; the tactical appearance is the level script, not the agent.
+   *
+   * The window matters. Awareness alone does not survive the walk: it decays at
+   * 0.22/s and `investigate` gives up below 0.02, so an order worth 0.45 is
+   * spent two seconds into a twenty-second approach and the soldier wanders off
+   * to patrol somewhere the player will never go.
+   */
+  alertTo(point: THREE.Vector3): void {
+    this.awareness = Math.max(this.awareness, 0.45)
+    this.huntFor = 25
+    this.lastKnown.copy(point)
+    if (this.state === 'idle' || this.state === 'patrol') this.enter('investigate')
+  }
 
   /** Called by the firing path on the first shot of each contact. */
   protected noteShot(distance: number): void {
@@ -288,15 +627,29 @@ export class Behaviour {
   onDamaged(hit: HitInfo): void {
     this.alerted = true
     this.awareness = 1
+
+    // A soldier hit while it is out of cover finishes being out of cover. An
+    // enemy that vanishes on the first round to land makes the exchange
+    // unreadable and stretches time to kill past the point where the weapon
+    // feels responsive: three chest hits kill, they take about 0.23 s of fire
+    // at 780 RPM, and a peek that ends after the first of them puts the other
+    // two on the far side of a two-second hide. The flinch is already visible;
+    // this is what makes it mean something.
+    if (this.peeking && this.peekTimer < 1.2) this.peekTimer = 1.2
     if (!this.losClear) {
       this.lastKnown.copy(hit.point).addScaledVector(hit.direction, -14)
       this.lastKnown.y += 1.4
     }
-    // Flush a soldier out of cover that is clearly not protecting it.
+    // Flush a soldier out of cover that is clearly not protecting it. It has to
+    // leave the state as well as the spot: `tickSuppress` is the only state
+    // that fights from cover and the only one that never looks for new cover,
+    // so dropping the spot without dropping the state parks the soldier behind
+    // a wall it no longer has a firing line out of.
     if (this.inCover && this.d.rng.bool(0.5)) {
       this.cover = null
       this.coverTimer = 0
       this.inCover = false
+      if (this.state === 'suppress') this.enter('engage')
     }
   }
 
@@ -385,10 +738,23 @@ export class Behaviour {
   // -------------------------------------------------------------------------
 
   /**
-   * Scores nearby standable positions for cover. A good spot breaks the line
-   * from the player to the soldier's chest *and* still lets the soldier lean
-   * out onto the player — cover you cannot shoot from is just a corner to die
-   * in, and AI that picks those looks broken.
+   * Scores nearby standable positions for cover.
+   *
+   * Three tests, all of which must pass, and the second and third are new:
+   *
+   * 1. **Hidden.** The line from the player to a crouched chest at the spot is
+   *    blocked. This is what makes it cover.
+   * 2. **Stays hidden.** The line to a crouched *head* is blocked too. A spot
+   *    that covers the chest and leaves the head out is where the old cover
+   *    search put half the squad: the synthetic player's target test aims at
+   *    1.2 m and its rounds go to the chest, so it spent whole magazines
+   *    shooting at a wall with a helmet above it.
+   * 3. **Shootable from.** There is a real step-out position, 0.75 m to one
+   *    side, from which a standing chest can see the player. Cover with no
+   *    firing line is a corner to die in; a spot that cannot be scored is
+   *    rejected outright rather than being taken as a last resort, because the
+   *    soldier that takes one stops contributing to the fight and the player
+   *    never finds out why it is standing there.
    */
   private findCover(): CoverSpot | null {
     const { nav, physics, rng } = this.d
@@ -401,17 +767,26 @@ export class Behaviour {
       const distToPlayer = G1.distanceTo(this.pEye)
       if (distToPlayer < 5 || distToPlayer > 34) continue
 
-      T2.set(G1.x, G1.y + 1.05, G1.z)
+      // 1 + 2: crouched chest at 0.97 and crouched head at 1.34 both blocked.
+      T2.set(G1.x, G1.y + 0.97, G1.z)
       T3.copy(this.pEye).sub(T2)
       const d = T3.length()
       if (d < 0.5) continue
       T3.divideScalar(d)
       if (!physics.raycast(T2, T3, d - 0.3, { characters: false })) continue
+      T5.set(G1.x, G1.y + 1.34, G1.z)
+      T4.copy(this.pEye).sub(T5).normalize()
+      if (!physics.raycast(T5, T4, d - 0.3, { characters: false })) continue
 
-      // Peek test: step sideways and see whether a firing line opens up.
+      // 3: step 0.75 m sideways and look for a standing chest line. The step
+      // has to land somewhere a soldier can stand, or it walks into the wall it
+      // was hiding behind and never gets its shot off.
       let peekDir = 0
       for (const side of [1, -1]) {
-        T5.set(T2.x - T3.z * side * 0.75, T2.y, T2.z + T3.x * side * 0.75)
+        const px = G1.x - T3.z * side * 0.75
+        const pz = G1.z + T3.x * side * 0.75
+        if (!nav.isWalkable(px, pz)) continue
+        T5.set(px, G1.y + 1.32, pz)
         T4.copy(this.pEye).sub(T5)
         const pd = T4.length()
         T4.divideScalar(pd)
@@ -420,11 +795,19 @@ export class Behaviour {
           break
         }
       }
+      if (peekDir === 0) continue
 
       const rangeScore = 1 - Math.min(1, Math.abs(distToPlayer - wantRange) / 22)
       const travel = 1 - Math.min(1, s.position.distanceTo(G1) / 12)
-      const score = (peekDir !== 0 ? 1.6 : 0.35) + rangeScore * 1.1 + travel * 0.7 - this.crowding(G1) * 1.2
-      if (!best || score > best.score) best = { pos: G1.clone(), score, peek: peekDir }
+      const score = rangeScore * 1.1 + travel * 0.7 - this.crowding(G1) * 1.2
+      if (!best || score > best.score) {
+        best = {
+          pos: G1.clone(),
+          score,
+          peek: peekDir,
+          peekPos: new THREE.Vector3(G1.x - T3.z * peekDir * 0.75, G1.y, G1.z + T3.x * peekDir * 0.75),
+        }
+      }
     }
     return best
   }
@@ -452,8 +835,15 @@ export class Behaviour {
     return !this.d.physics.raycast(s.muzzleWorld, T1, dist - 0.4, { characters: false })
   }
 
-  private fire(dt: number, target: THREE.Vector3): void {
-    const s = this.soldier
+  /**
+   * Trigger discipline: 0.4–0.6 s of fire then a pause,
+   * `sv_botMinFireTime`/`MaxFireTime` `[stated]` §7.5. The reaction window is
+   * counted in `update` rather than here, because a soldier that is stepping
+   * out of cover is not calling this yet and its reaction still has to be
+   * running.
+   */
+  private fire(dt: number, target: THREE.Vector3, mayHit: boolean): void {
+    if (this.reactionTimer > 0) return
     this.fireTimer -= dt
     if (this.burstPause > 0) {
       this.burstPause -= dt
@@ -465,77 +855,116 @@ export class Behaviour {
       return
     }
 
-    const { ctx, physics, rng } = this.d
-    this.firePoint.copy(target)
-    this.fireTimer = 0.085 + rng.range(0, 0.02)
+    this.fireTimer = SHOT_INTERVAL
     this.magazine--
     this.burstLeft--
+    this.shoot(target, mayHit)
+
+    if (this.burstLeft <= 0) {
+      this.burstLeft = burstRounds(this.d.rng)
+      this.burstPause = this.d.rng.range(BURST_PAUSE_MIN, BURST_PAUSE_MAX)
+      // The burst that was learning the range is over; the next one may land.
+      this.rangingBurst = false
+    }
+  }
+
+  /**
+   * Places one round. **Roll first, aim second.**
+   *
+   * §7.1 `[stated]`: hit chance against the player is an explicit dice roll —
+   * 50% inside 20.3 m falling to 10% at 50.8 m — and the rounds that lose it
+   * are deliberately deflected. That is the opposite of what this used to do,
+   * which was to fire into a cone and let the geometry decide, and the two are
+   * not interchangeable: a cone tuned to give 50% at 20 m gives far more than
+   * 10% at 50 m, and no cone at all can express "two of these six soldiers are
+   * allowed to hurt you".
+   *
+   * So the roll decides, and the tracer is then placed to agree with it. A
+   * round that wins goes to the chest; a round that loses is pushed 0.85–2.4 m
+   * off — outside the 0.4 m player capsule with room to spare, inside the
+   * 2.44 m at which the engine considers a passing round noticeable.
+   */
+  private shoot(target: THREE.Vector3, mayHit: boolean): void {
+    const s = this.soldier
+    const { ctx, physics, rng } = this.d
     s.fireVisuals()
     ctx.services.audio?.play('enemyFire', s.muzzleWorld, { volume: 0.85, maxDistance: 110 })
 
-    // Aim at centre of mass, then push the shot into a cone. First contact is
-    // deliberately loose: the player should hear rounds crack past before any
-    // of them land, and soldiers the squad has not given focus to never stop
-    // walking their rounds around the target.
-    T1.copy(this.firePoint)
-    T1.y += 0.95
-    T2.copy(T1).sub(s.muzzleWorld)
+    this.firePoint.copy(target)
+    this.firePoint.y += 0.95
+    T2.copy(this.firePoint).sub(s.muzzleWorld)
     const dist = T2.length() || 1
     this.noteShot(dist)
     T2.divideScalar(dist)
+    // Right and up, in the plane across the line of fire.
     T3.set(-T2.z, 0, T2.x).normalize()
     T4.crossVectors(T2, T3).normalize()
 
-    if (!this.focus) {
-      // Deliberate near-miss: offset the point of aim by about a body width so
-      // the tracer passes the player instead of being a coin flip.
-      const off = 1.0 + rng.next() * 1.5
-      const ang = rng.next() * Math.PI * 2
-      T2.addScaledVector(T3, (Math.cos(ang) * off) / dist)
-      T2.addScaledVector(T4, (Math.sin(ang) * off * 0.55) / dist)
+    const willHit = mayHit && !this.rangingBurst && this.attacker && difficulty.rollHit(dist, rng)
+    /** Lateral placement at the target, metres: the miss the player can see. */
+    let offset = 0
+
+    if (willHit) {
+      // Scatter inside the torso rather than on a point, so tracers do not all
+      // converge on one pixel of the player's chest.
+      offset = rng.spread(0.16)
+      T2.addScaledVector(T3, offset / dist)
+      T2.addScaledVector(T4, rng.spread(0.22) / dist)
+      T2.normalize()
+    } else {
+      // Mostly lateral: a round placed high or low reads as a wild shot, one
+      // that goes past your shoulder reads as a near miss. The aim cone is
+      // added to the deflection with the same sign rather than in a random
+      // direction, so it can only widen a miss and never walk one back onto
+      // the player — the roll is the only thing that decides that.
+      const settle = Math.min(1, this.contactTime / 3.2)
+      const moving = Math.min(1, s.velocity.length() / 4)
+      const spread = this.aimError * (2.0 - settle * 0.9) * (1 + moving * 0.8) * difficulty.aimErrorScale()
+      const cone = Math.abs(rng.gaussian()) * spread * 0.8 * dist
+      offset = (rng.range(MISS_MIN, MISS_MAX) + cone) * (rng.bool() ? 1 : -1)
+      T2.addScaledVector(T3, offset / dist)
+      T2.addScaledVector(T4, (rng.spread(0.8) + 0.35) / dist)
       T2.normalize()
     }
 
-    const settle = Math.min(1, this.contactTime / 3.2)
-    const moving = Math.min(1, s.velocity.length() / 4)
-    const spread = this.aimError * (2.0 - settle * 0.9) * (1 + moving * 0.8) * (s.stance === 'crouch' ? 0.8 : 1)
-    const a = rng.next() * Math.PI * 2
-    const r = Math.abs(rng.gaussian()) * spread * 0.8
-    T2.addScaledVector(T3, Math.cos(a) * r).addScaledVector(T4, Math.sin(a) * r).normalize()
-
     const worldHit = physics.raycast(s.muzzleWorld, T2, 90, { characters: false })
     const wallDist = worldHit ? worldHit.distance : 90
-    const playerDist = rayCapsule(s.muzzleWorld, T2, this.pPos, PLAYER_RADIUS)
-    const hitPlayer = playerDist > 0 && playerDist < wallDist
+    // A round that won the roll still stops at a wall that got in the way.
+    const landed = willHit && wallDist > dist - 0.5
 
-    T5.copy(s.muzzleWorld).addScaledVector(T2, hitPlayer ? playerDist : wallDist)
+    T5.copy(s.muzzleWorld).addScaledVector(T2, landed ? dist : wallDist)
     ctx.services.fx?.bulletTracer(s.muzzleWorld, T5, 340)
 
-    if (hitPlayer) {
+    ctx.events.emit('ai:shot', {
+      id: s.id,
+      distance: dist,
+      aimErrorDeg: THREE.MathUtils.radToDeg(Math.atan2(Math.abs(offset), dist)),
+      willHit: landed,
+    })
+
+    if (landed) {
       T3.copy(T2).negate()
-      ctx.events.emit('player:damaged', { amount: 5 + rng.range(0, 3.5), fromDirection: T3.clone() })
+      const amount = PLAYER_DAMAGE * rng.range(0.9, 1.1) * difficulty.damageToPlayerScale()
+      ctx.events.emit('player:damaged', { amount, fromDirection: T3.clone() })
       if (rng.bool(0.3)) ctx.services.fx?.blood(T5, T3, 0.3)
     } else if (worldHit) {
       ctx.services.fx?.impact(worldHit.point, worldHit.normal, worldHit.surface)
     }
-
-    if (this.burstLeft <= 0) {
-      // Disciplined bursts with a real gap between them: rate of fire is the
-      // other half of how lethal a squad is, and a continuous stream both
-      // sounds wrong and leaves the player no window to move.
-      this.burstLeft = rng.int(3, 5)
-      this.burstPause = rng.range(0.6, 1.6) * (this.hasContact ? 0.85 : 1.5)
-    }
   }
 
-  /** Unaimed fire around the last known position, to pin the player down. */
+  /**
+   * Unaimed fire around the last known position, to pin the player down.
+   * Cannot hurt the player by construction — it is aimed at the ground near
+   * where they were — and it runs at half cadence so a squad that has lost the
+   * player is heard rather than felt.
+   */
   private suppressFire(dt: number): void {
     if (this.suppressAim.lengthSq() < 1e-6) this.suppressAim.copy(this.lastKnown)
     this.suppressAim.x += this.d.rng.spread(2.4) * dt
     this.suppressAim.z += this.d.rng.spread(2.4) * dt
     this.suppressAim.y = this.lastKnown.y - 1.4
     if (this.suppressAim.distanceToSquared(this.lastKnown) > 12) this.suppressAim.copy(this.lastKnown)
-    this.fire(dt, this.suppressAim)
+    this.fire(dt, this.suppressAim, false)
   }
 
   // -------------------------------------------------------------------------
@@ -560,8 +989,40 @@ export class Behaviour {
     this.cachePlayer()
     this.updatePerception(dt)
 
+    // The reaction window runs on the clock, not on the trigger. Ticking it
+    // inside `fire` looked equivalent and is not: a soldier that acquires the
+    // player from behind cover does not reach `fire` until it has stepped out,
+    // so the window would start when the soldier was already in position and
+    // the measured sighting-to-first-shot time would be the step-out plus the
+    // reaction rather than the reaction. Running it here lets the two overlap,
+    // which is also what a soldier does — it moves and readies at the same time.
+    if (this.reactionTimer > 0) {
+      this.reactionTimer -= dt
+      if (this.reactionTimer <= 0) {
+        // The window has closed: the next opportunity is a shot, not a shot one
+        // burst-pause later. Without this the measured sighting-to-first-shot
+        // time is the reaction plus whatever the burst timers were mid-way
+        // through, which is not the number this file is setting.
+        this.burstPause = 0
+        this.fireTimer = 0
+        this.burstLeft = burstRounds(this.d.rng)
+      }
+    }
+
+    // One line-of-fire test per frame; see the field for what it means.
+    this.engageable = false
+    if (this.hasContact && this.exposed) {
+      switch (this.state) {
+        case 'engage': case 'suppress': case 'flank': case 'seekCover':
+          this.engageable = this.muzzleClear()
+          break
+        default: break
+      }
+    }
+
     this.repathTimer -= dt
     this.coverTimer -= dt
+    if (this.huntFor > 0) this.huntFor -= dt
     // Every second on target shaves the cone; this is the whole "they are
     // ranging you in" feeling. It bottoms out well short of perfect, because
     // an enemy that never misses is not a difficulty setting, it is a wall.
@@ -628,14 +1089,15 @@ export class Behaviour {
     const s = this.soldier
     s.stance = 'stand'
     if (this.alerted) { this.enter('engage'); return }
-    if (this.awareness <= 0.02) { this.enter('patrol'); return }
+    if (this.awareness <= 0.02 && this.huntFor <= 0) { this.enter('patrol'); return }
     if (this.repathTimer <= 0) {
       this.setDestination(this.lastKnown, true)
       this.repathTimer = 1.5
     }
     this.aimAtLastKnown(0.75)
     s.faceTarget = this.lastKnown
-    if (this.followPath(dt, 3.3) && this.timeInState > 5) this.enter('patrol')
+    const left = s.position.distanceTo(this.lastKnown)
+    if (this.followPath(dt, travelSpeed(left)) && this.timeInState > 5) this.enter('patrol')
   }
 
   private tickEngage(dt: number): void {
@@ -655,19 +1117,26 @@ export class Behaviour {
     this.aimAtLastKnown(1)
     s.faceTarget = this.lastKnown
 
-    if (this.role === 'advance' && dist > 9 && this.lostTime < 3) {
+    // A soldier that is shooting stands still. Plant-and-fire is what Call of
+    // Duty AI actually do, it is what makes them readable, and it is the
+    // difference between a target the player can hit and one they cannot: at
+    // 18 m a soldier crossing at 4.7 m/s stays half a metre ahead of where the
+    // player is aiming, so a fight against a moving squad is unwinnable by aim
+    // alone however good the aim is.
+    const holding = this.burstLeft > 0 && this.burstPause <= 0 && this.engageable
+    if (this.role === 'advance' && dist > 9 && this.lostTime < 3 && !holding) {
       if (this.repathTimer <= 0) {
         this.repathTimer = 0.9
         this.setDestination(this.pPos, true)
       }
-      this.followPath(dt, dist > 18 ? 4.7 : 3.1)
+      this.followPath(dt, travelSpeed(dist - 9))
       s.stance = 'stand'
     } else {
       this.clearPath()
       s.stance = dist > 14 ? 'crouch' : 'stand'
     }
 
-    if (this.hasContact && this.muzzleClear()) this.fire(dt, this.pPos)
+    if (this.engageable) this.fire(dt, this.pPos, true)
     else if (this.lostTime < 3.5 && this.d.squad.alert > 0.5 && this.d.rng.bool(0.02)) this.enter('suppress')
   }
 
@@ -678,35 +1147,65 @@ export class Behaviour {
     this.aimAtLastKnown(0.85)
     s.faceTarget = this.lastKnown
     s.stance = 'stand'
-    // Moving fast between cover reads as urgency; strolling reads as a demo.
-    if (this.followPath(dt, 5.1) || this.timeInState > 6) {
+    const left = s.position.distanceTo(this.cover.pos)
+    if (this.followPath(dt, travelSpeed(left)) || this.timeInState > 6) {
       this.inCover = true
       this.enter('suppress')
     }
   }
 
+  /**
+   * Cover fighting: hide, step out, shoot, step back.
+   *
+   * The step is real now — 0.75 m to the side, walked — rather than a lean the
+   * spine solves as 5 cm of chest movement. That single change is what makes
+   * the exchange symmetric: while the soldier is out it can shoot and be shot,
+   * and while it is behind cover neither is true.
+   *
+   * The rhythm is set by whether this soldier holds an attacker token. A holder
+   * is the one applying pressure, so it is out roughly twice as much as it is
+   * in; everyone else spends most of the time down, which is what keeps four
+   * suppressing soldiers from reading as four more targets. Hide times come
+   * from `sv_botMinCrouchTime`/`Max` 2000/4000 ms `[stated]` §7.5.
+   */
   private tickSuppress(dt: number): void {
     const s = this.soldier
     if (this.magazine <= 0) { this.enter('reload'); return }
     if (!this.alerted && this.lostTime > 7) { this.inCover = false; this.enter('patrol'); return }
     if (this.role === 'advance' || this.role === 'flank') { this.inCover = false; this.enter('engage'); return }
+    // No spot to work means nothing to peek out of: go and find one rather than
+    // standing in the state that never looks.
+    if (!this.cover && this.timeInState > 2) { this.inCover = false; this.enter('engage'); return }
 
     this.clearPath()
     s.faceTarget = this.lastKnown
     this.aimAtLastKnown(1)
 
-    // Pop out, shoot, drop back. That rhythm is what makes cover read as cover.
     this.peekTimer -= dt
     if (this.peekTimer <= 0) {
       this.peeking = !this.peeking
-      this.peekTimer = this.peeking ? this.d.rng.range(0.8, 1.8) : this.d.rng.range(0.6, 1.4)
+      const rng = this.d.rng
+      // A peek has to be long enough to be a fight. The player needs a 0.34 s
+      // reaction, a moment to settle the aim and 0.23 s of fire to land three
+      // chest hits, so anything under about 1.2 s exposed is an enemy that
+      // cannot be killed on that appearance however well the player shoots.
+      this.peekTimer = this.peeking
+        ? (this.attacker ? rng.range(2.2, 3.4) : rng.range(1.4, 2.4))
+        : (this.attacker ? rng.range(1.2, 2.2) : rng.range(HIDE_MIN, HIDE_MAX))
+    }
+
+    const cover = this.cover
+    if (cover) {
+      // Walking pace over three quarters of a metre: fast enough to read as
+      // popping out, slow enough that the player can put rounds on it.
+      this.stepTo(this.peeking ? cover.peekPos : cover.pos, 1.7)
+      s.leanTarget = this.peeking ? cover.peek * 0.6 : 0
     }
     s.stance = this.peeking ? 'stand' : 'crouch'
-    s.leanTarget = this.peeking && this.cover ? this.cover.peek * 0.9 : 0
 
     if (!this.peeking) return
-    if (this.hasContact && this.muzzleClear()) this.fire(dt, this.pPos)
-    else if (this.lostTime < 6) this.suppressFire(dt)
+    if (this.engageable) this.fire(dt, this.pPos, true)
+    else if (this.lostTime > 0.5 && this.lostTime < 6) this.suppressFire(dt)
   }
 
   private tickFlank(dt: number): void {
@@ -730,8 +1229,9 @@ export class Behaviour {
     s.stance = 'stand'
     s.faceTarget = this.hasContact ? this.lastKnown : null
     this.aimAtLastKnown(this.hasContact ? 1 : 0.5)
-    const done = this.followPath(dt, 5.3)
-    if (this.hasContact && this.muzzleClear()) this.fire(dt, this.pPos)
+    const left = this.hasDestination ? s.position.distanceTo(this.destination) : 0
+    const done = this.followPath(dt, travelSpeed(left))
+    if (this.engageable) this.fire(dt, this.pPos, true)
     if (done || this.timeInState > 9) {
       this.role = 'suppress'
       this.enter('engage')
@@ -747,7 +1247,7 @@ export class Behaviour {
     s.faceTarget = this.lastKnown
     if (!s.isReloading) {
       this.magazine = 30
-      this.burstLeft = this.d.rng.int(3, 6)
+      this.burstLeft = burstRounds(this.d.rng)
       this.enter(this.inCover ? 'suppress' : 'engage')
     }
   }
@@ -762,7 +1262,24 @@ export class Behaviour {
     }
     this.aimAtLastKnown(0.6)
     s.faceTarget = null
-    if (this.followPath(dt, 5.4) || this.timeInState > 7) this.enter('engage')
+    const left = this.hasDestination ? s.position.distanceTo(this.destination) : 0
+    if (this.followPath(dt, travelSpeed(left)) || this.timeInState > 7) this.enter('engage')
+  }
+
+  /**
+   * Walks a short distance without pathfinding: cover step-outs are under a
+   * metre and a path query for them would be both wasteful and jerky.
+   */
+  private stepTo(p: THREE.Vector3, speed: number): void {
+    const s = this.soldier
+    T1.set(p.x - s.position.x, 0, p.z - s.position.z)
+    const d = T1.length()
+    if (d < 0.12) {
+      s.moveSpeed = 0
+      return
+    }
+    s.moveDir.copy(T1).divideScalar(d)
+    s.moveSpeed = Math.min(speed, d * 3.5)
   }
 
   /**
@@ -775,51 +1292,46 @@ export class Behaviour {
     this.inCover = false
   }
 
-  /** Drops the soldier straight into a fight; used to script capture poses. */
+  /**
+   * Drops the soldier straight into a fight; used to script capture poses.
+   *
+   * A capture pose is a still frame of a firefight, so it skips the reaction
+   * window and the ranging burst — the soldier has been in this fight for a
+   * while by the time the shutter opens — and asserts exposure, because the
+   * pose camera stands where a player would and these soldiers are placed in
+   * the open in front of it.
+   */
   forceEngage(target: THREE.Vector3): void {
     this.alerted = true
     this.awareness = 1
     this.hasContact = true
     this.losClear = true
+    this.exposed = true
     this.lastKnown.copy(target)
     this.aimError = 0.07
     this.contactTime = 1.2
+    this.reactionTimer = 0
+    this.rangingBurst = false
     this.burstLeft = 5
     this.enter('engage')
   }
 }
 
 /**
- * Distance along `dir` at which the ray first enters a vertical capsule
- * standing at `base`, or -1. Done analytically because the player is not
- * guaranteed to own a collider in the physics world.
+ * Travel speed for a soldier with `remaining` metres to go.
+ *
+ * `sv_botSprintDistance "512"` = 13.0 m `[stated]` §7.5. Sprinting the last few
+ * metres of a move is where the old speeds hurt: every reposition inside a
+ * firefight — cover to cover, closing on the player — is under 13 m, so the
+ * whole fight was fought at a sprint by targets nobody could lead.
  */
-function rayCapsule(origin: THREE.Vector3, dir: THREE.Vector3, base: THREE.Vector3, radius: number): number {
-  const ax = base.x
-  const ay = base.y + 0.35
-  const az = base.z
-  const uy = 1.27 // spine from ankle to eye
+function travelSpeed(remaining: number): number {
+  return remaining > SPRINT_DISTANCE ? SPRINT_SPEED : WALK_SPEED
+}
 
-  const wx = origin.x - ax
-  const wy = origin.y - ay
-  const wz = origin.z - az
-  const a = dir.lengthSq()
-  const b = dir.y * uy
-  const c = uy * uy
-  const d = dir.x * wx + dir.y * wy + dir.z * wz
-  const e = uy * wy
-  const denom = a * c - b * b
-  let sc = denom > 1e-9 ? (b * e - c * d) / denom : -d / a
-  if (sc < 0) sc = 0
-  let tc = denom > 1e-9 ? (a * e - b * d) / denom : e / c
-  tc = tc < 0 ? 0 : tc > 1 ? 1 : tc
-
-  const dx = origin.x + dir.x * sc - ax
-  const dy = origin.y + dir.y * sc - (ay + uy * tc)
-  const dz = origin.z + dir.z * sc - az
-  const gap = Math.hypot(dx, dy, dz)
-  if (gap > radius) return -1
-  return Math.max(0.1, sc - Math.sqrt(Math.max(0, radius * radius - gap * gap)))
+/** Rounds in one burst: 0.4-0.6 s of fire at the enemy rifle's round spacing. */
+function burstRounds(rng: Rand): number {
+  return Math.max(1, Math.round(rng.range(BURST_MIN, BURST_MAX) / SHOT_INTERVAL))
 }
 
 /** Ground height under a point, for placing spawns. */

@@ -1,11 +1,15 @@
 import * as THREE from 'three'
 import { Rand } from '../core/Rand'
-import type { GameContext, HudService, System } from '../core/Types'
+import type { Damageable, GameContext, HudService, System } from '../core/Types'
+import { callsign } from '../game/Callsigns'
+import { getMatchService, type MatchPhase, type MatchService, type MatchState } from '../game/Match'
+import { BANNER_SECONDS, WAVES } from '../game/MatchDefs'
 import { AmmoPanel } from './Ammo'
 import { Compass, type CompassMarker } from './Compass'
 import { Crosshair, type HitKind } from './Crosshair'
 import { BloodOverlay, DamageIndicators, MessageToast, Prompts, SprintArc, StatsOverlay } from './Indicators'
 import { Killfeed, type Side } from './Killfeed'
+import { AwardStack, ScorePanel, WaveBanner, pad2 } from './MatchHud'
 import { Menus } from './Menus'
 import { Minimap, type Contact } from './Minimap'
 import { clamp, damp, el, installStyles, toggleClass } from './Style'
@@ -15,19 +19,6 @@ const CONTACT_LIFE = 3.2
 const MAX_CONTACTS = 16
 /** Two calls describing the same event within this window are one event. */
 const DEDUPE = 0.06
-
-/**
- * Two disjoint callsign pools. The first six are the player's side, the last
- * six the opposition, and `nameFor` only ever draws from the matching half —
- * so a name is bound to a team for the whole match and the killfeed can colour
- * by team without ever contradicting itself.
- */
-const CALLSIGNS = [
-  'MERAD', 'HASSAN', 'RASHID', 'KANE', 'ROSS', 'BRAVO',
-  'ZAROV', 'VOLK', 'ORLOV', 'SOKOL', 'DUSHKA', 'BARIN',
-]
-const SIDE_POOL = 6
-const RANKS = ['PVT.', 'CPL.', 'SGT.', 'LT.']
 
 interface Blip {
   x: number
@@ -62,6 +53,9 @@ export class HudSystem implements System, HudService {
   private toast!: MessageToast
   private stats!: StatsOverlay
   private menus!: Menus
+  private scorePanel!: ScorePanel
+  private awards!: AwardStack
+  private banner!: WaveBanner
 
   private ctx!: GameContext
   private scale = 1
@@ -87,6 +81,19 @@ export class HudSystem implements System, HudService {
   private lastDirAt = -99
   private weaponName = ''
   private ammoDriven = false
+
+  /**
+   * The match layer, resolved lazily: it publishes itself during its own init
+   * and may be registered after this system, so it cannot be read here at init
+   * time. Everything below degrades to the pre-match HUD when it is absent.
+   */
+  private match: MatchService | undefined
+  private lastPhase: MatchPhase | '' = ''
+  private lastWave = -1
+  private lastHostiles = -1
+  private lastCountdown = -1
+  /** True between a win or a loss and the next deploy. */
+  private finished = false
 
   private started = false
   private paused = false
@@ -114,6 +121,9 @@ export class HudSystem implements System, HudService {
     this.prompts = new Prompts(this.root)
     this.toast = new MessageToast(this.root)
     this.stats = new StatsOverlay(this.root)
+    this.scorePanel = new ScorePanel(this.root)
+    this.awards = new AwardStack(this.root)
+    this.banner = new WaveBanner(this.root)
 
     const centre = el('div', 'center', this.root)
     this.damageArcs = new DamageIndicators(centre)
@@ -139,6 +149,7 @@ export class HudSystem implements System, HudService {
       onResume: () => this.resume(),
       onQuit: () => this.quitToMenu(),
       onRespawn: () => this.respawn(),
+      onRestart: () => this.restartMatch(),
     })
 
     this.stats.setEnabled(ctx.config.stats)
@@ -185,14 +196,16 @@ export class HudSystem implements System, HudService {
     this.offs.push(events.on('entity:killed', ({ entity, byPlayer, weapon, headshot }) => {
       if (byPlayer) {
         this.kills++
-        this.compass.setScore(`${pad2(this.kills)} / 12`)
+        // The match layer owns the objective line when it is present; this is
+        // the standalone fallback so the HUD still reads correctly without it.
+        if (!this.match) this.compass.setScore(`${pad2(this.kills)} / 12`)
         this.hitmarker('kill')
       }
       const victimSide: Side = entity.team === 'player' ? 'friendly' : 'enemy'
       const killerSide: Side = byPlayer ? 'you' : victimSide === 'enemy' ? 'friendly' : 'enemy'
       this.feed.add(
-        byPlayer ? 'YOU' : nameFor(killerSide, entity.id + 3),
-        nameFor(victimSide, entity.id),
+        byPlayer ? 'YOU' : callsign(killerSide, entity.id + 3),
+        callsign(victimSide, entity.id),
         weapon || this.weaponName,
         headshot,
         killerSide,
@@ -223,13 +236,13 @@ export class HudSystem implements System, HudService {
 
   /** Clicking the world re-captures the mouse after a failed or lost lock. */
   private onCanvasDown = (): void => {
-    if (!this.started || this.paused || this.dead) return
+    if (!this.started || this.paused || this.dead || this.finished) return
     if (!document.pointerLockElement) this.requestLock()
   }
 
   private onKeyDown = (e: KeyboardEvent): void => {
     if (e.code === 'Escape') {
-      if (!this.started || this.dead) return
+      if (!this.started || this.dead || this.finished) return
       if (this.menus.current === 'settings') this.menus.back()
       else if (this.paused) this.resume()
       else this.pause()
@@ -243,7 +256,7 @@ export class HudSystem implements System, HudService {
 
   /** Losing the pointer lock mid-fight means the player hit Escape or alt-tabbed. */
   private onLockChange = (): void => {
-    if (!this.started || this.dead) return
+    if (!this.started || this.dead || this.finished) return
     if (!document.pointerLockElement && !this.menus.isOpen) this.pause()
   }
 
@@ -251,6 +264,7 @@ export class HudSystem implements System, HudService {
     this.started = true
     this.paused = false
     this.dead = false
+    this.finished = false
     this.menus.show('none')
     this.ctx.input.enabled = true
     this.requestLock()
@@ -278,6 +292,9 @@ export class HudSystem implements System, HudService {
   private quitToMenu(): void {
     this.paused = false
     this.started = false
+    this.finished = false
+    this.match?.abandon()
+    this.resetMatchHud()
     this.menus.show('start')
     this.ctx.input.enabled = false
     this.ctx.input.exitLock()
@@ -287,15 +304,165 @@ export class HudSystem implements System, HudService {
   private onDeath(): void {
     this.dead = true
     this.health = 0
-    this.menus.setDeathCause('ENEMY CONTACT — SECTOR 07')
+
+    // Charge the life before reading the phase: this is the one call that can
+    // turn a death into the end of the match, and it is idempotent, so it does
+    // not matter whether the director's own listener got here first.
+    const match = this.match
+    match?.reportPlayerDeath()
+    if (match && match.state.phase === 'defeat') {
+      this.showEnd(match)
+      return
+    }
+
+    this.menus.setDeathCause(this.deathCause(match?.state))
     this.menus.show('death')
     this.ctx.input.enabled = false
     this.ctx.input.exitLock()
   }
 
+  /**
+   * What the death screen says. The full attribution — who, at what range,
+   * how far you got — belongs on the mission-failed screen; between redeploys
+   * the player only needs to know how much rope they have left.
+   */
+  private deathCause(state: MatchState | undefined): string {
+    const killer = this.nearestEnemy()
+    const who = killer ? callsign('enemy', killer.id) : 'ENEMY CONTACT'
+    if (!state || !Number.isFinite(state.livesMax)) return `${who} — SECTOR 07`
+    const left = Math.max(0, state.livesLeft)
+    return `${who} — WAVE ${state.wave} — ${left} REINFORCEMENT${left === 1 ? '' : 'S'} LEFT`
+  }
+
+  /** Nearest hostile still standing: the best available guess at the killer. */
+  private nearestEnemy(): Damageable | null {
+    const ai = this.ctx.services.ai
+    const player = this.ctx.services.player
+    if (!ai || !player) return null
+    let best: Damageable | null = null
+    let bestD = Infinity
+    for (const e of ai.enemies) {
+      if (!e.alive) continue
+      const d = e.position.distanceToSquared(player.eye)
+      if (d < bestD) { bestD = d; best = e }
+    }
+    return best
+  }
+
   /** The `player:respawn` handler owns the UI side, so both paths agree. */
   private respawn(): void {
     this.ctx.events.emit('player:respawn', {})
+  }
+
+  // --- match layer ---------------------------------------------------------
+
+  private showEnd(match: MatchService): void {
+    if (this.finished) return
+    this.finished = true
+    this.banner.hide()
+    this.awards.reset()
+    this.ctx.input.enabled = false
+    this.ctx.input.exitLock()
+    const summary = match.summary()
+    if (summary) this.menus.showResult(summary)
+    else this.menus.show(match.state.phase === 'victory' ? 'victory' : 'defeat')
+  }
+
+  private restartMatch(): void {
+    this.finished = false
+    this.dead = false
+    this.health = 1
+    this.healthDriven = false
+    this.kills = 0
+    this.damageArcs.clear()
+    this.resetMatchHud()
+    this.match?.restart()
+    this.ctx.events.emit('player:respawn', {})
+    this.beginPlay()
+  }
+
+  private resetMatchHud(): void {
+    this.banner.hide()
+    this.awards.reset()
+    this.scorePanel.reset()
+    this.lastPhase = ''
+    this.lastWave = -1
+    this.lastHostiles = -1
+    this.lastCountdown = -1
+  }
+
+  /**
+   * Wave and phase transitions, and the end screens. Runs even when the HUD is
+   * hidden, because winning and losing are not display concerns.
+   */
+  private pollMatch(elapsed: number): void {
+    const match = this.match
+    if (!match) return
+    const s = match.state
+    if (s.phase === this.lastPhase && s.wave === this.lastWave) return
+    const enteredPhase = s.phase !== this.lastPhase
+    this.lastPhase = s.phase
+    this.lastWave = s.wave
+    this.lastHostiles = -1
+    this.lastCountdown = -1
+
+    if (s.phase === 'wave') {
+      const def = WAVES[Math.min(Math.max(s.wave - 1, 0), WAVES.length - 1)]
+      const last = s.wave >= s.waveCount
+      this.banner.show(
+        `WAVE ${s.wave} OF ${s.waveCount}`,
+        s.waveLabel,
+        def.brief.toUpperCase(),
+        elapsed,
+        BANNER_SECONDS,
+        last ? 'alert' : '',
+      )
+      return
+    }
+    if (s.phase === 'break') {
+      // The banner is held for the whole break, counting down: this is the beat
+      // where the player reloads, repositions and reads their score, and it
+      // needs to be visibly a beat rather than an absence of enemies.
+      this.banner.show(`WAVE ${s.wave} CLEARED`, 'REGROUP', 'STAND BY', elapsed, 0)
+      return
+    }
+    this.banner.hide()
+    if (enteredPhase && (s.phase === 'victory' || s.phase === 'defeat')) this.showEnd(match)
+  }
+
+  /**
+   * Per-frame match readouts. Every string built here is guarded by the value
+   * that produced it, so a steady frame allocates nothing.
+   */
+  private updateMatchHud(elapsed: number): void {
+    const match = this.match
+    if (!match) return
+    const s = match.state
+
+    if (s.phase === 'wave') {
+      if (s.hostilesLeft !== this.lastHostiles) {
+        this.lastHostiles = s.hostilesLeft
+        this.compass.setObjective(`WAVE ${s.wave}/${s.waveCount} — ${s.waveLabel}`)
+        this.compass.setScore(`${pad2(s.hostilesLeft)} LEFT`)
+      }
+    } else if (s.phase === 'break') {
+      const tick = Math.ceil(s.breakLeft)
+      if (tick !== this.lastCountdown) {
+        this.lastCountdown = tick
+        this.compass.setObjective('PLAZA HELD — REGROUP')
+        this.compass.setScore(`NEXT ${pad2(tick)}`)
+        this.banner.setSub(`NEXT WAVE IN ${tick}`)
+      }
+    } else if (s.phase === 'victory' && this.lastHostiles !== 0) {
+      this.lastHostiles = 0
+      this.compass.setObjective('PLAZA SECURED')
+      this.compass.setScore(`${s.waveCount} / ${s.waveCount}`)
+    }
+
+    this.scorePanel.update(s, elapsed)
+    this.awards.ingest(match.awards, match.awardSeq, elapsed)
+    this.awards.update(elapsed)
+    this.banner.update(elapsed)
   }
 
   /**
@@ -331,6 +498,9 @@ export class HudSystem implements System, HudService {
     const now = performance.now()
     if (this.lastFrameStamp > 0) this.frameMs += (now - this.lastFrameStamp - this.frameMs) * 0.1
     this.lastFrameStamp = now
+
+    if (!this.match) this.match = getMatchService(ctx)
+    this.pollMatch(ctx.elapsed)
 
     const hidden = ctx.config.hideHud
     toggleClass(this.root, 'hud-off', hidden)
@@ -381,7 +551,8 @@ export class HudSystem implements System, HudService {
     )
     this.toast.update(elapsed)
 
-    // --- contacts, compass, minimap --------------------------------------
+    // --- match, contacts, compass, minimap -------------------------------
+    this.updateMatchHud(elapsed)
     this.feed.update(elapsed)
     this.gatherContacts(elapsed, px, pz)
     this.compass.update(headingOf(yaw), this.markers, this.markerCount)
@@ -478,14 +649,23 @@ export class HudSystem implements System, HudService {
     this.kills = rng.int(4, 8)
     this.compass.setScore(`${pad2(this.kills)} / 12`)
     if (!this.ammoDriven) this.ammo.setAmmo(rng.int(14, 25), 120, 0)
+
+    // The scoreboard is graded in these frames too, so it gets a plausible
+    // seeded total rather than a zero the mission has not earned yet. Queued
+    // rather than applied here: the director resets the board when the match
+    // opens on the first frame, which is after this runs.
+    const score = this.kills * 100 + rng.int(2, 7) * 50
+    const streak = rng.int(0, 3)
+    this.pending.push({ at: 0, run: () => getMatchService(this.ctx)?.seedCapture(score, this.kills, streak) })
+
     // Draws are taken here, not inside the closures, so the seeded feed does
     // not depend on the order `lateUpdate` happens to drain the queue.
     for (let i = 0; i < 3; i++) {
       const at = freeze - (3.4 - i * 1.35)
       const mine = i === 1
       const killerSide: Side = mine ? 'you' : 'friendly'
-      const killer = mine ? 'YOU' : nameFor('friendly', rng.int(0, 40))
-      const victim = nameFor('enemy', rng.int(0, 40))
+      const killer = mine ? 'YOU' : callsign('friendly', rng.int(0, 40))
+      const victim = callsign('enemy', rng.int(0, 40))
       const headshot = rng.bool(0.35)
       this.pending.push({
         at,
@@ -526,6 +706,8 @@ export class HudSystem implements System, HudService {
     this.root.style.setProperty('--s', String(this.scale))
     this.menus.layout(this.scale)
     this.crosshair.layout(this.scale)
+    this.awards.layout(this.scale)
+    this.banner.layout(this.scale)
     this.compass.layout(this.scale, this.dpr)
     this.minimap.layout(this.scale, this.dpr)
   }
@@ -544,7 +726,7 @@ export class HudSystem implements System, HudService {
     this.feed.add(killer, victim, weapon, headshot, killerSide, victimSide, this.ctx.elapsed)
     if (mine) {
       this.kills++
-      this.compass.setScore(`${pad2(this.kills)} / 12`)
+      if (!this.match) this.compass.setScore(`${pad2(this.kills)} / 12`)
     }
   }
 
@@ -629,13 +811,3 @@ function isPlayerName(name: string): boolean {
   return n === 'you' || n === 'player' || n === 'operator'
 }
 
-/** Picks a callsign from the half of the roster that belongs to `side`. */
-function nameFor(side: Side, id: number): string {
-  const i = Math.abs(Math.round(id)) % SIDE_POOL
-  const slot = side === 'enemy' ? SIDE_POOL + i : i
-  return `${RANKS[slot % RANKS.length]} ${CALLSIGNS[slot]}`
-}
-
-function pad2(v: number): string {
-  return v < 10 ? `0${v}` : String(v)
-}

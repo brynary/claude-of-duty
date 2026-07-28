@@ -36,10 +36,17 @@ import { join, resolve, basename } from 'node:path'
  *   design       — a judgement call with no research basis, stated as such
  */
 const TARGETS = {
-  ttkMean: { range: [0.20, 0.30], unit: 's', label: 'Time to kill (mean)', source: '§1, §2.1 [measured]',
-    why: 'MW2019 just under 200ms; BO6 ARs 260-340ms. Upper bound is §1\'s headline recommendation of 200-300ms rather than BO6\'s measured envelope, because §2.1 records MWIII\'s 300ms+ as "widely disliked" — targeting the envelope would admit the case the research calls the bad one.' },
-  ttkMax: { range: [0, 0.60], unit: 's', label: 'Time to kill (worst)', source: 'design',
-    why: 'Twice the upper target, rounded down. At 706 RPM [measured] 0.6s is about 7 rounds — a quarter of a magazine, not most of one. The bound exists so a long tail cannot hide inside a healthy mean; it is a judgement, not a sourced figure.' },
+  // NOT time-to-kill. This measures first damaging hit to death, which is
+  // (STK-1) / (hitRate x RPM/60 x dutyCycle) — so it is dominated by accuracy,
+  // not by weapon lethality, and it moves the wrong way when damage rises.
+  // It was labelled "time to kill" for the first two rounds and read 1.47s
+  // against a 200-300ms target, which framed an accuracy problem as a weapon
+  // problem. True TTK is a property of the weapon table, not of a run, and is
+  // verified by arithmetic in the gunfeel report: M4A1 4 STK at 780 RPM = 231ms.
+  killDuration: { range: [0.8, 2.2], unit: 's', label: 'Kill duration (first hit to death)', source: 'derived',
+    why: 'At the 4 shots-to-kill and 780 RPM the weapon table now specifies, and the 18-45% accuracy band, a kill takes 4/hitRate rounds at 76.9ms spacing across a burst duty cycle near 55%: roughly 0.9s at 45% accuracy and 2.2s at 18%. Wider than the sourced TTK because it deliberately includes the misses.' },
+  killDurationMax: { range: [0, 4.0], unit: 's', label: 'Kill duration (worst)', source: 'design',
+    why: 'A ceiling so a long tail cannot hide inside a healthy mean. An enemy taking longer than this to die has soaked an entire magazine of near-misses, which reads as unresponsive weapons whatever the cause.' },
   accuracy: { range: [0.18, 0.45], unit: '', label: 'Player accuracy', source: 'design',
     why: 'FEEL_TARGET contains no player-accuracy figure at all, so this range is invented. It earns its place only as a tripwire: §3.6 [stated] establishes that ADS spread in CoD is exactly zero, so an accuracy far below this band means spread or recoil is fighting the player rather than that the player is bad.' },
   enemyReaction: { range: [0.50, 1.00], unit: 's', label: 'Enemy reaction time', source: '§7.5 [stated]',
@@ -79,8 +86,8 @@ function pick(run) {
   const dur = Math.max(run.duration, 1e-6)
   const mins = dur / 60
   return {
-    ttkMean: run.timeToKill.mean,
-    ttkMax: run.timeToKill.max,
+    killDuration: run.timeToKill.mean,
+    killDurationMax: run.timeToKill.max,
     accuracy: run.accuracy,
     enemyReaction: run.enemyReaction.mean,
     engagementDistance: run.engagementDistance.mean,

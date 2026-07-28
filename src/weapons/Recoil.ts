@@ -1,12 +1,25 @@
 import { Rand } from '../core/Rand'
 
 /**
- * Camera recoil: a deterministic shaped spray pattern with a small random
- * component, plus the spring that walks the view back down between bursts.
+ * Camera recoil, modelled on the two-part system described in FEEL_TARGET §3.5.
  *
- * The pattern is authored as [pitch, yaw] multipliers per shot index. Early
- * shots climb almost vertically, then the pattern breaks to one side and back,
- * which is what makes a Call of Duty spray learnable rather than random.
+ * Each shot adds a kick with a directional bias and a large random component,
+ * and a **centre speed** pulls the view back toward zero *continuously* —
+ * "It applies immediately on firing, but during full-auto fire there is usually
+ * too much kick to fully recentre before the next shot." `[stated]`
+ *
+ * That last sentence is the whole model, and gating recentring behind "the
+ * trigger is up" (which is what this class used to do) turns a bounded climb
+ * into an unbounded one. With the centre speed running every frame the offset
+ * converges to `kick / (1 - e^(-recovery / shotsPerSecond))` instead of summing
+ * without limit, so a magazine has a ceiling and the player pulls against a
+ * bias rather than chasing a runaway.
+ *
+ * The `pattern` is a *bias* curve, not a memorisable path: §3.5 is explicit
+ * that CoD is "a randomised cone with a directional bias, not a memorisable
+ * fixed spray pattern like CS or Battlefield." The horizontal term is therefore
+ * small next to `jitter`; the vertical term only shapes how the first shots
+ * feel heavier than the settled tail.
  */
 export interface RecoilProfile {
   /** Base vertical kick per shot, radians. */
@@ -15,12 +28,17 @@ export interface RecoilProfile {
   yaw: number
   /** Fraction of the kick that is randomised, 0..1. */
   jitter: number
-  /** Shaped pattern; sampled by shot index and held at the tail. */
+  /** Shaped bias; sampled by shot index and held at the tail. */
   pattern: readonly (readonly [number, number])[]
   /** Spring frequency for how fast the view snaps to the new target. */
   snap: number
-  /** How fast the view walks back down once firing stops, per second. */
+  /**
+   * Centre speed: how fast the view is pulled back toward zero, per second.
+   * Applies every frame, including while the trigger is held.
+   */
   recovery: number
+  /** Multiplier on `recovery` once the trigger is released. */
+  settle: number
   /** Fraction of the kick that never returns (permanent climb), 0..1. */
   permanent: number
   /** Recoil reduction while aiming down sights. */
@@ -88,13 +106,14 @@ export class RecoilState {
     if (dt <= 0) return
     this.sinceShot += dt
 
-    // Recover once the trigger is released and the burst delay has passed.
-    if (!firing && this.sinceShot > 0.055) {
-      // Walk back down toward the residual climb, not all the way to zero.
-      const k = Math.exp(-profile.recovery * dt)
-      this.targetPitch = this.restPitch + (this.targetPitch - this.restPitch) * k
-      this.targetYaw = this.restYaw + (this.targetYaw - this.restYaw) * k
-    }
+    // Centre speed runs every frame, trigger up or down. Between bursts it runs
+    // faster, which is the view snapping back the moment you stop shooting.
+    const held = firing || this.sinceShot <= 0.055
+    const rate = held ? profile.recovery : profile.recovery * profile.settle
+    const k = Math.exp(-rate * dt)
+    this.targetPitch = this.restPitch + (this.targetPitch - this.restPitch) * k
+    this.targetYaw = this.restYaw + (this.targetYaw - this.restYaw) * k
+
     if (!firing && this.sinceShot > 0.28) {
       this.shotIndex = 0
       const settle = Math.exp(-2.2 * dt)

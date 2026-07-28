@@ -7,7 +7,7 @@ import { buildDrainage, buildKerbs, buildPaving, buildSteps, buildTerrain, groun
 import {
   BUILDINGS, buildAlleyTerminus, buildBuilding, buildCompoundWalls, buildMarketHall,
   buildMinaret, buildMosque, buildRoofClutter, buildSabat, buildSkyline, buildWaterTower,
-  footprintBase, insideAnyBuilding, type BuildResult,
+  insideAnyBuilding, type BuildResult,
 } from './Buildings'
 import {
   buildInteriors, buildOverhead, buildPosters, buildSetPieces, definePropKinds,
@@ -20,6 +20,7 @@ import {
 import {
   applyWind, buildTrees, defineFoliageKinds, scatterFoliage, solidifyFoliage, type WindHandle,
 } from './Foliage'
+import { EncounterDirector } from './Encounter'
 
 /**
  * A sun-bleached Middle Eastern district, roughly 90 x 90 m of playable space.
@@ -44,6 +45,7 @@ export class LevelSystem implements System, LevelService {
   private root = new THREE.Group()
   private indoor: THREE.Box3[] = []
   private wind: WindHandle | null = null
+  private encounter = new EncounterDirector()
 
   init(ctx: GameContext): void {
     const { scene, services, config } = ctx
@@ -215,50 +217,28 @@ export class LevelSystem implements System, LevelService {
     farm.build(instGroup, mats, 'prop')
 
     this.indoor = result.indoor
-    this.buildSpawns()
 
     this.playerSpawn.set(2.0, groundHeight(2.0, 2.5) + 1.7, 2.5)
+
+    // The encounter director owns `spawnPoints` from here on: it republishes
+    // them against the player's position and facing so that each wave arrives
+    // from behind cover, from one coherent direction, at a distance chosen to
+    // put an approach between the spawn and the first shot. It has to run last
+    // in init because it stages the opening wave against `playerSpawn`, and
+    // `AiSystem.init` — which spawns that wave — runs immediately after this.
+    this.encounter.init(ctx, this)
 
     services.level = this
     this.root.updateMatrixWorld(true)
   }
 
   /**
-   * Enemy spawns spread across the plaza, both routes, the interiors, the lot
-   * and the rooftops, so a wave can approach from more than one direction.
-   */
-  private buildSpawns(): void {
-    const pts: [number, number][] = [
-      // Plaza and its approaches.
-      [-9.0, -22.5], [-17.5, -18.0], [-3.0, -24.5], [-20.5, -9.5], [2.0, -17.0],
-      [-13.0, -26.0], [3.5, -6.0], [-24.0, -14.0],
-      // Market street, west route.
-      [-6.5, 19.5], [-4.5, 26.5], [-8.5, 33.0], [-2.0, 34.5], [-9.5, 14.0],
-      // Alley, east route.
-      [6.8, 20.5], [7.2, 32.0], [6.6, 25.0], [7.6, 16.0],
-      // The junction and the lot.
-      [11.5, 21.5], [16.0, 26.0], [12.5, 30.0], [21.0, 24.5], [23.5, 33.5],
-      // Highway and the far side.
-      [30.0, 32.0], [19.5, 38.5], [28.0, 26.5],
-      // Interiors and the north.
-      [-14.0, 8.0], [-19.5, 4.0], [-15.5, 27.5], [12.0, 12.0], [-2.0, -27.5],
-      [16.0, -8.0], [-24.5, 11.0],
-    ]
-    for (const [x, z] of pts) {
-      this.spawnPoints.push(new THREE.Vector3(x, groundHeight(x, z) + 0.05, z))
-    }
-    // Rooftop overwatch positions on the market hall deck.
-    const deck = footprintBase(19.75, 16.25, 8.5, 11.5) + 2.86
-    this.spawnPoints.push(new THREE.Vector3(19.0, deck, 18.5))
-    this.spawnPoints.push(new THREE.Vector3(20.6, deck, 13.5))
-  }
-
-  /**
    * Drives the foliage wind from `elapsed` rather than accumulating `dt`, so a
    * frozen capture frame is bit-identical regardless of frame rate.
    */
-  update(_dt: number, ctx: GameContext): void {
+  update(dt: number, ctx: GameContext): void {
     if (this.wind) this.wind.uniform.value = ctx.elapsed
+    this.encounter.update(dt, ctx)
   }
 
   /** True inside a roofed volume — drives reverb and interior lighting. */
@@ -270,6 +250,7 @@ export class LevelSystem implements System, LevelService {
   }
 
   dispose(): void {
+    this.encounter.dispose()
     this.root.traverse((o) => {
       const m = o as THREE.Mesh
       if (m.geometry) m.geometry.dispose()

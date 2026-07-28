@@ -1,15 +1,35 @@
 import { createConfig, type Config, type QualityLevel } from '../core/Config'
 import { Rand } from '../core/Rand'
 import type { GameContext } from '../core/Types'
+import type { MatchSummary } from '../game/Match'
+import { formatClock, formatScore } from './MatchHud'
 import { TextSlot, el } from './Style'
 
-export type MenuScreen = 'none' | 'start' | 'pause' | 'settings' | 'death'
+export type MenuScreen = 'none' | 'start' | 'pause' | 'settings' | 'death' | 'victory' | 'defeat'
 
 export interface MenuHandlers {
   onDeploy(): void
   onResume(): void
   onQuit(): void
   onRespawn(): void
+  /** Start a fresh match from an end screen. */
+  onRestart(): void
+}
+
+/** The rows of the debrief table, in reading order. */
+const RESULT_ROWS = [
+  'KILLS', 'ACCURACY', 'HEADSHOTS', 'BEST STREAK',
+  'SHOTS FIRED', 'DAMAGE TAKEN', 'TIME', 'REDEPLOYS',
+] as const
+
+interface ResultScreen {
+  node: HTMLElement
+  title: TextSlot
+  sub: HTMLElement
+  score: TextSlot
+  wavesRow: HTMLElement
+  waves: HTMLElement[]
+  rows: Map<string, TextSlot>
 }
 
 /** Config fields a quality preset owns; everything else survives a change. */
@@ -40,6 +60,9 @@ export class Menus {
   private diedAt = -1
   private respawned = false
 
+  private victory!: ResultScreen
+  private defeat!: ResultScreen
+
   private ctx: GameContext
   private handlers: MenuHandlers
   private baseSensitivity: number
@@ -62,6 +85,11 @@ export class Menus {
     this.screens.set('death', death.node)
     this.deathSub = death.sub
     this.deathTimer = death.timer
+
+    this.victory = this.buildResult('victory', 'PLAZA SECURED', 'REDEPLOY')
+    this.defeat = this.buildResult('defeat', 'MISSION FAILED', 'TRY AGAIN')
+    this.screens.set('victory', this.victory.node)
+    this.screens.set('defeat', this.defeat.node)
 
     for (const node of this.screens.values()) node.classList.add('closed')
   }
@@ -194,6 +222,84 @@ export class Menus {
     return { node, sub, timer }
   }
 
+  /**
+   * Debrief. The same construction serves win and loss because they are the
+   * same information — the only differences are the headline, the accent and
+   * one extra line naming whoever finished you.
+   */
+  private buildResult(kind: 'victory' | 'defeat', headline: string, primary: string): ResultScreen {
+    const node = this.shell(kind)
+    const pane = el('div', 'result', node)
+    let i = 0
+    const eyebrow = stagger(el('div', 'eyebrow', pane), i++)
+    eyebrow.textContent = 'OPERATION SILENT CORRIDOR'
+    const title = new TextSlot(stagger(el('div', 'result-title', pane), i++))
+    title.set(headline)
+    const sub = stagger(el('div', 'result-sub', pane), i++)
+
+    const scoreRow = stagger(el('div', 'result-score', pane), i++)
+    const score = new TextSlot(el('div', 'n', scoreRow))
+    el('div', 'lbl', scoreRow).textContent = 'FINAL SCORE'
+    score.set('0')
+
+    const wavesRow = stagger(el('div', 'result-waves', pane), i++)
+    const waves: HTMLElement[] = []
+
+    const grid = stagger(el('div', 'result-grid', pane), i++)
+    const rows = new Map<string, TextSlot>()
+    for (const label of RESULT_ROWS) {
+      const row = el('div', '', grid)
+      el('span', '', row).textContent = label
+      rows.set(label, new TextSlot(el('b', '', row)))
+    }
+
+    this.item(pane, primary, i++, true, () => this.handlers.onRestart())
+    this.item(pane, 'RETURN TO MENU', i++, false, () => this.handlers.onQuit())
+    return { node, title, sub, score, wavesRow, waves, rows }
+  }
+
+  /** Fills a debrief and opens it. */
+  showResult(summary: MatchSummary): void {
+    const screen = summary.won ? this.victory : this.defeat
+    screen.score.set(formatScore(summary.score))
+
+    // Wave marks are built the first time, since the wave count is fixed for
+    // the match but not known when the screen is constructed.
+    if (screen.waves.length !== summary.waveCount) {
+      screen.wavesRow.textContent = ''
+      screen.waves.length = 0
+      for (let i = 0; i < summary.waveCount; i++) screen.waves.push(el('i', '', screen.wavesRow))
+    }
+    for (let i = 0; i < screen.waves.length; i++) {
+      const done = i < summary.wavesCleared
+      screen.waves[i].className = done ? 'done' : (!summary.won && i === summary.fellOnWave - 1) ? 'lost' : ''
+    }
+
+    const set = (k: string, v: string) => screen.rows.get(k)?.set(v)
+    set('KILLS', String(summary.kills))
+    set('ACCURACY', `${Math.round(Math.min(1, summary.accuracy) * 100)}%`)
+    set('HEADSHOTS', String(summary.headshots))
+    set('BEST STREAK', String(summary.bestStreak))
+    set('SHOTS FIRED', String(summary.shotsFired))
+    set('DAMAGE TAKEN', String(Math.round(summary.damageTaken)))
+    set('TIME', formatClock(summary.timeSurvived))
+    set('REDEPLOYS', String(summary.deaths))
+
+    screen.sub.textContent = ''
+    if (summary.won) {
+      line(screen.sub, `ALL ${summary.waveCount} PUSHES REPELLED`)
+      line(screen.sub, `THE PLAZA HELD FOR ${formatClock(summary.timeSurvived)}`)
+    } else {
+      const by = summary.killedBy
+        ? `KILLED BY <b>${summary.killedBy}</b> AT ${summary.killedAtRange.toFixed(0)} M`
+        : 'KILLED IN ACTION'
+      lineHtml(screen.sub, by)
+      line(screen.sub, `FELL ON WAVE ${summary.fellOnWave} OF ${summary.waveCount} — ${summary.wavesCleared} CLEARED`)
+    }
+
+    this.show(summary.won ? 'victory' : 'defeat')
+  }
+
   private buildSettings(): HTMLElement {
     const node = this.shell('settings')
     const pane = el('div', 'pane', node)
@@ -312,6 +418,19 @@ export class Menus {
     window.clearTimeout(this.hideTimer)
     this.root.remove()
   }
+}
+
+function line(parent: HTMLElement, text: string): void {
+  el('div', '', parent).textContent = text
+}
+
+/**
+ * The only markup written from a string in the whole layer, and it interpolates
+ * one value: a callsign drawn from a twelve-entry constant table. Nothing here
+ * is ever player-supplied.
+ */
+function lineHtml(parent: HTMLElement, html: string): void {
+  el('div', '', parent).innerHTML = html
 }
 
 function stagger<T extends HTMLElement>(node: T, index: number): T {

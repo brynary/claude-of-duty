@@ -4,10 +4,17 @@ import { applyPose } from '../core/Poses'
 import type { PhysicsSystem } from '../physics/Physics'
 import { Locomotion, MOVE, type MoveIntent } from './Movement'
 import { CameraRig } from './CameraRig'
+import { difficulty } from '../game/Difficulty'
 
-/** Seconds out of combat before health starts coming back. */
-const REGEN_DELAY = 3.1
-const REGEN_RATE = 34
+/**
+ * Health regeneration, `[stated]` from the MWIII Season 2 patch notes: a 3 s
+ * delay, then 75 HP/s. Against a 100 HP pool that is a 1.33 s ramp, so a player
+ * who breaks contact is whole again 4.33 s later. The delay is what makes a
+ * firefight a firefight and the ramp is what makes disengaging worth doing;
+ * the previous 3.1 s / 34 HP/s took 6.0 s and turned every retreat into a walk.
+ */
+const REGEN_DELAY = 3.0
+const REGEN_RATE = 75
 /** Window for a double tap to mean "tactical sprint". */
 const DOUBLE_TAP = 0.28
 const RESPAWN_DELAY = 4.0
@@ -37,6 +44,46 @@ export class PlayerSystem implements System, PlayerService {
   isSliding = false
   health = 100
   speedFraction = 0
+
+  // --- movement state read structurally by other systems ---------------------
+  //
+  // These four are public API despite not appearing on `PlayerService` in
+  // `Types.ts`. That file is the frozen cross-system contract and cannot be
+  // edited by one agent mid-build, so the systems below reach for these the way
+  // `HudSystem` already reaches for `stamina`: an optional structural read that
+  // degrades to a fallback when the field is absent. Do not rename or make them
+  // private — nothing in this file references them, so a rename looks free and
+  // is not. Each names its reader.
+  //
+  /**
+   * Read by: `WeaponSystem`, to refuse to fire.
+   *
+   * Seconds until the weapon is usable again after a sprint, slide or mantle.
+   * Call of Duty's sprint-out time is 160-230 ms for a rifle and 330-410 ms out
+   * of a slide, and it is the single number that decides whether the game feels
+   * twitchy or committed. Movement owns the clock because every way of leaving
+   * a sprint has to pay the same price — releasing the key, aiming, pulling the
+   * trigger, cresting a slope — and only this system sees all of them.
+   */
+  sprintOutRemaining = 0
+  /**
+   * Read by: `WeaponSystem`. The same condition as `sprintOutRemaining <= 0`
+   * with the sprint itself folded in, so a caller that only wants a yes/no does
+   * not have to remember to check both.
+   */
+  weaponReady = true
+  /**
+   * Read by: `HudSystem`, via `staminaOf(player)` — it drives the sprint arc
+   * under the reticle and falls back to modelling its own if this is missing.
+   * 0..1 tactical sprint remaining, refilling over 4 s.
+   */
+  stamina = 1
+  /**
+   * Read by: nothing yet — offered to `HudSystem` for a slide-cancel prompt.
+   * True while releasing crouch would end the slide with its speed intact
+   * rather than at walking pace.
+   */
+  slideCancelOpen = false
 
   // --- damageable-shaped, but deliberately not in ctx.entities --------------
   readonly id = 0
@@ -87,6 +134,15 @@ export class PlayerSystem implements System, PlayerService {
     ctx.services.player = this
     this.eventsRef = ctx.events
     this.rig.setFov(ctx.config.fov)
+
+    // The third of the three variables Call of Duty's difficulty presets move
+    // (§7.6 [measured]: enemy accuracy, damage to the player, and the player's
+    // health pool). The AI system applies the first two but cannot reach this
+    // one, so without this line `healthScale` was silently inert and Hardened
+    // and Veteran were delivering two thirds of their intended difficulty while
+    // appearing complete.
+    this.maxHealth = difficulty.playerMaxHealth()
+    this.health = this.maxHealth
 
     const level = ctx.services.level
     if (level) {
@@ -177,7 +233,10 @@ export class PlayerSystem implements System, PlayerService {
     m.strafe = dead ? 0 : inp.axis('KeyA', 'KeyD')
     m.yaw = this.rig.aimYaw
     m.ads = ads
-    m.busy = busy
+    // Pulling the trigger drops the sprint even before a shot comes out. Waiting
+    // for `isFiring` would deadlock: the weapon refuses to fire while sprinting,
+    // so nothing would ever set `isFiring`, so the sprint would never break.
+    m.busy = busy || (!dead && inp.mouse0)
 
     if (inp.wasPressed('KeyW')) {
       if (ctx.elapsed - this.lastForwardTap < DOUBLE_TAP) this.tacLatch = true
@@ -187,7 +246,7 @@ export class PlayerSystem implements System, PlayerService {
       if (ctx.elapsed - this.lastSprintTap < DOUBLE_TAP) this.tacLatch = true
       this.lastSprintTap = ctx.elapsed
     }
-    if (m.forward < 0.5 || ads > 0.3 || busy || dead) this.tacLatch = false
+    if (m.forward < 0.5 || ads > 0.3 || m.busy || dead) this.tacLatch = false
 
     if (inp.wasPressed('KeyC')) this.crouchToggle = !this.crouchToggle
     const crouchEdge = inp.wasPressed('ControlLeft') || inp.wasPressed('KeyC')
@@ -257,6 +316,10 @@ export class PlayerSystem implements System, PlayerService {
     this.isCrouching = this.loco.crouchAmount > 0.5
     this.isSliding = this.loco.isSliding
     this.speedFraction = THREE.MathUtils.clamp(this.loco.speed / MOVE.sprint, 0, 1)
+    this.sprintOutRemaining = this.loco.sprintOut
+    this.weaponReady = this.loco.sprintOut <= 0 && !this.loco.isSprinting
+    this.stamina = this.loco.tacSprintLeft
+    this.slideCancelOpen = this.loco.slideCancelOpen
   }
 
   // --- health --------------------------------------------------------------
