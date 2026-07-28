@@ -90,6 +90,49 @@ function makeDataTexture(data: Uint8Array, size: number, srgb: boolean, aniso: n
   return tex
 }
 
+/**
+ * Band-limits a tiling height field with `passes` separable 1-2-1 taps.
+ *
+ * A viewmodel is the one thing in the frame that is never minified: measured
+ * against the capture, the rifle's maps run about 15 texels per millimetre and
+ * a pixel covers 0.18mm at the ADS eye relief, so the texture sits at roughly
+ * 1:1 with the framebuffer and mipmapping never engages. Any feature authored
+ * one texel wide is therefore a feature one pixel wide, and `heightToNormal`
+ * is a Sobel -- a high-pass whose gain peaks exactly at Nyquist. Feeding it
+ * single-texel noise produced a full-amplitude random normal at every texel,
+ * which on `rail` (roughness 0.22, metalness 0.94, probe weight 1.45) makes
+ * each pixel reflect a different part of a coloured probe. That is the
+ * "high-frequency iridescent sparkle that looks like a broken specular or a
+ * badly filtered normal map" the blind judges filed, and it is also why the
+ * rail read as a bright noise field instead of black anodised aluminium.
+ *
+ * Two passes put the smallest surviving feature at about three texels, which
+ * is the finest thing the frame can actually carry. This is a band limit, not
+ * a softening: the slopes that describe stipple and tool marks are all far
+ * below Nyquist and pass through untouched.
+ */
+function blurField(field: Float32Array, size: number, passes: number): void {
+  const tmp = new Float32Array(field.length)
+  for (let p = 0; p < passes; p++) {
+    for (let y = 0; y < size; y++) {
+      const row = y * size
+      for (let x = 0; x < size; x++) {
+        const l = field[row + (x === 0 ? size - 1 : x - 1)]
+        const r = field[row + (x === size - 1 ? 0 : x + 1)]
+        tmp[row + x] = (l + 2 * field[row + x] + r) * 0.25
+      }
+    }
+    for (let y = 0; y < size; y++) {
+      const up = (y === 0 ? size - 1 : y - 1) * size
+      const dn = (y === size - 1 ? 0 : y + 1) * size
+      const row = y * size
+      for (let x = 0; x < size; x++) {
+        field[row + x] = (tmp[up + x] + 2 * tmp[row + x] + tmp[dn + x]) * 0.25
+      }
+    }
+  }
+}
+
 /** Sobel a height field into a tangent-space normal map. */
 function heightToNormalTexture(height: Float32Array, size: number, strength: number, aniso: number): THREE.DataTexture {
   const data = new Uint8Array(size * size * 4)
@@ -587,7 +630,10 @@ export class WeaponMaterials {
         const u = x / S
         const v = y / S
         // Anisotropic grain: stretched along U to read as machining direction.
-        const grain = noise.fbm(u * 0.35, v * 3.0, 3, 3)
+        // Two octaves, not three: the v*3 scaling means octave three lands at
+        // 384 noise cells across 256 texels, which is finer than the texture
+        // can store, never mind resolve.
+        const grain = noise.fbm(u * 0.35, v * 3.0, 3, 2)
         // Pitting is rare and shallow. A high exponent with a small amplitude
         // keeps it as occasional casting pits; anything stronger reads as
         // sandpaper once the receiver is 40cm from the eye.
@@ -613,7 +659,14 @@ export class WeaponMaterials {
     }
     scratch(90, 26, -0.40, 0.05)
     scratch(30, 60, -0.22, 0.02)
-    this.metalNormal = heightToNormalTexture(mh, S, 0.16, anisotropy)
+    // `scratch` draws one texel per step, so every tool mark on the weapon was
+    // a Nyquist-width groove. Band-limiting here fixes the normal map *and* the
+    // roughness map below, which derives its `polish` term from the same field:
+    // a one-texel groove was dropping rail roughness from 0.22 to 0.14 for a
+    // single texel at a time, and isolated near-mirror specks on a metal that
+    // reflects a coloured probe are exactly what "sparkle" means.
+    blurField(mh, S, 2)
+    this.metalNormal = heightToNormalTexture(mh, S, 0.30, anisotropy)
 
     const mr = new Uint8Array(S * S * 4)
     const ma = new Uint8Array(S * S * 4)
@@ -654,13 +707,20 @@ export class WeaponMaterials {
       for (let x = 0; x < S; x++) {
         const u = x / S
         const v = y / S
-        const cell = noise.sample(5, u, v)
-        const fine = noise.sample(6, u, v)
+        // Octave 6 is one noise cell per texel and octave 5 is two. A moulded
+        // stipple cell is about a millimetre across, which at this map's 15
+        // texels per millimetre is a four-texel cell -- octave 4. The finer
+        // levels were not adding stipple, they were adding noise, and on the
+        // stock (normalScale 0.80, 26mm from the eye at full ADS) that noise
+        // was being magnified rather than filtered.
+        const cell = noise.sample(4, u, v)
+        const fine = noise.sample(5, u, v)
         const broad = noise.fbm(u, v, 2, 3)
         ph[y * S + x] = Math.pow(cell, 1.6) * 0.9 + fine * 0.5 + broad * 0.25
       }
     }
-    this.polymerNormal = heightToNormalTexture(ph, S, 0.34, anisotropy)
+    blurField(ph, S, 2)
+    this.polymerNormal = heightToNormalTexture(ph, S, 0.58, anisotropy)
     const pr = new Uint8Array(S * S * 4)
     for (let y = 0; y < S; y++) {
       for (let x = 0; x < S; x++) {
@@ -682,11 +742,15 @@ export class WeaponMaterials {
     for (let y = 0; y < F; y++) {
       for (let x = 0; x < F; x++) {
         const weave = Math.sin(x * Math.PI * 0.5) * Math.sin(y * Math.PI * 0.5)
-        const fuzz = noise.fbm(x / F, y / F, 4, 2)
+        // Octaves 3-4, not 4-5: on a 128px map octave 5 is one cell per texel.
+        const fuzz = noise.fbm(x / F, y / F, 3, 2)
         fh[y * F + x] = weave * 0.5 + fuzz * 0.6
       }
     }
-    this.fabricNormal = heightToNormalTexture(fh, F, 0.5, anisotropy)
+    // One pass only. The weave itself has a four-texel period and is the whole
+    // point of the map, so it is left close to full amplitude.
+    blurField(fh, F, 1)
+    this.fabricNormal = heightToNormalTexture(fh, F, 0.70, anisotropy)
 
     // --- multicam-ish camo for the sleeve ---
     const C = 256
@@ -704,12 +768,19 @@ export class WeaponMaterials {
         const v = y / C
         const big = noise.fbm(u, v, 1, 3)
         const mid = noise.fbm(u * 1.0 + 0.31, v * 1.0 + 0.17, 2, 3)
-        const spot = noise.fbm(u + 0.61, v + 0.44, 4, 2)
+        // The spot layer is thresholded into a hard palette switch, so its
+        // octave sets the size of the smallest camo blob. At octaves 4-5 the
+        // smallest blob was one texel and the sleeve read as coloured
+        // salt-and-pepper rather than as a printed pattern -- the sharpen pass
+        // then amplified it and the aberration pass split it into red and cyan.
+        const spot = noise.fbm(u + 0.61, v + 0.44, 3, 2)
         let idx = big < 0.42 ? 2 : big < 0.55 ? 0 : big < 0.7 ? 1 : 3
         if (mid > 0.72) idx = 1
         if (spot > 0.84) idx = 4
         const p = palette[idx]
-        const grit = (noise.sample(6, u, v) - 0.5) * 0.06
+        // Grit is albedo, and albedo noise at one cell per texel is the one
+        // thing the sharpen pass cannot tell apart from real surface detail.
+        const grit = (noise.sample(5, u, v) - 0.5) * 0.05
         const i = (y * C + x) * 4
         cam[i] = Math.round(clamp01(p[0] + grit) * 255)
         cam[i + 1] = Math.round(clamp01(p[1] + grit) * 255)
@@ -725,10 +796,15 @@ export class WeaponMaterials {
       for (let x = 0; x < F; x++) {
         const u = x / F
         const v = y / F
-        gh[y * F + x] = Math.pow(noise.sample(4, u, v), 1.3) + noise.sample(6, u, v) * 0.35
+        // Octave 6 on a 128px map is 256 noise cells across 128 texels: the
+        // field was aliased before it was ever written to the texture, and at
+        // normalScale 0.6 on a glove that fills the lower third of an ADS frame
+        // that reads as glitter on the knuckles.
+        gh[y * F + x] = Math.pow(noise.sample(3, u, v), 1.3) + noise.sample(5, u, v) * 0.35
       }
     }
-    this.gloveNormal = heightToNormalTexture(gh, F, 0.6, anisotropy)
+    blurField(gh, F, 2)
+    this.gloveNormal = heightToNormalTexture(gh, F, 0.92, anisotropy)
 
     // --- reticle sprites ---
     this.dotTexture = this.makeDot(64)
@@ -2066,8 +2142,17 @@ function addRedDot(b: PartBuilder, root: THREE.Group, z: number, railTop: number
   // single sided and the eye looks straight through the optic body at whatever
   // is bolted underneath.
   b.tube('bore', r - 0.0016, r - 0.0016, 0.060, [0, axisY, z], { seg: 20, caps: false, uv: 30 })
-  b.tube('anodised', r + 0.0022, r + 0.0022, 0.008, [0, axisY, z - 0.027], { seg: 20, faceted: true, uv: 30, wear: 0.22 })
-  b.tube('anodised', r + 0.0026, r + 0.0026, 0.009, [0, axisY, z + 0.027], { seg: 20, faceted: true, uv: 30, wear: 0.22 })
+  // Objective and ocular flanges. `caps: false` is not cosmetic here: a capped
+  // cylinder puts a solid disc of the flange's full radius across the bore, and
+  // the rear one lands 7mm in front of the lens, dead on the sight line. Round
+  // 3 fixed a winding bug in `tri` that had been silently culling half of every
+  // authored fan; these two caps were among the faces it had been hiding, so
+  // fixing the winding sealed the optic shut. What an ADS capture then showed
+  // was a matte anodised plate with a floating dot on it -- the reticle sprite
+  // draws with `depthTest: false` and so survived -- which is what the blind
+  // judges scored as the ADS pose losing to a build whose sight was open.
+  b.tube('anodised', r + 0.0022, r + 0.0022, 0.008, [0, axisY, z - 0.027], { seg: 20, faceted: true, caps: false, uv: 30, wear: 0.22 })
+  b.tube('anodised', r + 0.0026, r + 0.0026, 0.009, [0, axisY, z + 0.027], { seg: 20, faceted: true, caps: false, uv: 30, wear: 0.22 })
   // Elevation turret and battery cap, knurled.
   b.tube('anodised', 0.0092, 0.0105, 0.012, [0, axisY + r + 0.005, z + 0.006], { axis: 'y', seg: 12, uv: 40, wear: 0.18 })
   b.tube('anodised', 0.0088, 0.0100, 0.011, [r + 0.004, axisY, z + 0.006], { axis: 'x', seg: 12, uv: 40, wear: 0.18 })
@@ -2094,7 +2179,12 @@ function addRedDot(b: PartBuilder, root: THREE.Group, z: number, railTop: number
 function addHoloSight(b: PartBuilder, z: number, railTop: number, axisY: number): { window: number } {
   const hw = 0.021
   const hh = 0.020
-  b.box('anodised', [0.040, axisY - railTop - 0.004, 0.072], [0, (railTop + axisY) * 0.5, z + 0.012], { c: 0.0025, uv: 34, wear: 0.28 })
+  // Mount block, stopped 1mm below the bottom of the glass. Sized from the
+  // optical axis it used to stand 18mm proud of the window sill and fill the
+  // lower 45% of the sight picture -- the same error `addRedDot` was corrected
+  // for a round earlier, and it was still here.
+  const mountTop = axisY - hh - 0.001
+  b.box('anodised', [0.040, mountTop - railTop, 0.072], [0, (railTop + mountTop) * 0.5, z + 0.012], { c: 0.0025, uv: 34, wear: 0.28 })
   // Hood: four members framing the glass.
   b.box('anodised', [0.006, hh * 2 + 0.010, 0.050], [hw + 0.003, axisY, z], { c: 0.0018, uv: 36, wear: 0.4 })
   b.box('anodised', [0.006, hh * 2 + 0.010, 0.050], [-hw - 0.003, axisY, z], { c: 0.0018, uv: 36, wear: 0.4 })
@@ -2113,9 +2203,12 @@ function addScope(b: PartBuilder, z: number, railTop: number, axisY: number): { 
   const rTube = 0.0155
   const rObj = 0.0285
   const rOcu = 0.0225
-  // Rings.
+  // Rings. Every collar on this scope is a sleeve around the tube, so all of
+  // them are capless — see the note in `addRedDot`. A capped collar is a solid
+  // disc across the bore, and five of them in series is what turned this scope
+  // into a rod with a reticle painted on the back of it.
   for (const rz of [z + 0.055, z - 0.055]) {
-    b.tube('anodised', rTube + 0.006, rTube + 0.006, 0.020, [0, axisY, rz], { seg: 16, faceted: true, uv: 34, wear: 0.35 })
+    b.tube('anodised', rTube + 0.006, rTube + 0.006, 0.020, [0, axisY, rz], { seg: 16, faceted: true, caps: false, uv: 34, wear: 0.35 })
     b.box('anodised', [0.030, axisY - railTop - rTube, 0.022], [0, (railTop + axisY - rTube) * 0.5, rz], { c: 0.002, uv: 34, wear: 0.3 })
     b.box('steel', [0.0075, 0.014, 0.020], [0.020, axisY - rTube * 0.6, rz], { c: 0.0015, uv: 40, wear: 0.6 })
   }
@@ -2123,16 +2216,16 @@ function addScope(b: PartBuilder, z: number, railTop: number, axisY: number): { 
   // Objective bell forward.
   b.tube('anodised', rObj, rTube, 0.045, [0, axisY, z - 0.172], { seg: 18, faceted: true, caps: false, uv: 30, wear: 0.1 })
   b.tube('anodised', rObj, rObj, 0.030, [0, axisY, z - 0.210], { seg: 18, faceted: true, caps: false, uv: 30, wear: 0.12 })
-  b.tube('anodised', rObj + 0.0025, rObj + 0.0025, 0.006, [0, axisY, z - 0.226], { seg: 18, faceted: true, uv: 30, wear: 0.6 })
+  b.tube('anodised', rObj + 0.0025, rObj + 0.0025, 0.006, [0, axisY, z - 0.226], { seg: 18, faceted: true, caps: false, uv: 30, wear: 0.6 })
   b.disc('glassFront', rObj - 0.004, [0, axisY, z - 0.228], { seg: 28 })
   // Ocular bell and rubber eyecup.
   b.tube('anodised', rTube, rOcu, 0.030, [0, axisY, z + 0.163], { seg: 18, faceted: true, caps: false, uv: 30, wear: 0.1 })
   b.tube('anodised', rOcu, rOcu, 0.028, [0, axisY, z + 0.192], { seg: 18, faceted: true, caps: false, uv: 30, wear: 0.15 })
-  b.tube('rubber', rOcu + 0.004, rOcu + 0.004, 0.016, [0, axisY, z + 0.212], { seg: 18, uv: 30, wear: 0.25 })
+  b.tube('rubber', rOcu + 0.004, rOcu + 0.004, 0.016, [0, axisY, z + 0.212], { seg: 18, caps: false, uv: 30, wear: 0.25 })
   b.disc('glass', rOcu - 0.004, [0, axisY, z + 0.204], { seg: 28 })
   b.ring('dark', rOcu - 0.006, rOcu - 0.0005, [0, axisY, z + 0.208], { seg: 28, uv: 20, wear: 0 })
   // Magnification ring with grip ribs.
-  b.tube('anodised', rTube + 0.004, rTube + 0.004, 0.022, [0, axisY, z + 0.130], { seg: 18, faceted: true, uv: 34, wear: 0.4 })
+  b.tube('anodised', rTube + 0.004, rTube + 0.004, 0.022, [0, axisY, z + 0.130], { seg: 18, faceted: true, caps: false, uv: 34, wear: 0.4 })
   for (let i = 0; i < 10; i++) {
     const a = (i / 10) * Math.PI * 2
     b.box('anodised', [0.0022, 0.0022, 0.020], [Math.sin(a) * (rTube + 0.005), axisY + Math.cos(a) * (rTube + 0.005), z + 0.130], {

@@ -111,6 +111,24 @@ export const FILMIC_GRADE: GradeSettings = {
   // field down faster than the toe lifts it. The white point is untouched —
   // shape(1.0) is 254.4 either way, because the toe meets the ramp with slope 1
   // and nothing above it moves.
+  //
+  // Round 6 left the toe exactly here and fixed the crush upstream instead. The
+  // pile-up the judges were reading was not the toe's compression, it was the
+  // ACES fit clipping everything below scene 0.0033 to display zero before the
+  // toe saw it — see GradeEffect's acesCurve. The toe was already lifting a
+  // scene-black pixel to sRGB 6.6; it was being handed a slab of identical
+  // zeroes to lift.
+  //
+  // Two things were established by simulation over the eight round-5 captures
+  // and are worth not re-deriving. First, the toe's floor and its compression
+  // width are the same knob: kneeLow bottoms out at knee/4, so widening the toe
+  // to raise the floor also widens the flattened region, and narrowing it to
+  // recover slope drops the floor. Second, and more important, the pctBelow8
+  // window of 1.5 to 10 cannot be satisfied on every pose at once by any global
+  // curve. Sunset's sub-8 population is 7.8 to 9.7 times the ADS pose's at every
+  // setting tried, and the window only spans a factor of 6.7. Whichever end is
+  // satisfied, the other misses. Closing that needs either per-pose grading or
+  // ambient light in the backlit half of the sunset pose — not a curve change.
   toeKnee: 0.13,
   shoulderKnee: 0.85,
   lift: [0.0, 0.0, 0.0],

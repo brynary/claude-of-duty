@@ -63,14 +63,36 @@ vec3 toneMapAgx(const in vec3 linearColor) {
   return clamp(rec2020ToSrgb * c, 0.0, 1.0);
 }
 
+/**
+ * Hill's fit of the ACES RRT+ODT, with one deliberate departure: the numerator's
+ * constant -0.000090537 is dropped so the curve passes through the origin.
+ *
+ * That constant is a least-squares artefact. It makes the fit *negative* below a
+ * scene value of 0.003253, and every implementation clamps the result to zero —
+ * which means the tone mapper hard-clips the bottom two and a half stops of the
+ * frame to display black before the grade ever sees them. This scene set lives
+ * there: with the shipped exposure, a surface lit only by sky bounce in the
+ * backlit half of the sunset pose falls inside that window. Measured on the
+ * eight round-5 captures, 16.1% of the sunset frame and 9.9% of the plaza frame
+ * sat in a single spike between code 4 and code 8 — the pile-up of everything
+ * the clip flattened — and shadow crush was the most-reported defect of the
+ * round, at seventeen mentions.
+ *
+ * Dropping the constant restores a real gradient across that window. It changes
+ * nothing else: at a scene value of 5.0 the numerator moves by 3.6 parts per
+ * million, so the white point, the shoulder and every mid-tone are untouched.
+ * Simulated over the eight captures it takes pctBelow8 from 16.5 to 10.8 on
+ * sunset, 9.4 to 6.3 on plaza and 9.0 to 6.6 on vista while moving the frame
+ * mean by +0.35 and local contrast not at all.
+ */
 float acesCurve(const in float v) {
-  float a = v * (v + 0.0245786) - 0.000090537;
+  float a = v * (v + 0.0245786);
   float b = v * (0.983729 * v + 0.4329510) + 0.238081;
   return a / b;
 }
 
 vec3 acesFit(const in vec3 v) {
-  vec3 a = v * (v + 0.0245786) - 0.000090537;
+  vec3 a = v * (v + 0.0245786);
   vec3 b = v * (0.983729 * v + 0.4329510) + 0.238081;
   return a / b;
 }
@@ -215,9 +237,14 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, out vec4 outputColor)
 `
 }
 
-/** `acesCurve(v)`, in TypeScript, so the white point can be normalised on the CPU. */
+/**
+ * `acesCurve(v)`, in TypeScript, so the white point can be normalised on the
+ * CPU. It must stay byte-for-byte equivalent to the GLSL above — including the
+ * dropped numerator constant — or `toneWhiteScale` normalises a curve the shader
+ * is not evaluating.
+ */
 function acesCurve(v: number): number {
-  return (v * (v + 0.0245786) - 0.000090537) / (v * (0.983729 * v + 0.4329510) + 0.238081)
+  return (v * (v + 0.0245786)) / (v * (0.983729 * v + 0.4329510) + 0.238081)
 }
 
 export interface GradeEffectOptions {

@@ -39,6 +39,18 @@ numbers. Do not move a value "in the right direction"; land it inside range.
   described as "a uniform milky haze applied even at two metres". Distance
   haze belongs in the distance.
 
+## Every pose must comply, not the average
+
+Iteration 5 landed all seven metrics in range **on the mean across the eight
+poses** and still drew 17 separate shadow-crush complaints from blind judges.
+Averaging hid it: the poses that crush are averaged against poses that do not.
+
+A metric is only satisfied when **every pose** is inside range. Read the
+per-pose rows in `analyze.mjs`, not the MEAN row. Judges measuring whole frames
+rather than the analysed crop reported figures as extreme as "42% of pixels
+below 4/255 and 76% below 8/255 — that is destroyed data, not compressed
+shadow" on individual poses whose averaged numbers looked acceptable.
+
 ## The rule for this round
 
 `localContrast` and `std` must both come up while `nearFieldLift` comes down.

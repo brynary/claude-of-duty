@@ -53,64 +53,97 @@ vec3 lensToLinear(const in vec3 c) {
   return mix(pow((v + 0.055) / 1.055, vec3(2.4)), v / 12.92, step(v, vec3(0.04045)));
 }
 
+float lensLuma(const in vec3 c) {
+  return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
 /**
- * Contrast-adaptive sharpening: a cross-shaped negative lobe, one texel out, on
- * the converged frame.
+ * Contrast-adaptive sharpening: a cross-shaped negative lobe, one texel out,
+ * measured on luma and applied as a single scalar correction to all three
+ * channels.
  *
- * This replaces a plain unsharp mask that was clamped to the exact min and max
- * of its own four neighbours. That clamp made it very nearly a no-op: measured
- * across the eight capture poses, turning it off entirely moved local contrast
- * by 0.0007 out of 0.017. It cost four texture fetches and bought nothing.
+ * ## Why it is driven from luma
  *
- * sharpenOvershoot reintroduces a *bounded* overshoot, as a fraction of the
- * local range, because zero overshoot is what made the old filter inert: an
- * edge that may never exceed its own neighbours can never actually gain
- * acutance. This, and not the amplitude term, is what stops the filter ringing:
- * a halo has to be both wide and bright, and the ring here can never leave the
- * one-texel lobe nor exceed a fixed fraction of what the neighbourhood already
- * spans.
+ * Run per channel — AMD's own formulation — the amplitude term, the
+ * neighbourhood range and the overshoot clamp are all computed independently for
+ * red, green and blue. Any pixel where the three channels disagree at the
+ * one-texel scale therefore has that disagreement *amplified*, and this frame
+ * set has plenty: the materials carry chroma in their fine detail, the lateral
+ * aberration above deliberately offsets the red and blue taps against the green
+ * one, and the accumulation pass leaves a little residual chroma on sub-pixel
+ * geometry. Round 5 shipped the per-channel form at a gain that reached 5x on
+ * silhouettes, and blind judges reported "high-frequency iridescent sparkle that
+ * looks like a broken specular or badly filtered normal map". Measured as the
+ * mean disagreement between the three channels' one-texel high-pass, the eight
+ * poses averaged 1.68 against 0.78 for round 4's gentler kernel.
  *
- * ## Why the amplitude term has a floor
+ * A scalar correction cannot manufacture that. Chroma rides through untouched
+ * and only luminance acutance is restored, which is what a sharpener is for.
+ * It is also cheaper: five dot products and scalar min/max/sqrt in place of
+ * three-wide ones.
  *
- * AMD's CAS scales the lobe by sqrt(min(mn, 2 - mx) / mx), which backs off as
- * the neighbourhood approaches either rail. In a mid-key frame that costs
- * nothing. This frame set is not mid-key: it averages sRGB 61 out of 255, and in
- * shadow the term collapses — a neighbourhood spanning 0.02 to 0.20 scores 0.32,
- * so it received barely a third of the configured lobe. Round 4 shipped local
- * contrast at 0.028 against a 0.030 floor with most of the frame sharpened at
- * that third.
+ * ## Why the amplitude term no longer has a real floor
  *
- * The floor keeps the term's shape while bounding how far it can retreat. It is
- * safe to do that here specifically because the overshoot clamp above is already
- * the guard against the excursion CAS's amplitude was protecting against, and it
- * is expressed relative to the local range rather than to the rails.
+ * amp = sqrt(min(mn, 2 - mx) / mx) collapses toward zero exactly where the
+ * neighbourhood spans a hard silhouette — a dark bar against sky scores about
+ * 0.15 — and that collapse is not a deficiency, it is the mechanism that keeps
+ * CAS off edges and on texture. Round 5 read it as under-sharpening and set the
+ * floor to 0.85, which forced 87% of the full lobe onto every silhouette in the
+ * frame. Combined with an overshoot of 0.62 of the local range, an antialiased
+ * edge pixel sitting midway between its neighbours was pushed past whichever
+ * rail it was nearer: the filter was *removing* antialiasing faster than the
+ * accumulation pass could produce it. Measured as pixels lying outside their own
+ * four-neighbour range by more than 8/255, round 5 ran 0.51-2.22% of the frame
+ * against round 2's 0.00-0.23%, and judges filed eight separate reports of
+ * "stair-stepped and chewed up" thin geometry.
  *
- * Note the pole: the kernel normalises by (1 + 4w), so it inverts at
- * w = -0.25. sharpenPeak() clamps short of that. Where the lobe is strongest the
- * clamp above is doing most of the work — which is the intended behaviour, not a
- * symptom: in a flat neighbourhood the local range is small, so the clamp holds
- * the excursion to a fraction of it however high the raw gain goes.
+ * 0.15 is a token floor: it lifts the deepest shadow off zero gain without
+ * arming the lobe on silhouettes. At the shipped peak the gain runs about 1.27x
+ * on a hard edge, 1.8x in textured shadow and 2.8x on lit texture — against
+ * round 5's 5.1x, 6.8x and 9.5x.
+ *
+ * Note the pole: the kernel normalises by (1 + 4w), so it inverts at w = -0.25.
+ * sharpenPeak() clamps short of that.
  */
 vec3 lensSharpen(const in vec3 e, const in vec3 b, const in vec3 d, const in vec3 f, const in vec3 h) {
-  vec3 mn = min(min(min(b, d), min(f, h)), e);
-  vec3 mx = max(max(max(b, d), max(f, h)), e);
-  vec3 amp = sqrt(clamp(min(mn, 2.0 - mx) / max(mx, 0.0001), 0.0, 1.0));
-  vec3 w = mix(vec3(sharpenFloor), vec3(1.0), amp) * sharpenPeak;
-  vec3 sharp = ((b + d + f + h) * w + e) / (1.0 + 4.0 * w);
-  vec3 slack = (mx - mn) * sharpenOvershoot;
-  return clamp(sharp, mn - slack, mx + slack);
+  float le = lensLuma(e);
+  float lb = lensLuma(b);
+  float ld = lensLuma(d);
+  float lf = lensLuma(f);
+  float lh = lensLuma(h);
+  float mn = min(min(min(lb, ld), min(lf, lh)), le);
+  float mx = max(max(max(lb, ld), max(lf, lh)), le);
+  float amp = sqrt(clamp(min(mn, 2.0 - mx) / max(mx, 0.0001), 0.0, 1.0));
+  float w = mix(sharpenFloor, 1.0, amp) * sharpenPeak;
+  float sharp = ((lb + ld + lf + lh) * w + le) / (1.0 + 4.0 * w);
+  float slack = (mx - mn) * sharpenOvershoot;
+  return max(e + (clamp(sharp, mn - slack, mx + slack) - le), vec3(0.0));
 }
 
 void mainImage(const in vec4 inputColor, const in vec2 uv, out vec4 outputColor) {
   vec2 centered = vec2((uv.x - 0.5) * aspect, uv.y - 0.5);
   float radius = length(centered) / (0.5 * sqrt(aspect * aspect + 1.0));
 
-  // Lateral aberration only: nothing in the middle of the frame, a pixel or so
-  // of red/blue split in the extreme corners. More than that stops reading as
-  // a lens and starts reading as a broken shader.
+  // Lateral aberration only: nothing in the middle of the frame, a fraction of
+  // a pixel of red/blue split in the extreme corners.
+  //
+  // "A pixel or so" was the intent and 0.001 was the number, but that is a
+  // *half*-split per channel measured in UV: at 1920x1080 it put red and blue
+  // 2.2 pixels apart in the corners. It survived two rounds because the frames
+  // it was tuned on were hazy enough that a 2-pixel split across a low-contrast
+  // edge produced almost no colour difference. Once the grade had real contrast
+  // the same setting drew five separate reports of "a red edge on one side and
+  // a cyan edge on the other" on every window bar and roofline, and the rubric
+  // lists rainbow fringing as an instant fail. See {@link LensEffectOptions} for
+  // the calibration.
   vec2 fringe = (uv - 0.5) * aberration * radius * radius * radius;
   vec3 color = vec3(lensFetch(uv + fringe).r, inputColor.g, lensFetch(uv - fringe).b);
 
+  // The centre tap has been split by the aberration and the four neighbours have
+  // not, so the two are very slightly inconsistent near the corners. That
+  // mismatch is only visible if the filter can amplify it: at the shipped
+  // aberration the disagreement is a third of a pixel, and the filter is now
+  // scalar, so it cannot turn a channel offset into a colour excursion at all.
   color = lensSharpen(
     color,
     lensFetch(uv + vec2(0.0, texelSize.y)),
@@ -151,6 +184,17 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, out vec4 outputColor)
 `
 
 export interface LensEffectOptions {
+  /**
+   * Half the lateral red/blue split at the frame corner, in UV, before the
+   * cubic radial falloff.
+   *
+   * The corner split in pixels is 2 * aberration * hypot(width / 2, height / 2),
+   * so at 1920x1080 the shipped 0.00028 is 0.62 px in the extreme corners and,
+   * through the cubic falloff, 0.04 px at half radius. Below one pixel
+   * everywhere is the whole of what "a lens, not a broken shader" means here:
+   * the corners soften very slightly and no edge anywhere in the frame gains a
+   * coloured side.
+   */
   aberration?: number
   vignetteDarkness?: number
   vignetteOffset?: number
@@ -159,10 +203,16 @@ export interface LensEffectOptions {
   sharpness?: number
   /**
    * Smallest fraction of the lobe the contrast-adaptive amplitude may leave in
-   * place. 0 is stock CAS; 1 removes the adaptation entirely.
+   * place. 0 is stock CAS; 1 removes the adaptation — and with it the edge
+   * protection that is the entire point of CAS. See {@link FRAGMENT_SHADER}.
    */
   sharpenFloor?: number
-  /** Permitted overshoot past the local neighbourhood, as a fraction of its range. */
+  /**
+   * Permitted excursion past the local neighbourhood, as a fraction of its
+   * range. This is the ceiling on ringing *and* on how far an antialiased edge
+   * pixel can be pushed toward a rail, so it is the setting that decides whether
+   * the filter preserves or destroys the accumulation pass's work.
+   */
   sharpenOvershoot?: number
 }
 
@@ -181,11 +231,13 @@ const SHARPEN_PEAK_LIMIT = -0.235
  * exactly zero — which makes the kernel `e / 1.0`, an exact identity, and lets
  * the quality tier switch sharpening off without a branch in the shader.
  *
- * Values above 1.0 are permitted and are past AMD's calibrated range on
- * purpose. That range assumes a natively rasterised frame; this one has been
- * box-filtered over a one-pixel jitter footprint by the accumulation pass before
- * the filter ever sees it, so what is being restored is acutance a supersampled
- * frame genuinely had. {@link SHARPEN_PEAK_LIMIT} is the real bound.
+ * Values above 1.0 are permitted but are past AMD's calibrated range, and round
+ * 5's 1.22 is where the aliasing, ringing and sparkle reports came from: at that
+ * setting the lobe reaches -0.230, the kernel divides by 0.078, and the raw gain
+ * on one-texel detail is 12.8x. Nothing survives that except whatever the
+ * overshoot clamp happens to allow, which turns the filter from a sharpener into
+ * a local posteriser. Stay at or below 1.0 unless there is a measurement saying
+ * otherwise. {@link SHARPEN_PEAK_LIMIT} is the hard bound.
  */
 function sharpenPeak(sharpness: number): number {
   if (sharpness <= 0) return 0
@@ -194,7 +246,7 @@ function sharpenPeak(sharpness: number): number {
 
 export class LensEffect extends Effect {
   constructor({
-    aberration = 0.001,
+    aberration = 0.00028,
     // A vignette that read as gentle over a lifted black floor reads as heavy
     // once the corners can actually reach black, so this comes down with it.
     // It is a pure luminance multiply and cannot tint anything: the red cast
@@ -203,9 +255,9 @@ export class LensEffect extends Effect {
     vignetteDarkness = 0.10,
     vignetteOffset = 0.44,
     grainAmount = 0.015,
-    sharpness = 1.22,
-    sharpenFloor = 0.85,
-    sharpenOvershoot = 0.62,
+    sharpness = 0.95,
+    sharpenFloor = 0.15,
+    sharpenOvershoot = 0.20,
   }: LensEffectOptions = {}) {
     const uniforms = new Map<string, THREE.Uniform>([
       ['aberration', new THREE.Uniform(aberration)],

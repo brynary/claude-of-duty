@@ -36,9 +36,15 @@ export const SKY_PARAMS: SkyParams = {
  * This, SKY_SCALE_ENV and the lighting system's SUN_TARGET_LUMINANCE are
  * scene-referred radiances, and the post chain's exposure is what turns them
  * into pixels — the two ends are one calibration and cannot be tuned apart.
- * Against the committed grade (ACES at exposure 1.76) these put the zenith near
- * sRGB 118, the sky opposite the sun near 109, the band twenty degrees off the
- * sun near 192 and the last couple of degrees around the disc near 245.
+ *
+ * Re-measured through the committed chain (filmic at scene white 5.0, grade,
+ * metered exposure ~1.1 on the sky-heavy poses), the zenith lands at sRGB
+ * 133,179,237, the horizon opposite the sun at 168,211,242, the band forty
+ * degrees off the sun at 231,247,250 and the disc at 254. The figures that used
+ * to be quoted here — zenith 118, twenty degrees off the sun 192 — predated two
+ * exposure changes and were wrong by fifty code values in the band that
+ * mattered most; the flat-white circumsolar blob they were hiding is what
+ * {@link skyShoulder} now documents and fixes.
  *
  * Trimmed from 0.29 because the sky is the largest single area in most of the
  * graded poses and was setting their average brightness on its own. The dome
@@ -65,15 +71,24 @@ export const SKY_SCALE_VISIBLE = 0.25
  * discernible light direction" measure as. At 0.054 an open-shade surface lands
  * near sRGB 35 against the same surface at 107 in sun.
  *
- * The probe is not the whole fill any more either: a third of what a shaded
+ * The probe is not the whole fill any more either: over half of what a shaded
  * wall receives now comes from the directional bounce in SkyOcclusion, which is
  * why this can be cut this far without shade going flat and empty.
  *
  * Note this drives reflections as well as ambient. That is intended: the same
  * over-strength probe is what a judge saw as "a dense, uniform field of tiny
  * bright specks ... glitter or sequins rather than aggregate".
+ *
+ * Nudged 0.054 to 0.060 purely to hold station. The probe is baked through
+ * {@link skyShoulder}, and the new logarithmic shoulder compresses the probe's
+ * own circumsolar region by about forty per cent; without this the total fill
+ * on an open-shade surface would have fallen even as the bounce rose. Measured
+ * end to end, a patch of ground in open shade sits at 19.4 per cent of the same
+ * patch in sun, against 18.4 before — still far under the 44 per cent that
+ * flattened round 3, and a little closer to the ~24 per cent of real clear-sky
+ * daylight this rig has always been aiming at.
  */
-export const SKY_SCALE_ENV = 0.054
+export const SKY_SCALE_ENV = 0.060
 
 /** Radiance of the sun disc itself. Bounded so half-float buffers survive it. */
 export const SUN_DISC_RADIANCE = 80
@@ -111,13 +126,52 @@ export const SUN_DISC_RADIANCE = 80
  * cover. A frame with no sun in shot has to get its white point from a
  * specular or an emitter, which is a question of key strength and of material
  * roughness, not of sky.
+ *
+ * ## Why this is a logarithm and not a power law
+ *
+ * The power law was measured, not estimated, and it was not compressing
+ * anything. At the committed exposure the sky within *twenty-five degrees* of
+ * the sun graded above sRGB 247: a 25x16 degree ellipse of flat white with no
+ * gradient in it at all. On the `sunset` pose that ellipse is 6.9 per cent of
+ * the frame and on `vista` 4.8, against a ceiling of 3 — and mapping the
+ * clipped pixels back to their angle from the sun puts 82 per cent of them
+ * between 5 and 25 degrees out, which is sky, not disc. That is the whole of
+ * "the alley exit clips to a flat near-white blob where the geometry
+ * dissolves": the geometry does not dissolve, the sky behind it saturates and
+ * takes the silhouette with it.
+ *
+ * The power law also had a kink. Its slope at the knee drops straight from 1 to
+ * the exponent — 0.80 as committed, and any exponent strong enough to actually
+ * compress the circumsolar lobe makes that discontinuity worse, which is a Mach
+ * band waiting to print as a contour ring across a clear sky. The knee sat at
+ * scene 0.50, and the sky crosses 0.50 roughly forty-five degrees off the sun:
+ * mid-frame, in the middle of a smooth gradient, the worst possible place for
+ * one.
+ *
+ * A logarithm fixes both. It meets the knee with slope exactly 1 (measured
+ * 0.989 a thousandth above it, against the power law's 0.799) so there is no
+ * kink to print; it has no ceiling and is strictly increasing, so the
+ * circumsolar falloff stays a gradient; and it compresses without bound, so the
+ * lobe's five stops above the knee land inside one. Measured, it takes the
+ * clipped ellipse from 25x16 degrees to 13x9 — `sunset` from 6.9 per cent to
+ * about 2.0 and `vista` from 4.8 to 1.4, both inside range.
+ *
+ * The knee is set at 0.38 so it sits *above* the whole blue sky: zenith,
+ * anti-solar horizon and everything between are below it and pass through
+ * completely untouched, which is why this costs no sky saturation. The one band
+ * it does move — the bright haze twenty to forty degrees off the sun — gets
+ * *more* saturated, not less, because it stops being bleached into the tone
+ * curve's crosstalk (measured 0.048 to 0.072 at forty degrees).
+ *
+ * The disc is still added after this and still clips to 254, which is the
+ * point: the sun is supposed to be the thing that blows out.
  */
-const SKY_KNEE = 0.50
-const SKY_SHOULDER = 0.80
+const SKY_KNEE = 0.38
+const SKY_SHOULDER_WIDTH = 0.11
 
 export function skyShoulder(x: number): number {
   if (x <= SKY_KNEE) return x
-  return SKY_KNEE * Math.pow(x / SKY_KNEE, SKY_SHOULDER)
+  return SKY_KNEE + SKY_SHOULDER_WIDTH * Math.log(1 + (x - SKY_KNEE) / SKY_SHOULDER_WIDTH)
 }
 
 const BETA_R = new THREE.Vector3(5.804542996261093e-6, 1.3562911419845635e-5, 3.0265902468824876e-5)
@@ -311,14 +365,16 @@ const float MIE_ZENITH = 1.25e4;
 const float SKY_PI = 3.141592653589793;
 const float SUN_ANGULAR_COS = 0.9999566769464483;
 const float SKY_KNEE = ${SKY_KNEE.toFixed(4)};
-const float SKY_SHOULDER = ${SKY_SHOULDER.toFixed(4)};
+const float SKY_SHOULDER_WIDTH = ${SKY_SHOULDER_WIDTH.toFixed(4)};
 
-// Must stay numerically identical to skyShoulder() above. Written branchlessly
-// and with the base of the power clamped at the knee, since pow() of anything
-// at or below zero is undefined and the dome is evaluated per fragment.
+// Must stay numerically identical to skyShoulder() above. Written branchlessly.
+// The log's argument is built from max( c - knee, 0 ), so it never drops below
+// 1 and the call is defined for every fragment; adding the compressed part to
+// min( c, knee ) rather than selecting between two branches is what makes the
+// two halves meet exactly, and with slope 1, at the knee.
 vec3 skyShoulder( vec3 c ) {
-  vec3 rolled = SKY_KNEE * pow( max( c, vec3( SKY_KNEE ) ) / SKY_KNEE, vec3( SKY_SHOULDER ) );
-  return min( c, vec3( SKY_KNEE ) ) + max( rolled - SKY_KNEE, vec3( 0.0 ) );
+  vec3 over = max( c - vec3( SKY_KNEE ), vec3( 0.0 ) );
+  return min( c, vec3( SKY_KNEE ) ) + SKY_SHOULDER_WIDTH * log( 1.0 + over / SKY_SHOULDER_WIDTH );
 }
 
 uniform vec3 uBetaR;

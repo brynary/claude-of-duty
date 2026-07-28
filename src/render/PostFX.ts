@@ -173,7 +173,6 @@ export class PostFxSystem implements System, PostFxService {
   private lens!: LensEffect
   private grade!: GradeEffect
   private accumulation!: AccumulationPass
-  private smaaPass!: EffectPass
 
   private normalsPass: DepthNormalsPass | null = null
   private ssao: SSAOEffect | null = null
@@ -284,25 +283,41 @@ export class PostFxSystem implements System, PostFxService {
     // materials were flatter and is not now that they carry real texel detail.
     // At 0.10 it accepts 1-9% (mean 5%), which is edges and not brickwork.
     smaa.edgeDetectionMaterial.edgeDetectionThreshold = 0.10
-    this.smaaPass = new EffectPass(camera, smaa)
-    this.composer.addPass(this.smaaPass)
+    // Unconditional, including while the accumulation pass is running. Round 5
+    // switched it off for captures on the reasoning that 25 jittered samples
+    // already resolve every edge better than SMAA's area tables can. The
+    // reasoning is sound and the frames still came back with eight separate
+    // reports of stair-stepped window bars, rail teeth and awning edges —
+    // because the sharpen downstream was undoing the resolve faster than the
+    // accumulation produced it, and because SMAA is the only thing in this chain
+    // that sees an edge as an edge rather than as five samples of a pixel.
+    // Correct edges are worth more than the acutance that switching it off was
+    // protecting; the threshold, not the on/off, is where that trade belongs.
+    this.composer.addPass(new EffectPass(camera, smaa))
 
     this.accumulation = new AccumulationPass()
     this.accumulation.enabled = false
     this.composer.addPass(this.accumulation)
 
     this.lens = new LensEffect({
-      aberration: config.chromaticAberration ? 0.001 : 0,
+      // 0.62 px of red/blue split in the extreme corners and effectively none
+      // over the central half of the frame. See `LensEffectOptions.aberration`
+      // for why the previous 0.001 measured 2.2 px and read as rainbow fringing
+      // on every bar and roofline.
+      aberration: config.chromaticAberration ? 0.00028 : 0,
       // Grain is added after the sharpen, so the sharpen does not amplify it.
       grainAmount: config.filmGrain ? 0.015 : 0,
       // Applied after the temporal accumulation, whose one-pixel jitter
-      // footprint is a box filter and costs a little acutance. 1.22 is past
-      // AMD's calibrated range on purpose — see `sharpenPeak` — and the floor
-      // is what stops the amplitude term giving up in shadow, which is where
-      // most of this frame set lives.
-      sharpness: config.sharpen ? 1.22 : 0,
-      sharpenFloor: 0.85,
-      sharpenOvershoot: 0.62,
+      // footprint is a box filter and costs a little acutance. That is all this
+      // is for. Round 5 ran it at 1.22 with the amplitude adaptation almost
+      // disabled and 0.62 of overshoot, which restored far more than the box
+      // filter ever removed and manufactured the aliasing, ringing and
+      // iridescent sparkle the judges then reported. These three numbers keep
+      // roughly round 4's gain on lit texture, a third of it on silhouettes,
+      // and a third of its permitted excursion.
+      sharpness: config.sharpen ? 0.95 : 0,
+      sharpenFloor: 0.15,
+      sharpenOvershoot: 0.20,
     })
     this.composer.addPass(new EffectPass(camera, this.lens))
 
@@ -468,16 +483,6 @@ export class PostFxSystem implements System, PostFxService {
     const accumulate = config.taa && frozen
 
     this.accumulation.enabled = accumulate
-    // Two anti-aliasers on the same frame, and one of them strictly better.
-    // Once the accumulation pass is running, the frame is being supersampled
-    // from two dozen sub-pixel offsets — every edge already resolves to more
-    // gradations than SMAA's area tables can express. Leaving SMAA in front of
-    // it does not improve a single edge; it only blends detail pixels toward
-    // their neighbours, twenty-odd times, before the average is taken.
-    //
-    // It stays on for live frames, where there is no accumulation and a
-    // shimmering image would be worse than a marginally softer one.
-    this.smaaPass.enabled = !accumulate
     if (!accumulate) {
       this.accumulation.reset()
       return

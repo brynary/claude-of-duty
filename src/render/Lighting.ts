@@ -54,15 +54,28 @@ const HEMISPHERE_INTENSITY = 0.055
 
 /**
  * Warm bounce standing in for the light a sunlit floor throws back into a room
- * the sun never reaches. Short range and unshadowed: it is fill, not a key.
+ * the sun never reaches. Unshadowed: it is fill, not a key.
  *
- * Raised in step with the cut to the sky probe. A room is lit by these far more
- * than by ambient, so leaving them alone while the ambient halved would have
- * taken the interiors down with the exteriors — and `interior` was one of only
- * two poses the previous round won.
+ * The intensity and the decay have to be read together, because what was wrong
+ * with the previous pair was the *shape*, not the level. At intensity 7 with the
+ * physical decay of 2, this light delivered 1.44 of irradiance to the floor
+ * directly beneath it against 1.04 from the sun on open ground — a bounce fill
+ * 39 per cent brighter than direct sunlight — and then fell to 5 per cent of
+ * sunlight four metres further out. A 27:1 falloff across one room reads as a
+ * lamp on a stand, which is precisely what the placement comment says it is
+ * trying not to look like, and it left the rest of the room dark anyway.
+ *
+ * The physical answer is that a decay of 2 is wrong here. Inverse square is the
+ * falloff of a point, and what this stands in for is a patch of sunlit floor
+ * several metres across; near an area source the falloff is far shallower.
+ * Decay 1.35 with the intensity re-solved to match keeps the same irradiance at
+ * six metres — the distance the old light was actually useful at — while
+ * halving the hot spot under it and delivering four times as much at ten. Same
+ * light in the room, spread over the room instead of pooled under one point.
  */
-const INTERIOR_FILL_INTENSITY = 7
-const INTERIOR_FILL_RANGE = 14
+const INTERIOR_FILL_INTENSITY = 1.9
+const INTERIOR_FILL_RANGE = 20
+const INTERIOR_FILL_DECAY = 1.35
 
 const POOL_SIZE: Record<string, number> = { low: 3, medium: 4, high: 5, ultra: 5 }
 /**
@@ -81,6 +94,18 @@ const INTERIOR_FILLS: Record<string, number> = { low: 0, medium: 4, high: 5, ult
  * black void. See `placeInteriorFills`.
  */
 const LIT_ROOM_FILL_SHARE = 0.4
+
+/**
+ * How far apart two placed fills must be, in metres.
+ *
+ * Tied to {@link INTERIOR_FILL_RANGE}, and it has to move with it: two fills
+ * closer together than about half their reach are lighting the same air twice
+ * while some other room gets nothing, and with only three slots reserved for
+ * unlit interiors that is an expensive mistake. The candidate list this draws
+ * from is already spaced by SkyOcclusion, more tightly than this — deliberately,
+ * so there is a surplus to choose from and the spread-out ones can be picked.
+ */
+const INTERIOR_FILL_SPACING = 10
 
 /**
  * Residual `FogExp2` density.
@@ -425,7 +450,10 @@ export class LightingSystem implements System, LightingService {
       const point = dark[i]
       let crowded = false
       for (let j = 0; j < slot; j++) {
-        if (this.interiorFills[j].position.distanceToSquared(point) < 36) crowded = true
+        if (
+          this.interiorFills[j].position.distanceToSquared(point)
+          < INTERIOR_FILL_SPACING * INTERIOR_FILL_SPACING
+        ) crowded = true
       }
       if (crowded) continue
       const fill = this.interiorFills[slot++]
@@ -448,8 +476,8 @@ export class LightingSystem implements System, LightingService {
 
   private buildInteriorFills(scene: THREE.Scene, count: number): void {
     for (let i = 0; i < count; i++) {
-      // Faked bounce off a sunlit floor patch: warm, short range, no shadow.
-      const light = new THREE.PointLight(0xffd9a8, 0, INTERIOR_FILL_RANGE, 2)
+      // Faked bounce off a sunlit floor patch: warm, soft falloff, no shadow.
+      const light = new THREE.PointLight(0xffd9a8, 0, INTERIOR_FILL_RANGE, INTERIOR_FILL_DECAY)
       light.color.copy(this.bounceTint)
       light.name = `interiorFill${i}`
       light.castShadow = false

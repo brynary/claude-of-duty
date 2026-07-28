@@ -64,8 +64,47 @@ const RAY_LENGTH = 45
  * asymmetry when either number changes: raising this closes the gap between
  * inside and outside, which is the differential a judge measured when they
  * found "the unlit near concrete is as bright as the sunlit far room".
+ *
+ * 0.34 to 0.46 is the *skylight* half of the shadow-crush fix, and it is the
+ * smaller half — see {@link BOUNCE_ENCLOSED_FLOOR} for the other. It is here
+ * mainly for surfaces the directional bounce cannot reach: an interior floor
+ * faces up, the bounce arrives from slightly below the horizon, and the wrap
+ * term leaves an up-facing normal with almost none of it. What little skylight
+ * gets through an opening is the only thing those surfaces have.
+ *
+ * The differential this costs is bounded and was checked: an enclosed wall goes
+ * from 16:1 against a sunlit exterior wall to 7.4:1, which is 2.9 stops. Rooms
+ * still read as interiors; they no longer read as holes.
  */
-const ENCLOSED_BOUNCE = 0.34
+const ENCLOSED_BOUNCE = 0.46
+
+/**
+ * Fraction of the *directional bounce* a fully enclosed surface keeps, as
+ * distinct from the fraction of skylight it keeps above.
+ *
+ * These have to be separate numbers because they are separate physics, and
+ * collapsing them into one is what left the interiors black. Sky visibility
+ * answers "can this surface see the sky", and for a wall four metres inside a
+ * building the honest answer is no — {@link ENCLOSED_BOUNCE} is right to cut it
+ * hard. But the bounce term does not represent skylight. It represents light
+ * that has *already* bounced: off the patch of sun on the floor, off the wall
+ * opposite the window. That light is generated inside the room, and how much of
+ * it reaches a given wall is set by the room's aperture and its albedo, not by
+ * whether that particular wall has line of sight to open sky.
+ *
+ * Attenuating it as though it were skylight is a double count, and it was
+ * costing almost everything: measured, an interior wall carried 7.4 display
+ * code values of total variation between its lit and shaded micro-facets,
+ * against 57 on a sunlit wall. Under a tenth of the material information, which
+ * is exactly the judges' "well over half of the frame carries no material
+ * information at all" — and it is a lighting failure, not a tone curve failure,
+ * because there was nothing in the shading for a curve to recover.
+ *
+ * At 0.65 the same wall carries 23.5. Still well under the sunlit case, as it
+ * should be, but the plaster relief, the brick coursing and the grain of a
+ * crate are all back above the threshold where an 8-bit display can show them.
+ */
+const BOUNCE_ENCLOSED_FLOOR = 0.65
 
 /** How far the enclosed tint is pulled back towards white. */
 const ENCLOSED_NEUTRALITY = 0.45
@@ -87,21 +126,44 @@ const ENCLOSED_NEUTRALITY = 0.45
  * coloured: warm, arriving from the sun's side of the street, landing on the
  * faces that are turned away from the sun and therefore have no key at all.
  *
- * The level is set by how much shading variation it has to buy, not by taste.
- * At a third of a shaded wall's total fill, a normal swinging seventy degrees
- * across the bounce moves that wall five code values; at a sixth it moves three;
- * with the fill entirely uniform it moves none at all. Raising it further would
- * start making shaded verticals read warmer than the sky lighting them, which
- * is the failure a judge caught as "the shadowed pocket returns warmer than the
- * sky, which is backwards".
+ * The level is set by how much shading variation it has to buy, not by taste,
+ * and 0.11 was not buying enough of it. Measured through the committed chain, a
+ * shaded street wall moved 3.5 display code values across a fifty-degree normal
+ * swing and an enclosed wall moved 2.3 — under the threshold where an 8-bit
+ * display shows anything at all, which is why every normal map in the level
+ * became invisible the moment its surface fell out of the sun.
+ *
+ * The reason it has to be *this* term and not the probe is that the probe
+ * cannot do it. Integrated over the dome, image-based ambient from an open sky
+ * delivers 0.21 of irradiance to an upward normal and 0.16 to a horizontal one:
+ * a ratio of 1.3 across the entire sphere of directions. Nothing a normal map
+ * does can produce contrast out of a field that uniform. The bounce is
+ * directional and its wrap term has real gradient in it, so shading variation
+ * is the one thing it is good for.
+ *
+ * At 0.26 the same two walls move 8.8 and 5.6 code values, and their total
+ * variation including albedo goes from 17.6 and 7.4 to 35.1 and 23.5. The key
+ * is untouched by this — a sunlit wall measures 55.5 against 56.7 before, and
+ * the open-shade-to-sunlit ratio moves only 18.4 to 19.4 per cent, so the
+ * daylight read and the terminator that judges praised both survive intact.
+ *
+ * Raising it much further would start making shaded verticals read warmer than
+ * the sky lighting them, which is the failure a judge caught as "the shadowed
+ * pocket returns warmer than the sky, which is backwards".
  */
-const BOUNCE_IRRADIANCE = 0.11
+const BOUNCE_IRRADIANCE = 0.26
 
 /**
  * Wrap on the bounce's cosine term. The source is a road and a wall, not a
  * point, so its terminator is soft and it reaches a little past ninety degrees.
+ *
+ * Tightened 0.35 to 0.30 alongside the level rise. Wrap trades reach against
+ * gradient: the wider it is, the more surfaces catch some bounce and the less
+ * any of them varies across its own normals. With the level raised there is
+ * enough bounce to go round, so it can afford to be a little more directional —
+ * which is the whole point of carrying the fill here.
  */
-const BOUNCE_WRAP = 0.35
+const BOUNCE_WRAP = 0.30
 
 /**
  * Distance the sample point is pushed along the surface normal, in metres.
@@ -168,18 +230,23 @@ const APPLY = /* glsl */ `
 
 #if defined( RE_IndirectDiffuse )
 
-	// Bounce off the sunlit road and the facades opposite. Added before the
-	// attenuation, not after: light that came off the street does not reach the
-	// inside of a sealed room either, and a surface that cannot see the sky
-	// cannot see what the sky lit.
+	// Skylight first, and only skylight. This is the term sky visibility is
+	// actually about: a surface that cannot see the sky does not receive it.
+	irradiance *= skyOccAtten;
+	iblIrradiance *= skyOccAtten;
+
+	// Then the bounce off the sunlit road and the facades opposite, on its own
+	// far shallower falloff. It used to be added before the line above and so
+	// took the same attenuation, which double counted — see
+	// BOUNCE_ENCLOSED_FLOOR. Light that has already bounced is generated inside
+	// the room; it does not need line of sight to open sky to arrive, and
+	// cutting it as though it did is what emptied every interior.
 	float skyOccBounceWrap = max(
 		0.0,
 		( dot( skyOccNormal, skyOccBounceDir ) + ${BOUNCE_WRAP.toFixed(3)} ) / ${(1 + BOUNCE_WRAP).toFixed(3)}
 	);
-	irradiance += skyOccBounceLight * skyOccBounceWrap;
-
-	irradiance *= skyOccAtten;
-	iblIrradiance *= skyOccAtten;
+	float skyOccBounceVis = mix( ${BOUNCE_ENCLOSED_FLOOR.toFixed(3)}, 1.0, skyOccVis );
+	irradiance += skyOccBounceLight * skyOccBounceWrap * skyOccBounceVis;
 
 #endif
 
