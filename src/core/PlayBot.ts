@@ -332,9 +332,23 @@ export class PlayBotSystem implements System {
     if (side > 0.35) this.frame.down.add('KeyD')
     else if (side < -0.35) this.frame.down.add('KeyA')
 
-    // Sprint when there is nothing to shoot and the path is long.
-    const engaged = this.target !== null
-    const sprinting = !engaged && dist > 6 && fwd > 0.5
+    // Sprint whenever the trigger is not down and there is ground to cover.
+    //
+    // This used to require `target === null`, which sounds reasonable and is
+    // far too strict: `chooseTarget` acquires any live enemy within 70m with
+    // line of sight and holds it until it dies or the line breaks, so on this
+    // map "no enemy anywhere" is almost never true. Measured, the bot held
+    // Shift for 0.00% of frames with enemies present and 17.5% with combat
+    // disabled entirely — every single refusal downstream was `!sprintHeld`.
+    // A real player sprints between bursts and while repositioning under fire;
+    // the honest condition is "not currently shooting", not "nothing to shoot".
+    //
+    // The distance gate was the other half. `dist` is to the *next* waypoint
+    // and the route advances at 1.6m, so on 8-11m legs a 6m threshold only
+    // held for the first few metres of each leg — which is why even the
+    // combat-free ceiling was 17.5% rather than most of the traverse.
+    const shooting = this.frame.mouse0 || this.frame.mouse1
+    const sprinting = !shooting && dist > 3 && fwd > 0.5
     if (sprinting) this.frame.down.add('ShiftLeft')
 
     // Slide into contact occasionally, the way a player closing on a fight
@@ -347,8 +361,10 @@ export class PlayBotSystem implements System {
       this.note('slide')
     }
 
-    // Take cover when hurt, if the profile is cautious enough.
-    if (engaged && player.health < 55 * this.skill.cautiousness * 2) {
+    // Take cover when hurt, if the profile is cautious enough. Still keyed on
+    // holding a target rather than on the trigger — crouching is about being
+    // under threat, not about currently shooting.
+    if (this.target !== null && player.health < 55 * this.skill.cautiousness * 2) {
       this.frame.down.add('ControlLeft')
     }
 
