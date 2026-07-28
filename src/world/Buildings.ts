@@ -809,6 +809,7 @@ export const EXTRA_FOOTPRINTS: { cx: number; cz: number; hw: number; hd: number;
   { cx: 19.75, cz: 16.25, hw: 4.25, hd: 5.75, yaw: 0 }, // market hall
   { cx: 9.35, cz: 29.5, hw: 0.35, hd: 5.8, yaw: 0 }, // alley compound wall
   { cx: 31, cz: 27.5, hw: 2.2, hd: 2.2, yaw: 0 }, // water tower legs
+  { cx: 7.15, cz: 34.7, hw: 2.4, hd: 1.5, yaw: 0 }, // alley gateway — keep the passage clear
 ]
 
 // ---------------------------------------------------------------------------
@@ -1111,6 +1112,117 @@ export function buildCompoundWalls(b: Builder, rng: Rand): void {
   }
 }
 
+/**
+ * A vaulted gateway closing the far end of the alley.
+ *
+ * The alley pose's leading lines used to run out into open sand and a blown-out
+ * sky: the strongest composition on the map resolved on nothing. This puts a
+ * 3 m deep masonry reveal on the vanishing point — dark inside, sunlit beyond —
+ * so the corridor terminates on a readable shape with a bright slot behind it
+ * for the parked truck to silhouette against. The route stays open.
+ */
+export function buildAlleyTerminus(b: Builder, rng: Rand, result: BuildResult): void {
+  const xL = 4.75
+  const xR = 9.55
+  const zc = 34.7
+  const depth = 3.0
+  const span = xR - xL
+  const cx = (xL + xR) / 2
+  const base = footprintBase(cx, zc, span, depth)
+  const H = 6.6
+  // Arch centred on the alley pose's sightline rather than on the gateway, so
+  // the piers are deliberately unequal and the mass reads as built, not placed.
+  const ax = 6.55
+  const r = 1.5
+  const ys = 2.45
+  const mat: MaterialName = 'stuccoTan'
+  const trim: MaterialName = 'stoneBlock'
+  b.push(cx, base, zc, 0)
+
+  const lp = ax - r - xL
+  const rp = xR - (ax + r)
+  // Piers run 0.35 m below the footprint base so no corner can lift off a
+  // sloping alley floor.
+  const pierH = ys + 0.45
+  b.solid(mat, lp, pierH, depth, xL + lp / 2 - cx, pierH / 2 - 0.35, 0, 0, 0.05)
+  b.solid(mat, rp, pierH, depth, xR - rp / 2 - cx, pierH / 2 - 0.35, 0, 0, 0.05)
+  b.box(trim, lp + 0.12, 0.26, depth + 0.1, xL + lp / 2 - cx, ys + 0.12, 0, 0, 0.03)
+  b.box(trim, rp + 0.12, 0.26, depth + 0.1, xR - rp / 2 - cx, ys + 0.12, 0, 0, 0.03)
+
+  // Barrel vault through the full 3 m depth: the reveal is the point.
+  const segs = 11
+  const segLen = (Math.PI * r) / segs
+  for (let i = 0; i < segs; i++) {
+    const a = (Math.PI * (i + 0.5)) / segs
+    b.geom(mat, chamferBox(segLen * 1.1, 0.42, depth, 0.02),
+      xform(ax - cx + Math.cos(a) * (r + 0.21), ys + Math.sin(a) * (r + 0.21), 0, 0, 0, a - Math.PI / 2))
+  }
+  // Spandrel fill stepped to the extrados, then the solid mass over the gate.
+  const R = r + 0.42
+  const steps = 7
+  for (let i = 0; i < steps; i++) {
+    const y0 = ys + (R * i) / steps
+    const y1 = ys + (R * (i + 1)) / steps
+    const hw = Math.sqrt(Math.max(0, R * R - (y1 - ys) * (y1 - ys)))
+    const l1 = ax - hw
+    if (l1 - xL > 0.02) b.solid(mat, l1 - xL, y1 - y0, depth, (xL + l1) / 2 - cx, (y0 + y1) / 2, 0, 0, 0.02)
+    const r0 = ax + hw
+    if (xR - r0 > 0.02) b.solid(mat, xR - r0, y1 - y0, depth, (r0 + xR) / 2 - cx, (y0 + y1) / 2, 0, 0, 0.02)
+  }
+  const yTop = ys + R
+  b.solid(mat, span, H - yTop, depth, 0, (yTop + H) / 2, 0, 0, 0.04)
+
+  // Voussoirs on the face the camera sees, so the arch head catches a rim.
+  const vous = 11
+  for (let i = 0; i < vous; i++) {
+    const a = Math.PI * ((i + 0.5) / vous)
+    b.geom(trim, plainBox(0.22, 0.34, 0.1),
+      xform(ax - cx + Math.cos(a) * (r + 0.12), ys + Math.sin(a) * (r + 0.12), -depth / 2 - 0.05, 0, 0, a - Math.PI / 2))
+  }
+  b.box(trim, 0.34, 0.34, 0.12, ax - r - 0.17 - cx, ys, -depth / 2 - 0.05, 0, 0.02)
+  b.box(trim, 0.34, 0.34, 0.12, ax + r + 0.17 - cx, ys, -depth / 2 - 0.05, 0, 0.02)
+
+  // Shuttered window over the gate, recessed 0.3 m into the mass.
+  const wy = yTop + 0.95
+  b.box('plasterDamaged', 1.1, 1.3, 0.1, ax - cx + 0.35, wy, -depth / 2 + 0.3, 0, 0.01)
+  b.box(trim, 1.4, 0.11, 0.5, ax - cx + 0.35, wy - 0.7, -depth / 2 + 0.1, 0, 0.03)
+  b.box(trim, 1.5, 0.16, 0.42, ax - cx + 0.35, wy + 0.73, -depth / 2 + 0.08, 0, 0.03)
+  for (let i = 0; i < 4; i++) {
+    b.geom('rebar', cylinderGeom(0.017, 0.017, 1.24, 5),
+      xform(ax - cx - 0.13 + i * 0.32, wy, -depth / 2 + 0.16))
+  }
+
+  // Coping, and a broken parapet so the roofline is not a ruled edge.
+  b.box(trim, span + 0.24, 0.16, depth + 0.28, 0, H + 0.08, 0, 0, 0.035)
+  let px = -span / 2 + 0.2
+  while (px < span / 2 - 0.2) {
+    const w = rng.range(0.5, 1.3)
+    if (rng.bool(0.72)) {
+      const ph = rng.range(0.35, 0.75)
+      b.solid(mat, Math.min(w, span / 2 - 0.2 - px), ph, depth * 0.42, px + w / 2, H + 0.16 + ph / 2, -depth * 0.2, 0, 0.03)
+    }
+    px += w + rng.range(0.08, 0.5)
+  }
+
+  // A bare bulb on a flex under the vault: the only light in a 3 m tunnel, and
+  // the thing that makes the far end read as a place rather than a hole.
+  b.geom('metalPainted', cylinderGeom(0.006, 0.006, 0.6, 4), xform(ax - cx, ys + r - 0.3, 0.2))
+  b.geom('glass', sphereGeom(0.06, 8, 6), xform(ax - cx, ys + r - 0.62, 0.2))
+  b.geom('metalPainted', cylinderGeom(0.022, 0.028, 0.07, 8), xform(ax - cx, ys + r - 0.55, 0.2))
+
+  // Damp and soot up the piers, and tyre rub where carts scrape the jambs.
+  for (const sx of [-1, 1]) {
+    b.geom('dirt', decalQuad(depth * 0.8, 2.0, 0.2, sx * 13),
+      xform(ax - cx + sx * (r - 0.02), 1.05, 0.1, sx > 0 ? -Math.PI / 2 : Math.PI / 2))
+  }
+  b.geom('dirt', decalQuad(span * 0.9, 1.1, 0.18, 41), xform(0, 0.5, -depth / 2 - 0.014))
+  b.geom('plasterDamaged', decalQuad(1.6, 1.9, 0.3, 7), xform(-span / 2 + 1.0, 3.4, -depth / 2 - 0.016))
+
+  b.pop()
+  result.indoor.push(new THREE.Box3().setFromCenterAndSize(
+    new THREE.Vector3(ax, base + 1.2, zc), new THREE.Vector3(r * 1.8, 2.4, depth)))
+}
+
 /** Landmark on the skyline south-east: a steel water tower on braced legs. */
 export function buildWaterTower(b: Builder, rng: Rand): void {
   const cx = 31
@@ -1220,9 +1332,23 @@ export function buildRoofClutter(b: Builder, decks: BuildResult['decks'], rng: R
           xform(x, 0.95, z, yaw, Math.PI * 0.62))
         b.plate('metalRusted', 0.42, 0.05, 0.42, x, 0.02, z, yaw)
       } else if (kind < 0.86) {
-        // Stacked crates and a tarp.
+        // A boarded crate: corner battens and real boards, so the roofline gets
+        // a broken silhouette instead of another plain cube.
         const h = rng.range(0.45, 0.9)
-        b.solid('woodCrate', 0.8, h, 0.7, x, h / 2, z, rng.range(0, 3.1), 0.03, 'wood')
+        b.push(x, 0, z, rng.range(0, 3.1))
+        b.box('woodCrate', 0.758, h - 0.006, 0.658, 0, h / 2, 0, 0, 0.014)
+        for (const sx of [-1, 1]) {
+          for (const sz of [-1, 1]) b.plate('woodCrate', 0.07, h, 0.07, sx * 0.365, h / 2, sz * 0.315)
+        }
+        const courses = Math.max(3, Math.round(h / 0.15))
+        const bh = (h - 0.009 * (courses - 1)) / courses
+        for (let k = 0; k < courses; k++) {
+          const yy = bh / 2 + k * (bh + 0.009)
+          for (const sz of [-1, 1]) b.plate('woodCrate', 0.66, bh, 0.021, 0, yy, sz * 0.3395)
+          for (const sx of [-1, 1]) b.plate('woodCrate', 0.021, bh, 0.56, sx * 0.3895, yy, 0)
+        }
+        b.collide(0.8, h, 0.7, 0, h / 2, 0, 0, 'wood')
+        b.pop()
       } else {
         // Aerial mast with guy wires.
         const h = rng.range(1.8, 3.4)

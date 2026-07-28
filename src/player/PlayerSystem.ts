@@ -272,9 +272,16 @@ export class PlayerSystem implements System, PlayerService {
 
   private takeDamage(ctx: GameContext, amount: number, from: THREE.Vector3): void {
     if (amount <= 0 || !this.alive) return
-    // Capture mode must never produce a death screen mid-pose.
-    const floor = this.posed ? 25 : 0
-    this.health = Math.max(floor, this.health - amount)
+    // A fixed capture pose is a beauty shot of the world, so the player is
+    // immune while one is active. Clamping to a low health floor instead left
+    // the player permanently under the low-health threshold, which drew a heavy
+    // red pulse over every captured frame — the effect being graded rather than
+    // the scene behind it.
+    if (this.posed) {
+      ctx.services.hud?.damageDirection(from)
+      return
+    }
+    this.health = Math.max(0, this.health - amount)
     this.lastDamageAt = ctx.elapsed
     this.damageFlash = Math.min(1, this.damageFlash + THREE.MathUtils.clamp(amount / 35, 0.12, 0.8))
 

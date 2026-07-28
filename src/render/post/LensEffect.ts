@@ -4,7 +4,7 @@ import { BlendFunction, Effect, EffectAttribute } from 'postprocessing'
 /**
  * Everything that happens between the sensor and the eye: lateral chromatic
  * aberration, a contrast-adaptive sharpen, film grain and the vignette — plus
- * the red damage pulse, which is really just a second, angrier vignette.
+ * the blood bleed, which is really just a second, angrier vignette.
  *
  * These are merged into one shader on purpose. Each is a couple of
  * instructions; run as separate passes they would cost four full-screen
@@ -23,7 +23,7 @@ uniform float grainAmount;
 uniform float grainTime;
 uniform float sharpenAmount;
 uniform float damageFlash;
-uniform vec3 damageColor;
+uniform vec3 damageTint;
 
 vec3 lensFetch(const in vec2 uv) {
   return texture2D(inputBuffer, uv).rgb;
@@ -62,15 +62,23 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, out vec4 outputColor)
   color = clamp(color + (color - blurred) * sharpenAmount, min(color, lo), max(color, hi));
 
   // Grain scales with darkness: shadows are where a sensor is actually noisy,
-  // and it leaves the highlights clean.
+  // and it leaves the highlights clean. Kept modest, because grain that was
+  // invisible against a lifted black floor is very visible against a real one.
   float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
   float grain = lensHash(uv * vec2(aspect * 940.0, 940.0) + grainTime) - 0.5;
-  color += grain * grainAmount * mix(1.4, 0.3, smoothstep(0.06, 0.6, luma));
+  color += grain * grainAmount * mix(1.25, 0.35, smoothstep(0.04, 0.55, luma));
 
   color *= 1.0 - vignetteDarkness * smoothstep(vignetteOffset, 1.0, radius);
 
-  float pulse = damageFlash * mix(0.22, 1.0, smoothstep(0.1, 0.95, radius));
-  color = mix(color, damageColor, clamp(pulse, 0.0, 1.0));
+  // Blood in the corners of the eye, not paint on the lens. Green and blue are
+  // pulled down and red is lifted in proportion to what is already there, so
+  // the frame keeps its structure and an unlit ceiling stays unlit — lerping
+  // toward a solid maroon turned dark corners into bright red slabs, which is
+  // what a sustained low-health pulse looked like. The centre 40% of the frame
+  // is untouched at any intensity.
+  float pulse = clamp(damageFlash, 0.0, 1.0) * smoothstep(0.36, 1.0, radius);
+  vec3 bled = color * damageTint + vec3(0.06, 0.0, 0.0) * luma;
+  color = mix(color, bled, pulse);
 
   outputColor = vec4(lensToLinear(color), inputColor.a);
 }
@@ -86,11 +94,13 @@ export interface LensEffectOptions {
 
 export class LensEffect extends Effect {
   constructor({
-    aberration = 0.0012,
-    vignetteDarkness = 0.28,
-    vignetteOffset = 0.45,
-    grainAmount = 0.024,
-    sharpenAmount = 0.25,
+    aberration = 0.001,
+    // A vignette that read as gentle over a lifted black floor reads as heavy
+    // once the corners can actually reach black, so this comes down with it.
+    vignetteDarkness = 0.16,
+    vignetteOffset = 0.4,
+    grainAmount = 0.018,
+    sharpenAmount = 0.38,
   }: LensEffectOptions = {}) {
     const uniforms = new Map<string, THREE.Uniform>([
       ['aberration', new THREE.Uniform(aberration)],
@@ -100,7 +110,7 @@ export class LensEffect extends Effect {
       ['grainTime', new THREE.Uniform(0)],
       ['sharpenAmount', new THREE.Uniform(sharpenAmount)],
       ['damageFlash', new THREE.Uniform(0)],
-      ['damageColor', new THREE.Uniform(new THREE.Color(0.46, 0.03, 0.02))],
+      ['damageTint', new THREE.Uniform(new THREE.Vector3(1.0, 0.3, 0.24))],
     ])
 
     super('LensEffect', FRAGMENT_SHADER, {

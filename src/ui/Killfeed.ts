@@ -4,6 +4,11 @@ const HOLD = 5.0
 const FADE = 0.7
 const MAX_ROWS = 5
 
+/** Which side of the fight a name belongs to. */
+export type Side = 'you' | 'friendly' | 'enemy'
+
+const SIDE_CLASS: Record<Side, string> = { you: 'me', friendly: 'ally', enemy: 'foe' }
+
 interface Row {
   node: HTMLElement
   fx: Fx
@@ -14,6 +19,11 @@ interface Row {
  * Top-right kill log: `KILLER [weapon] VICTIM`, newest at the bottom, each
  * entry holding for five seconds before it fades. Weapon glyphs are inline
  * SVG silhouettes so they stay sharp at any resolution.
+ *
+ * Colour encodes **team**, never role: a given callsign is the same colour
+ * whether it appears as a killer or as a victim. Colouring by role is what
+ * produced the earlier frame where one operator was white in one row and red
+ * in the next.
  */
 export class Killfeed {
   private root: HTMLDivElement
@@ -28,18 +38,17 @@ export class Killfeed {
     victim: string,
     weapon: string,
     headshot: boolean,
-    playerIsKiller: boolean,
-    playerIsVictim: boolean,
+    killerSide: Side,
+    victimSide: Side,
     elapsed: number,
   ): void {
     const node = el('div', 'kf-row', this.root)
-    if (playerIsKiller) node.classList.add('mine')
-    if (playerIsVictim) node.classList.add('victim-me')
+    if (killerSide === 'you') node.classList.add('mine')
+    if (victimSide === 'you') node.classList.add('victim-me')
 
     const k = el('span', 'kf-name', node)
     k.textContent = killer.toUpperCase()
-    if (playerIsKiller) k.classList.add('me')
-    else if (playerIsVictim) k.classList.add('foe')
+    k.classList.add(SIDE_CLASS[killerSide])
 
     const icon = svgEl('svg', { class: 'kf-icon', viewBox: '0 0 48 17' }, node)
     pathOf(weaponGlyph(weapon), { fill: 'rgba(232,236,231,.86)' }, icon)
@@ -51,8 +60,7 @@ export class Killfeed {
 
     const v = el('span', 'kf-name', node)
     v.textContent = victim.toUpperCase()
-    if (playerIsVictim) v.classList.add('me')
-    else v.classList.add('foe')
+    v.classList.add(SIDE_CLASS[victimSide])
 
     this.rows.push({ node, fx: new Fx(node), born: elapsed })
     while (this.rows.length > MAX_ROWS) {

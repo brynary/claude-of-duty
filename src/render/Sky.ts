@@ -1,7 +1,7 @@
 import * as THREE from 'three'
 import {
   SKY_GLSL, SKY_PARAMS, SKY_SCALE_ENV, SKY_SCALE_VISIBLE, SUN_DISC_RADIANCE,
-  betaMie, betaRayleigh, skyColor, sunIntensity, type SkyParams,
+  betaMie, betaRayleigh, skyRadiance, sunIntensity, type SkyParams,
 } from './lighting/SkyModel'
 
 const DOME_RADIUS = 800
@@ -29,13 +29,21 @@ varying vec3 vDir;
 void main() {
   vec3 dir = normalize( vDir );
 
-  vec3 col = skyRadiance( dir ) * uScale;
+  // Shoulder before anything else, so the circumsolar lobe keeps a gradient
+  // instead of landing on flat white.
+  vec3 col = skyShoulder( skyRadiance( dir ) * uScale );
 
   // Below the horizon the dome becomes distant hazy ground. It keeps a memory
   // of the sky it replaces so the seam never reads as a hard line, and it gives
   // the environment map a warm bounce term that a sky-only probe would lack.
+  //
+  // uGroundColor arrives in the same pre-scale radiance units the model emits,
+  // so the ground half of the probe dims with the sky half. Held in visible
+  // units it was three times too bright at environment scale, which is what
+  // made every downward-facing surface — soffits above all — the warmest and
+  // brightest thing in a shot rather than the darkest.
   float below = 1.0 - smoothstep( -uHorizonFade, 0.0, dir.y );
-  col = mix( col, mix( col, uGroundColor, 0.82 ), below );
+  col = mix( col, mix( col, uGroundColor * uScale, 0.82 ), below );
 
   // Sun disc, limb darkened. Bounded radiance: an uncapped Preetham disc is
   // ~1e5 and overflows the half-float buffers the post chain runs on.
@@ -72,7 +80,7 @@ void main() {
   // Two lobes: a tight core that survives tone mapping as a hard disc, and a
   // wide circumsolar aureole that gives bloom and god rays something to grab.
   float core = pow( max( 0.0, 1.0 - d ), 6.0 );
-  float aureole = pow( max( 0.0, 1.0 - d ), 1.6 ) * 0.22;
+  float aureole = pow( max( 0.0, 1.0 - d ), 2.4 ) * 0.18;
   gl_FragColor = vec4( uColor * uIntensity * ( core + aureole ), 1.0 );
 
   #include <colorspace_fragment>
@@ -103,7 +111,7 @@ export class SkyDome {
   private readonly betaR = new THREE.Vector3()
   private readonly betaM = new THREE.Vector3()
   private readonly groundDir = new THREE.Vector3()
-  private readonly horizonSample = new THREE.Color()
+  private readonly horizonSample = new THREE.Vector3()
   private readonly groundColor = new THREE.Color()
 
   constructor() {
@@ -147,7 +155,9 @@ export class SkyDome {
     this.glowMaterial = new THREE.ShaderMaterial({
       uniforms: {
         uColor: { value: new THREE.Vector3(1, 0.9, 0.76) },
-        uIntensity: { value: 130 },
+        // Enough to clip the core to white and drive the god-ray pass, but not
+        // so much that the aureole swallows the buildings around it.
+        uIntensity: { value: 26 },
       },
       vertexShader: GLOW_VERTEX,
       fragmentShader: GLOW_FRAGMENT,
@@ -180,13 +190,19 @@ export class SkyDome {
 
     // Ground half: the horizon sky opposite the sun, dimmed and pushed warm, so
     // downward-facing surfaces pick up a plausible bounce from the environment.
+    // Kept in pre-scale radiance units — the shader multiplies by uScale — so
+    // the ground and the sky halves of the probe stay in the same ratio however
+    // the dome is scaled.
     this.groundDir.set(-sunDir.x, 0.03, -sunDir.z).normalize()
-    skyColor(this.groundDir, sunDir, this.params, SKY_SCALE_VISIBLE, this.horizonSample)
-    const bounce = Math.max(0.05, sunDir.y) * 0.5
+    skyRadiance(this.groundDir, sunDir, this.params, this.horizonSample)
+    // Ground albedo times the horizontal component of the beam: a dusty street
+    // reflects roughly a third of what lands on it, and the sun has to be up
+    // for anything to land at all.
+    const bounce = Math.max(0.05, sunDir.y) * 0.95
     this.groundColor.setRGB(
-      this.horizonSample.r * 0.30 + bounce * sunTint.r * 0.34,
-      this.horizonSample.g * 0.27 + bounce * sunTint.g * 0.29,
-      this.horizonSample.b * 0.24 + bounce * sunTint.b * 0.21,
+      this.horizonSample.x * 0.30 + bounce * sunTint.r,
+      this.horizonSample.y * 0.27 + bounce * sunTint.g * 0.85,
+      this.horizonSample.z * 0.24 + bounce * sunTint.b * 0.62,
       THREE.LinearSRGBColorSpace,
     )
     ;(u.uGroundColor.value as THREE.Vector3).set(this.groundColor.r, this.groundColor.g, this.groundColor.b)
@@ -199,8 +215,10 @@ export class SkyDome {
     this.sunSource.position.copy(cameraPosition).addScaledVector(sunDir, dist)
     // Billboard: face the camera, which is exactly the -sunDir axis.
     this.sunSource.lookAt(cameraPosition)
-    // 1.6 degrees across, a touch wider than the true disc so the aureole reads.
-    this.sunSource.scale.setScalar(dist * 0.055)
+    // A touch over two degrees across: wide enough that the aureole reads and
+    // the god-ray pass has something to occlude, tight enough that the disc
+    // still resolves as a disc.
+    this.sunSource.scale.setScalar(dist * 0.038)
   }
 
   /**

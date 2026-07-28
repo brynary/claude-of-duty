@@ -4,7 +4,7 @@ import type { MaterialService } from '../core/Types'
 import {
   Builder, InstanceFarm, TriSoup, cylinderGeom, normalizeGeom, plainBox, valueNoise,
 } from './Kit'
-import { groundHeight, zoneMaterialAt } from './Terrain'
+import { settleHeight, surfaceHeight, zoneMaterialAt } from './Terrain'
 import { insideAnyBuilding, xform } from './Buildings'
 
 /**
@@ -251,7 +251,9 @@ export function scatterFoliage(farm: InstanceFarm, rng: Rand, density: number): 
     const clump = valueNoise(x * 0.14, z * 0.14)
     p *= 0.35 + Math.max(0, clump) * 1.5
     if (!rng.bool(p)) continue
-    const y = groundHeight(x, z)
+    // Seated on the drawn surface, not the analytic field: over a bump the
+    // mesh sits several centimetres lower and a tuft hovers on its own shadow.
+    const y = surfaceHeight(x, z)
     const kind = mat === 'dirt' || mat === 'sand'
       ? rng.pick(['tuftA', 'tuftB', 'tuftDry', 'tuftDry'])
       : rng.pick(['weed', 'tuftB', 'weed'])
@@ -265,7 +267,7 @@ export function scatterFoliage(farm: InstanceFarm, rng: Rand, density: number): 
     const z = rng.range(-44, 44)
     if (insideAnyBuilding(x, z, 0.05)) continue
     if (!insideAnyBuilding(x, z, 0.95)) continue
-    const y = groundHeight(x, z)
+    const y = surfaceHeight(x, z)
     farm.place(rng.pick(['weed', 'tuftA', 'tuftDry']), x, y - 0.02, z, rng.range(0, Math.PI * 2), rng.range(0.8, 1.4))
   }
 }
@@ -292,7 +294,7 @@ const TREES: TreeSite[] = [
 export function buildTrees(b: Builder, farm: InstanceFarm, rng: Rand): void {
   for (let i = 0; i < TREES.length; i++) {
     const t = TREES[i]
-    const y = groundHeight(t.x, t.z)
+    const y = settleHeight(t.x, t.z, 0.9, 0.06)
     if (t.palm) {
       b.push(t.x, y - 0.1, t.z, rng.range(0, Math.PI * 2))
       const palm = palmGeom(i * 7.3 + 1, t.h)
@@ -308,7 +310,7 @@ export function buildTrees(b: Builder, farm: InstanceFarm, rng: Rand): void {
         b.box('stoneBlock', 0.5, 0.34, 0.24, t.x + Math.cos(a) * 0.85, y - 0.05, t.z + Math.sin(a) * 0.85, -a, 0.03)
       }
       for (let k = 0; k < 5; k++) {
-        farm.place('tuftDry', t.x + rng.spread(0.6), y, t.z + rng.spread(0.6), rng.range(0, 3.1), rng.range(0.8, 1.3))
+        farm.place('tuftDry', t.x + rng.spread(0.6), y + 0.04, t.z + rng.spread(0.6), rng.range(0, 3.1), rng.range(0.8, 1.3))
       }
     } else {
       b.push(t.x, y, t.z, rng.range(0, Math.PI * 2))

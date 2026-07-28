@@ -1,4 +1,4 @@
-import { Fx, easeOutCubic, el, pathOf, svgEl } from './Style'
+import { Fx, clamp, easeOutCubic, el, pathOf, svgEl } from './Style'
 
 export type HitKind = 'normal' | 'headshot' | 'kill'
 
@@ -114,11 +114,13 @@ export class Crosshair {
     this.ticks[2].set(-off, 0)
     this.ticks[3].set(off, 0)
 
-    // The reticle fades and contracts slightly as the optic takes over.
-    const fade = hidden ? 0 : Math.max(0, 1 - ads * 3.2)
+    // The reticle hands over to the optic, but only once the optic is actually
+    // near the eye. Fading it out in the first third of the blend left the
+    // screen centre completely unmarked for most of the raise.
+    const fade = hidden ? 0 : 1 - clamp((ads - 0.38) / 0.44, 0, 1)
     this.wrap.opacity(fade)
     this.wrap.visible(fade > 0.002)
-    this.dot.opacity(Math.max(0, 1 - ads * 5))
+    this.dot.opacity(1 - clamp((ads - 0.12) / 0.34, 0, 1))
 
     const age = elapsed - this.hitAt
     if (age >= 0 && age < HIT_LIFE) {

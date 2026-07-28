@@ -333,6 +333,33 @@ export function decalQuad(w: number, h: number, jitter = 0.12, seed = 1): THREE.
   return s.toGeometry()
 }
 
+/**
+ * Rotates and shifts a geometry's UVs in place.
+ *
+ * Instanced props share one geometry, so they also share one set of UVs: every
+ * copy of a crate shows the *same* knot in the same place, which is the single
+ * loudest tell that a prop was stamped out procedurally. Baking a different
+ * offset and grain direction into each variant geometry fixes it without
+ * needing a per-instance attribute the material system does not expose.
+ */
+export function shiftUv(g: THREE.BufferGeometry, du: number, dv: number, quarterTurns = 0): THREE.BufferGeometry {
+  const uv = g.getAttribute('uv') as THREE.BufferAttribute | undefined
+  if (!uv) return g
+  const t = ((quarterTurns % 4) + 4) % 4
+  for (let i = 0; i < uv.count; i++) {
+    let u = uv.getX(i)
+    let v = uv.getY(i)
+    for (let k = 0; k < t; k++) {
+      const nu = -v
+      v = u
+      u = nu
+    }
+    uv.setXY(i, u + du, v + dv)
+  }
+  uv.needsUpdate = true
+  return g
+}
+
 /** Strips any extra attributes and de-indexes so everything merges cleanly. */
 export function normalizeGeom(g: THREE.BufferGeometry): THREE.BufferGeometry {
   let out = g.index ? g.toNonIndexed() : g
@@ -577,17 +604,41 @@ interface InstanceKind {
  */
 export class InstanceFarm {
   private kinds = new Map<string, InstanceKind>()
+  private variants = new Map<string, string[]>()
 
   define(key: string, geom: THREE.BufferGeometry, mat: MaterialName, cast = true, receive = true): void {
     if (this.kinds.has(key)) return
     this.kinds.set(key, { geom: normalizeGeom(geom), mat, cast, receive, matrices: [] })
   }
 
+  /**
+   * Registers several interchangeable geometries under one logical key. Every
+   * `place` on that key deterministically picks a variant from the instance's
+   * world position, so a row of crates never repeats grain, proportion or wear
+   * while call sites stay unaware that variants exist.
+   */
+  defineVariants(key: string, geoms: THREE.BufferGeometry[], mat: MaterialName, cast = true, receive = true): void {
+    if (this.variants.has(key)) return
+    const keys: string[] = []
+    for (let i = 0; i < geoms.length; i++) {
+      const sub = `${key}#${i}`
+      this.define(sub, geoms[i], mat, cast, receive)
+      keys.push(sub)
+    }
+    this.variants.set(key, keys)
+  }
+
   has(key: string): boolean {
-    return this.kinds.has(key)
+    return this.kinds.has(key) || this.variants.has(key)
   }
 
   add(key: string, m: THREE.Matrix4): void {
+    const vs = this.variants.get(key)
+    if (vs) {
+      const e = m.elements
+      const h = hash2(e[12] * 1.37 + e[13] * 0.61, e[14] * 1.13 - e[12] * 0.29)
+      key = vs[Math.min(vs.length - 1, Math.floor(h * vs.length))]
+    }
     const k = this.kinds.get(key)
     if (k) k.matrices.push(m.clone())
   }

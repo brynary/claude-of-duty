@@ -30,13 +30,48 @@ export const SKY_PARAMS: SkyParams = {
   mieDirectionalG: 0.8,
 }
 
-/** What the camera sees. */
-export const SKY_SCALE_VISIBLE = 0.5
-/** What the environment map is generated at. */
-export const SKY_SCALE_ENV = 0.17
+/**
+ * What the camera sees.
+ *
+ * This, SKY_SCALE_ENV and the lighting system's SUN_TARGET_LUMINANCE are
+ * scene-referred radiances, and the post chain's exposure is what turns them
+ * into pixels — the two ends are one calibration and cannot be tuned apart.
+ * Against the committed grade (ACES at exposure 1.65) these put the zenith near
+ * sRGB 165, the horizon near 230 and the band around the sun near 250 without
+ * ever reaching 255, and a sunlit mid-albedo wall at 211 against the same wall
+ * in shade at 65.
+ */
+export const SKY_SCALE_VISIBLE = 0.29
+/**
+ * What the environment map is generated at. Lower than the visible scale
+ * because Preetham has no absolute calibration and pairing its raw radiance
+ * with a physically sized sun leaves shadows barely darker than lit ground.
+ */
+export const SKY_SCALE_ENV = 0.112
 
 /** Radiance of the sun disc itself. Bounded so half-float buffers survive it. */
-export const SUN_DISC_RADIANCE = 900
+export const SUN_DISC_RADIANCE = 80
+
+/**
+ * Preetham's circumsolar lobe is unbounded: the `Lin^1.5` term puts the sky ten
+ * degrees off the sun sixty times brighter than the zenith, which no tone curve
+ * can hold — it lands on flat 255 with the hue thrown away, and the gradient
+ * that makes a sky read as a sky goes with it. A photographic sky is more like
+ * ten to one.
+ *
+ * So the dome gets a shoulder: exact below the knee, asymptotic to a hard
+ * ceiling above it. Applied identically on the CPU and the GPU, always after
+ * the scale, and always before the sun disc is added — the disc is *supposed*
+ * to clip.
+ */
+const SKY_KNEE = 0.42
+const SKY_CEILING = 1.30
+
+export function skyShoulder(x: number): number {
+  if (x <= SKY_KNEE) return x
+  const span = SKY_CEILING - SKY_KNEE
+  return SKY_KNEE + span * (1 - Math.exp(-(x - SKY_KNEE) / span))
+}
 
 const BETA_R = new THREE.Vector3(5.804542996261093e-6, 1.3562911419845635e-5, 3.0265902468824876e-5)
 const MIE_CONST = new THREE.Vector3(1.8399918514433978e14, 2.7798023919660528e14, 4.0790479543861094e14)
@@ -145,7 +180,11 @@ export function skyRadiance(
 const _sample = new THREE.Vector3()
 const _dirTmp = new THREE.Vector3()
 
-/** Convenience wrapper writing straight into a linear-working-space Color. */
+/**
+ * Convenience wrapper writing straight into a linear-working-space Color.
+ * Shouldered, so every CPU-side query — fog colour, ambient tint — agrees with
+ * the pixel the dome shader would have produced for the same direction.
+ */
 export function skyColor(
   dir: THREE.Vector3,
   sunDir: THREE.Vector3,
@@ -154,7 +193,12 @@ export function skyColor(
   out: THREE.Color,
 ): THREE.Color {
   skyRadiance(dir, sunDir, params, _sample)
-  return out.setRGB(_sample.x * scale, _sample.y * scale, _sample.z * scale, THREE.LinearSRGBColorSpace)
+  return out.setRGB(
+    skyShoulder(_sample.x * scale),
+    skyShoulder(_sample.y * scale),
+    skyShoulder(_sample.z * scale),
+    THREE.LinearSRGBColorSpace,
+  )
 }
 
 /**
@@ -219,6 +263,15 @@ const float RAYLEIGH_ZENITH = 8.4e3;
 const float MIE_ZENITH = 1.25e4;
 const float SKY_PI = 3.141592653589793;
 const float SUN_ANGULAR_COS = 0.9999566769464483;
+const float SKY_KNEE = ${SKY_KNEE.toFixed(4)};
+const float SKY_CEILING = ${SKY_CEILING.toFixed(4)};
+
+// Must stay numerically identical to skyShoulder() above.
+vec3 skyShoulder( vec3 c ) {
+  const float span = SKY_CEILING - SKY_KNEE;
+  vec3 over = max( c - SKY_KNEE, vec3( 0.0 ) );
+  return min( c, vec3( SKY_KNEE ) ) + span * ( 1.0 - exp( -over / span ) );
+}
 
 uniform vec3 uBetaR;
 uniform vec3 uBetaM;

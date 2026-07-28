@@ -143,6 +143,27 @@ export function bilinearWrap(src: Field, w: number, h: number, x: number, y: num
   return a + (b - a) * ty
 }
 
+/**
+ * Bilinear resample of a tileable field, staying tileable.
+ *
+ * Weathering masks — soiling films, gravity runs, soot blooms — carry no
+ * detail above a few cycles per metre. Generating them at hero resolution
+ * costs sixteen times what generating them at a quarter of it costs and buys
+ * nothing a viewer can resolve, so they are built small and stretched here.
+ */
+export function resampleField(src: Field, sw: number, sh: number, dw: number, dh: number): Field {
+  if (sw === dw && sh === dh) return src
+  const out = field(dw, dh)
+  const kx = sw / dw
+  const ky = sh / dh
+  for (let y = 0; y < dh; y++) {
+    const sy = y * ky
+    const row = y * dw
+    for (let x = 0; x < dw; x++) out[row + x] = bilinearWrap(src, sw, sh, x * kx, sy)
+  }
+  return out
+}
+
 // --- Derived maps ---------------------------------------------------------
 
 /**

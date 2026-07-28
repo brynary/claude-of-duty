@@ -302,7 +302,24 @@ export function cylGeom(rTop: number, rBottom: number, height: number, o: CylOpt
   const slope = (rBottom - rTop) / Math.max(height, 1e-5)
   const wRim = 1
   const wMid = 0.04
-  const gradeAt = (t: number) => wMid + (wRim - wMid) * Math.pow(t, rimPower)
+
+  // Rim wear is a *band* near each end, not the whole wall. The side used to be
+  // a single quad whose four corners all sat on an end ring, so every cylinder
+  // in the arsenal — handguard, barrel, optic tube, buffer tube — came out at
+  // full edge wear and rendered as polished chrome. Splitting the wall into
+  // three axial bands lets the middle stay at the authored finish.
+  const rimW = Math.min(hy, Math.max(Math.max(rTop, rBottom) * 0.6, 0.0025))
+  const rings: number[] = [hy]
+  if (hy - rimW > -hy + rimW + 1e-4) rings.push(hy - rimW, -hy + rimW)
+  else if (hy > rimW * 0.5) rings.push(0)
+  rings.push(-hy)
+
+  const radiusAt = (y: number) => rBottom + (rTop - rBottom) * ((y + hy) / Math.max(height, 1e-5))
+  const wearAt = (y: number) => {
+    const fromEnd = hy - Math.abs(y)
+    const t = clamp01(1 - fromEnd / Math.max(rimW, 1e-5))
+    return wMid + (wRim - wMid) * Math.pow(t, 1 + rimPower * 0.14)
+  }
 
   for (let i = 0; i < seg; i++) {
     const t0 = thetaStart + (i / seg) * thetaLength
@@ -311,19 +328,27 @@ export function cylGeom(rTop: number, rBottom: number, height: number, o: CylOpt
     const s0 = Math.sin(t0)
     const c1 = Math.cos(t1)
     const s1 = Math.sin(t1)
-    p0.set(c0 * rTop, hy, s0 * rTop)
-    p1.set(c1 * rTop, hy, s1 * rTop)
-    p2.set(c1 * rBottom, -hy, s1 * rBottom)
-    p3.set(c0 * rBottom, -hy, s0 * rBottom)
-    if (o.faceted) {
-      const cm = Math.cos((t0 + t1) * 0.5)
-      const sm = Math.sin((t0 + t1) * 0.5)
-      n0.set(cm, slope, sm).normalize()
-      g.quadW(p0, p1, p2, p3, n0, n0, n0, n0, gradeAt(1), gradeAt(1), gradeAt(1), gradeAt(1))
-    } else {
-      n0.set(c0, slope, s0).normalize()
-      n1.set(c1, slope, s1).normalize()
-      g.quadW(p0, p1, p2, p3, n0, n1, n1, n0, gradeAt(1), gradeAt(1), gradeAt(1), gradeAt(1))
+    const cm = Math.cos((t0 + t1) * 0.5)
+    const sm = Math.sin((t0 + t1) * 0.5)
+    for (let k = 0; k < rings.length - 1; k++) {
+      const yA = rings[k]
+      const yB = rings[k + 1]
+      const rA = radiusAt(yA)
+      const rB = radiusAt(yB)
+      const wA = wearAt(yA)
+      const wB = wearAt(yB)
+      p0.set(c0 * rA, yA, s0 * rA)
+      p1.set(c1 * rA, yA, s1 * rA)
+      p2.set(c1 * rB, yB, s1 * rB)
+      p3.set(c0 * rB, yB, s0 * rB)
+      if (o.faceted) {
+        n0.set(cm, slope, sm).normalize()
+        g.quadW(p0, p1, p2, p3, n0, n0, n0, n0, wA, wA, wB, wB)
+      } else {
+        n0.set(c0, slope, s0).normalize()
+        n1.set(c1, slope, s1).normalize()
+        g.quadW(p0, p1, p2, p3, n0, n1, n1, n0, wA, wA, wB, wB)
+      }
     }
   }
 
@@ -361,6 +386,29 @@ export function cylGeom(rTop: number, rBottom: number, height: number, o: CylOpt
       p3.set(0, hy, 0)
       g.quad(p0, p1, p2, p3, _n, 0.3)
     }
+  }
+  return g.toGeometry()
+}
+
+/**
+ * Flat annulus facing +Z. Used as the bezel that frames an optic lens: the
+ * dark ring is what gives a sight window its edge vignette without a shader.
+ */
+export function ringGeom(rInner: number, rOuter: number, segments = 32): THREE.BufferGeometry {
+  const g = new GeomBuf()
+  const p0 = new THREE.Vector3()
+  const p1 = new THREE.Vector3()
+  const p2 = new THREE.Vector3()
+  const p3 = new THREE.Vector3()
+  const nz = new THREE.Vector3(0, 0, 1)
+  for (let i = 0; i < segments; i++) {
+    const t0 = (i / segments) * Math.PI * 2
+    const t1 = ((i + 1) / segments) * Math.PI * 2
+    p0.set(Math.cos(t0) * rInner, Math.sin(t0) * rInner, 0)
+    p1.set(Math.cos(t1) * rInner, Math.sin(t1) * rInner, 0)
+    p2.set(Math.cos(t1) * rOuter, Math.sin(t1) * rOuter, 0)
+    p3.set(Math.cos(t0) * rOuter, Math.sin(t0) * rOuter, 0)
+    g.quadW(p0, p1, p2, p3, nz, nz, nz, nz, 0.02, 0.02, 0.45, 0.45)
   }
   return g.toGeometry()
 }
@@ -433,8 +481,11 @@ export class WeaponMaterials {
         const v = y / S
         // Anisotropic grain: stretched along U to read as machining direction.
         const grain = noise.fbm(u * 0.35, v * 3.0, 3, 3)
-        const pits = Math.pow(noise.fbm(u, v, 4, 2), 5)
-        mh[y * S + x] = grain * 0.35 + pits * 1.2
+        // Pitting is rare and shallow. A high exponent with a small amplitude
+        // keeps it as occasional casting pits; anything stronger reads as
+        // sandpaper once the receiver is 40cm from the eye.
+        const pits = Math.pow(noise.fbm(u, v, 4, 2), 7)
+        mh[y * S + x] = grain * 0.30 + pits * 0.45
       }
     }
     const scratch = (count: number, len: number, depth: number, wob: number) => {
@@ -453,9 +504,9 @@ export class WeaponMaterials {
         }
       }
     }
-    scratch(90, 26, -0.55, 0.05)
-    scratch(30, 60, -0.3, 0.02)
-    this.metalNormal = heightToNormalTexture(mh, S, 0.28, anisotropy)
+    scratch(90, 26, -0.40, 0.05)
+    scratch(30, 60, -0.22, 0.02)
+    this.metalNormal = heightToNormalTexture(mh, S, 0.16, anisotropy)
 
     const mr = new Uint8Array(S * S * 4)
     const ma = new Uint8Array(S * S * 4)
@@ -469,17 +520,21 @@ export class WeaponMaterials {
         const h = mh[y * S + x]
         // Scratches polish: locally lower roughness where metal is exposed.
         const polish = clamp01(-h * 0.9)
-        let rough = 0.62 + (blotch - 0.5) * 0.34 + (fine - 0.5) * 0.12 - polish * 0.35
+        // Centred near 1.0 so the material's own roughness constant sets the
+        // finish and the map only breaks it up. Scratches polish locally.
+        let rough = 0.94 + (blotch - 0.5) * 0.22 + (fine - 0.5) * 0.10 - polish * 0.30
         rough = clamp01(rough)
         const rb = Math.round(rough * 255)
         mr[i] = rb; mr[i + 1] = rb; mr[i + 2] = rb; mr[i + 3] = 255
         // Albedo: soot/oil mottling plus brighter exposed metal in scratches.
-        const dirt = smoothstep(0.62, 0.86, blotch) * 0.25
-        const shine = polish * 0.5
-        const lum = clamp01(0.78 - dirt + shine + (fine - 0.5) * 0.1)
-        ma[i] = Math.round(lum * 252)
-        ma[i + 1] = Math.round(lum * 250)
-        ma[i + 2] = Math.round(lum * 255)
+        // Neutral-to-warm; any blue bias here shows up as a cold cast on a
+        // material whose entire response is specular.
+        const dirt = smoothstep(0.62, 0.86, blotch) * 0.20
+        const shine = polish * 0.34
+        const lum = clamp01(0.86 - dirt + shine + (fine - 0.5) * 0.08)
+        ma[i] = Math.round(lum * 255)
+        ma[i + 1] = Math.round(lum * 252)
+        ma[i + 2] = Math.round(lum * 246)
         ma[i + 3] = 255
       }
     }
@@ -498,7 +553,7 @@ export class WeaponMaterials {
         ph[y * S + x] = Math.pow(cell, 1.6) * 0.9 + fine * 0.5 + broad * 0.25
       }
     }
-    this.polymerNormal = heightToNormalTexture(ph, S, 0.55, anisotropy)
+    this.polymerNormal = heightToNormalTexture(ph, S, 0.34, anisotropy)
     const pr = new Uint8Array(S * S * 4)
     for (let y = 0; y < S; y++) {
       for (let x = 0; x < S; x++) {
@@ -506,8 +561,8 @@ export class WeaponMaterials {
         const u = x / S
         const v = y / S
         const sheen = noise.fbm(u, v, 2, 3)
-        const wearShine = Math.pow(clamp01(ph[y * S + x] - 0.85), 1.5) * 0.5
-        const rough = clamp01(0.74 + (sheen - 0.5) * 0.2 - wearShine)
+        const wearShine = Math.pow(clamp01(ph[y * S + x] - 0.85), 1.5) * 0.34
+        const rough = clamp01(0.96 + (sheen - 0.5) * 0.16 - wearShine)
         const rb = Math.round(rough * 255)
         pr[i] = rb; pr[i + 1] = rb; pr[i + 2] = rb; pr[i + 3] = 255
       }
@@ -697,92 +752,100 @@ export class WeaponMaterials {
     if (hit) return hit
     let mat: THREE.Material
     switch (key) {
+      // Metal colours below are specular F0, not diffuse albedo: at metalness
+      // ~0.9 the map value *is* the reflectance. A parkerised or anodised
+      // finish is a dull conversion coating, so F0 lands near 0.05-0.08 linear
+      // and roughness in the 0.55-0.75 band. Nothing on a service rifle is a
+      // mirror except a bare-worn edge.
       case 'gunmetal':
         mat = this.wearMaterial(key, {
-          color: 0x30322f, roughness: 0.52, metalness: 0.94,
-          wearColor: 0xc9ccd0, wearAlbedo: 0.75, wearRough: 0.19, wearMetal: 1,
-          envIntensity: 1.0, normalScale: 0.7,
+          color: 0x585b5a, roughness: 0.64, metalness: 0.88,
+          wearColor: 0x8b9096, wearAlbedo: 0.45, wearRough: 0.40, wearMetal: 1,
+          envIntensity: 0.55, normalScale: 0.35,
         }, { map: this.metalAlbedo, roughnessMap: this.metalRough, normalMap: this.metalNormal })
         break
       case 'anodised':
         mat = this.wearMaterial(key, {
-          color: 0x22252a, roughness: 0.46, metalness: 0.9,
-          wearColor: 0xb9bec6, wearAlbedo: 0.8, wearRough: 0.16, wearMetal: 1,
-          envIntensity: 1.05, normalScale: 0.55,
+          color: 0x4a4d50, roughness: 0.58, metalness: 0.86,
+          wearColor: 0x878c92, wearAlbedo: 0.42, wearRough: 0.36, wearMetal: 1,
+          envIntensity: 0.50, normalScale: 0.30,
         }, { map: this.metalAlbedo, roughnessMap: this.metalRough, normalMap: this.metalNormal })
         break
       case 'phosphate':
         mat = this.wearMaterial(key, {
-          color: 0x1b1d1f, roughness: 0.66, metalness: 0.85,
-          wearColor: 0x8f949a, wearAlbedo: 0.6, wearRough: 0.26, wearMetal: 1,
-          envIntensity: 0.85, normalScale: 0.85,
+          color: 0x3a3d3c, roughness: 0.75, metalness: 0.82,
+          wearColor: 0x74797e, wearAlbedo: 0.40, wearRough: 0.42, wearMetal: 1,
+          envIntensity: 0.42, normalScale: 0.45,
         }, { map: this.metalAlbedo, roughnessMap: this.metalRough, normalMap: this.metalNormal })
         break
       case 'steel':
         mat = this.wearMaterial(key, {
-          color: 0x8d949b, roughness: 0.3, metalness: 1,
-          wearColor: 0xd8dde2, wearAlbedo: 0.65, wearRough: 0.12, wearMetal: 1,
-          envIntensity: 1.25, normalScale: 0.45,
+          color: 0x9aa0a5, roughness: 0.40, metalness: 1,
+          wearColor: 0xc4cad0, wearAlbedo: 0.45, wearRough: 0.30, wearMetal: 1,
+          envIntensity: 0.80, normalScale: 0.25,
         }, { map: this.metalAlbedo, roughnessMap: this.metalRough, normalMap: this.metalNormal })
         break
       case 'dark':
         mat = this.wearMaterial(key, {
-          color: 0x0a0b0c, roughness: 0.78, metalness: 0.4,
-          wearColor: 0x6d7176, wearAlbedo: 0.35, wearRough: 0.4, wearMetal: 0.6,
-          envIntensity: 0.5, normalScale: 0.6,
+          color: 0x101112, roughness: 0.86, metalness: 0.25,
+          wearColor: 0x5c6065, wearAlbedo: 0.28, wearRough: 0.52, wearMetal: 0.5,
+          envIntensity: 0.25, normalScale: 0.45,
         }, { roughnessMap: this.metalRough, normalMap: this.metalNormal })
         break
       case 'polymer':
         mat = this.wearMaterial(key, {
-          color: 0x191b1c, roughness: 0.74, metalness: 0.03,
-          wearColor: 0x53575a, wearAlbedo: 0.45, wearRough: 0.42, wearMetal: 0.05,
-          envIntensity: 0.7, normalScale: 0.9,
+          color: 0x24262a, roughness: 0.70, metalness: 0.02,
+          wearColor: 0x4c5054, wearAlbedo: 0.35, wearRough: 0.50, wearMetal: 0.04,
+          envIntensity: 0.42, normalScale: 0.70,
         }, { roughnessMap: this.polymerRough, normalMap: this.polymerNormal })
         break
       case 'polymerTan':
         mat = this.wearMaterial(key, {
-          color: 0x6d5c42, roughness: 0.78, metalness: 0.02,
-          wearColor: 0x9c8b6d, wearAlbedo: 0.5, wearRough: 0.5, wearMetal: 0.05,
-          envIntensity: 0.65, normalScale: 0.9,
+          color: 0x5d5240, roughness: 0.76, metalness: 0.02,
+          wearColor: 0x8b7c60, wearAlbedo: 0.40, wearRough: 0.56, wearMetal: 0.04,
+          envIntensity: 0.40, normalScale: 0.70,
         }, { roughnessMap: this.polymerRough, normalMap: this.polymerNormal })
         break
       case 'rubber':
         mat = this.wearMaterial(key, {
-          color: 0x0f1011, roughness: 0.93, metalness: 0.0,
-          wearColor: 0x3a3c3e, wearAlbedo: 0.3, wearRough: 0.7, wearMetal: 0,
-          envIntensity: 0.35, normalScale: 1.15,
+          color: 0x1b1d1e, roughness: 0.94, metalness: 0.0,
+          wearColor: 0x3a3c3e, wearAlbedo: 0.25, wearRough: 0.80, wearMetal: 0,
+          envIntensity: 0.22, normalScale: 0.95,
         }, { roughnessMap: this.polymerRough, normalMap: this.polymerNormal })
         break
       case 'brass':
         mat = this.wearMaterial(key, {
-          color: 0xa8813a, roughness: 0.32, metalness: 1,
-          wearColor: 0xe2c07a, wearAlbedo: 0.6, wearRough: 0.16, wearMetal: 1,
-          envIntensity: 1.2, normalScale: 0.4,
+          color: 0xa8813a, roughness: 0.38, metalness: 1,
+          wearColor: 0xd8b878, wearAlbedo: 0.5, wearRough: 0.24, wearMetal: 1,
+          envIntensity: 0.70, normalScale: 0.35,
         }, { roughnessMap: this.metalRough, normalMap: this.metalNormal })
         break
       case 'glove':
         mat = this.wearMaterial(key, {
-          color: 0x24211e, roughness: 0.8, metalness: 0.0,
-          wearColor: 0x4a453f, wearAlbedo: 0.35, wearRough: 0.62, wearMetal: 0,
-          envIntensity: 0.45, normalScale: 1.0,
+          color: 0x282a2c, roughness: 0.82, metalness: 0.0,
+          wearColor: 0x4a453f, wearAlbedo: 0.30, wearRough: 0.66, wearMetal: 0,
+          envIntensity: 0.32, normalScale: 0.85,
         }, { roughnessMap: this.polymerRough, normalMap: this.gloveNormal })
         break
       case 'sleeve':
         mat = this.wearMaterial(key, {
-          color: 0xbfbfbf, roughness: 0.92, metalness: 0.0,
-          wearColor: 0x8a8574, wearAlbedo: 0.25, wearRough: 0.85, wearMetal: 0,
-          envIntensity: 0.4, normalScale: 0.8,
-        }, { map: this.camoAlbedo, normalMap: this.fabricNormal })
+          color: 0xb4b4b4, roughness: 0.94, metalness: 0.0,
+          wearColor: 0x8a8574, wearAlbedo: 0.22, wearRough: 0.88, wearMetal: 0,
+          envIntensity: 0.28, normalScale: 0.65,
+        }, { map: this.camoAlbedo, roughnessMap: this.polymerRough, normalMap: this.fabricNormal })
         break
       case 'glass':
       case 'glassFront': {
+        // Coated optic glass: almost clear, a faint cool coating tint and a
+        // controlled specular. The old 0.5-opacity pane was rendering as a
+        // grey disc that washed out everything behind the sight.
         const g = new THREE.MeshStandardMaterial({
-          color: key === 'glass' ? 0x121c2c : 0x0d1622,
-          roughness: 0.035,
-          metalness: 0.15,
+          color: key === 'glass' ? 0x2b3f5e : 0x22334d,
+          roughness: 0.02,
+          metalness: 0.0,
           transparent: true,
-          opacity: key === 'glass' ? 0.5 : 0.62,
-          envMapIntensity: 2.6,
+          opacity: key === 'glass' ? 0.10 : 0.16,
+          envMapIntensity: 0.9,
           depthWrite: false,
           side: THREE.DoubleSide,
         })
@@ -818,6 +881,14 @@ interface Chunk {
   wear: number
   uv: number
 }
+
+/**
+ * Global divisor on every part's texture repeat. UVs are authored as
+ * metres-times-repeat, and at the original density one 256px tile covered 4cm,
+ * which puts several texels inside a single pixel at viewmodel distance and
+ * reads as glitter. Halving it lands roughly one texel per pixel at 40cm.
+ */
+const UV_SCALE = 0.45
 
 export interface PartOpts {
   rot?: [number, number, number]
@@ -913,6 +984,11 @@ export class PartBuilder {
     this.addGeom(mat, g, this.compose(pos, o), o?.wear ?? 0, o?.uv ?? 24)
   }
 
+  ring(mat: WeaponMatKey, rInner: number, rOuter: number, pos: [number, number, number], o?: PartOpts): void {
+    const g = ringGeom(rInner, rOuter, o?.seg ?? 32)
+    this.addGeom(mat, g, this.compose(pos, o), o?.wear ?? 0, o?.uv ?? 24)
+  }
+
   /** Merges everything accumulated and attaches the meshes to their groups. */
   build(): void {
     for (const [target, byMat] of this.targets) {
@@ -954,8 +1030,8 @@ function mergeChunks(chunks: Chunk[]): THREE.BufferGeometry {
       nrm[(o + i) * 3] = _mv.x
       nrm[(o + i) * 3 + 1] = _mv.y
       nrm[(o + i) * 3 + 2] = _mv.z
-      uvs[(o + i) * 2] = u.getX(i) * c.uv
-      uvs[(o + i) * 2 + 1] = u.getY(i) * c.uv
+      uvs[(o + i) * 2] = u.getX(i) * c.uv * UV_SCALE
+      uvs[(o + i) * 2 + 1] = u.getY(i) * c.uv * UV_SCALE
       wear[o + i] = Math.min(1, w.getX(i) + c.wear)
     }
     o += p.count
@@ -1152,6 +1228,8 @@ interface HandOpts {
   /** 0 relaxed .. 1 fully closed. */
   curl?: number
   thumbOver?: boolean
+  /** Lays the index finger straight along the receiver, off the trigger. */
+  indexFinger?: boolean
 }
 
 function addHand(b: PartBuilder, o: HandOpts): void {
@@ -1170,38 +1248,44 @@ function addHand(b: PartBuilder, o: HandOpts): void {
 
   const m = new THREE.Matrix4()
 
-  // Palm: thicker across the knuckles, tapering toward the wrist.
+  // Palm: thicker across the knuckles, tapering toward the wrist. Sized to a
+  // real hand — 88mm across the knuckles, ~185mm wrist crease to fingertip.
   local(0, 0, 0, m)
-  b.addGeom('glove', chamferBox(0.031, 0.086, 0.060, 0.008), m, 0.12, 40)
-  local(-0.001, 0.028, -0.012, m)
-  b.addGeom('glove', chamferBox(0.030, 0.030, 0.040, 0.007), m, 0.3, 40)
+  b.addGeom('glove', chamferBox(0.033, 0.088, 0.064, 0.009), m, 0.10, 40)
+  local(-0.001, 0.029, -0.013, m)
+  b.addGeom('glove', chamferBox(0.032, 0.032, 0.042, 0.008), m, 0.22, 40)
   // Reinforced knuckle pad, the classic tactical-glove read.
-  local(-0.002, 0.032, -0.026, m)
-  b.addGeom('dark', chamferBox(0.028, 0.022, 0.016, 0.005), m, 0.45, 40)
+  local(-0.002, 0.033, -0.028, m)
+  b.addGeom('dark', chamferBox(0.030, 0.024, 0.017, 0.005), m, 0.30, 40)
   // Wrist cinch strap.
-  local(0, -0.042, 0.004, m)
-  b.addGeom('dark', chamferBox(0.034, 0.010, 0.056, 0.004), m, 0.35, 40)
+  local(0, -0.043, 0.004, m)
+  b.addGeom('dark', chamferBox(0.036, 0.011, 0.058, 0.004), m, 0.25, 40)
 
   // Four fingers wrapping around the front, curling about the grip axis.
-  const segLens = [0.030, 0.024, 0.019]
-  const widths = [0.0145, 0.0135, 0.0120]
+  const segLens = [0.033, 0.026, 0.021]
+  const widths = [0.0152, 0.0140, 0.0124]
   for (let f = 0; f < 4; f++) {
-    const fy = 0.031 - f * 0.0178
+    const fy = 0.032 - f * 0.0184
     const chain = new THREE.Matrix4()
-    local(-0.005, fy, -0.026, chain)
+    // Trigger discipline: the index finger lies straight along the receiver
+    // above the guard rather than curling into the trigger.
+    const indexed = o.indexFinger === true && f === 0
+    local(-0.005, fy, indexed ? -0.030 : -0.026, chain)
     // Splay along the grip so the fingers do not read as one slab.
-    chain.multiply(RX(0.07 - f * 0.05))
-    chain.multiply(RY(s * 0.55))
-    const bends = [0.78 * curl, 0.82 * curl, 0.62 * curl]
+    chain.multiply(RX(indexed ? 0.30 : 0.07 - f * 0.05))
+    chain.multiply(RY(s * (indexed ? 0.14 : 0.55)))
+    const bends = indexed
+      ? [0.12, 0.07, 0.05]
+      : [0.78 * curl, 0.82 * curl, 0.62 * curl]
     const taper = f === 3 ? 0.86 : f === 0 ? 0.95 : 1
     for (let k = 0; k < 3; k++) {
       chain.multiply(RY(s * bends[k]))
       const w = widths[k] * taper
       const seg = new THREE.Matrix4().copy(chain).multiply(T(0, 0, -segLens[k] * taper * 0.5))
-      b.addGeom('glove', chamferBox(w, w * 0.95, segLens[k] * taper, 0.0045), seg, 0.18 + k * 0.12, 55)
+      b.addGeom('glove', chamferBox(w, w * 0.95, segLens[k] * taper, 0.0045), seg, 0.14 + k * 0.10, 55)
       if (k < 2) {
         const kn = new THREE.Matrix4().copy(chain).multiply(T(s * w * 0.35, 0, -segLens[k] * taper))
-        b.addGeom('glove', chamferBox(w * 0.8, w * 0.8, 0.009, 0.003), kn, 0.55, 55)
+        b.addGeom('glove', chamferBox(w * 0.8, w * 0.8, 0.009, 0.003), kn, 0.40, 55)
       }
       chain.multiply(T(0, 0, -segLens[k] * taper))
     }
@@ -1230,9 +1314,15 @@ function addHand(b: PartBuilder, o: HandOpts): void {
   ], [
     w[0] + (e[0] - w[0]) * 0.26, w[1] + (e[1] - w[1]) * 0.26, w[2] + (e[2] - w[2]) * 0.26,
   ], 12, 0.3, 40)
-  tubeBetween(b, 'sleeve', 0.030, 0.050, [
+  // Overshoot the elbow so the sleeve runs out of frame rather than stopping in
+  // mid air at a visible cap. Keep the overshoot small: elbow directions point
+  // down and out, and anything that swings rearward lands on the near plane as
+  // a smeared blob.
+  tubeBetween(b, 'sleeve', 0.031, 0.056, [
     w[0] + (e[0] - w[0]) * 0.24, w[1] + (e[1] - w[1]) * 0.24, w[2] + (e[2] - w[2]) * 0.24,
-  ], e, 14, 0.05, 12)
+  ], [
+    w[0] + (e[0] - w[0]) * 1.15, w[1] + (e[1] - w[1]) * 1.15, w[2] + (e[2] - w[2]) * 1.15,
+  ], 14, 0.05, 12)
 }
 
 // ---------------------------------------------------------------------------
@@ -1278,20 +1368,23 @@ function addRedDot(b: PartBuilder, root: THREE.Group, z: number, railTop: number
   // QD throw lever on the left.
   b.box('steel', [0.008, 0.020, 0.030], [-0.017, railTop + 0.010, z + 0.004], { c: 0.0018, uv: 40, wear: 0.55 })
   // Main tube, faceted so it reads as machined rather than injection moulded.
-  b.tube('anodised', r, r, 0.062, [0, axisY, z], { seg: 16, faceted: true, caps: false, uv: 30, wear: 0.06 })
-  b.tube('anodised', r + 0.0022, r + 0.0022, 0.008, [0, axisY, z - 0.027], { seg: 16, faceted: true, uv: 30, wear: 0.5 })
-  b.tube('anodised', r + 0.0026, r + 0.0026, 0.009, [0, axisY, z + 0.027], { seg: 16, faceted: true, uv: 30, wear: 0.5 })
+  b.tube('anodised', r, r, 0.062, [0, axisY, z], { seg: 20, faceted: true, caps: false, uv: 30, wear: 0.05 })
+  b.tube('anodised', r + 0.0022, r + 0.0022, 0.008, [0, axisY, z - 0.027], { seg: 20, faceted: true, uv: 30, wear: 0.22 })
+  b.tube('anodised', r + 0.0026, r + 0.0026, 0.009, [0, axisY, z + 0.027], { seg: 20, faceted: true, uv: 30, wear: 0.22 })
   // Elevation turret and battery cap.
-  b.tube('anodised', 0.0092, 0.0105, 0.012, [0, axisY + r + 0.005, z + 0.006], { axis: 'y', seg: 12, uv: 40, wear: 0.4 })
-  b.tube('anodised', 0.0088, 0.0100, 0.011, [r + 0.004, axisY, z + 0.006], { axis: 'x', seg: 12, uv: 40, wear: 0.4 })
-  b.tube('anodised', 0.0115, 0.0115, 0.010, [-r - 0.004, axisY, z - 0.004], { axis: 'x', seg: 14, uv: 40, wear: 0.45 })
+  b.tube('anodised', 0.0092, 0.0105, 0.012, [0, axisY + r + 0.005, z + 0.006], { axis: 'y', seg: 12, uv: 40, wear: 0.18 })
+  b.tube('anodised', 0.0088, 0.0100, 0.011, [r + 0.004, axisY, z + 0.006], { axis: 'x', seg: 12, uv: 40, wear: 0.18 })
+  b.tube('anodised', 0.0115, 0.0115, 0.010, [-r - 0.004, axisY, z - 0.004], { axis: 'x', seg: 14, uv: 40, wear: 0.2 })
   // Brightness rocker.
-  b.box('dark', [0.006, 0.012, 0.016], [-r - 0.004, axisY - 0.012, z + 0.012], { c: 0.0012, uv: 40, wear: 0.3 })
-  // Killflash-free lenses: rear clear, front slightly deeper tint.
-  b.disc('glass', r - 0.0035, [0, axisY, z + 0.0245], { seg: 24 })
-  b.disc('glassFront', r - 0.0035, [0, axisY, z - 0.0245], { seg: 24 })
+  b.box('dark', [0.006, 0.012, 0.016], [-r - 0.004, axisY - 0.012, z + 0.012], { c: 0.0012, uv: 40, wear: 0.2 })
+  // Killflash-free lenses, recessed behind a matte bezel. The bezel is what
+  // gives the window a dark edge falloff instead of a hard-cut circle.
+  b.disc('glass', r - 0.0035, [0, axisY, z + 0.0245], { seg: 28 })
+  b.ring('dark', r - 0.0045, r - 0.0002, [0, axisY, z + 0.0295], { seg: 28, uv: 20, wear: 0 })
+  b.disc('glassFront', r - 0.0035, [0, axisY, z - 0.0245], { seg: 28 })
+  b.ring('dark', r - 0.0045, r - 0.0002, [0, axisY, z - 0.0295], { seg: 28, uv: 20, wear: 0, rot: [0, Math.PI, 0] })
   root.userData.opticZ = z
-  return { window: r - 0.0045 }
+  return { window: r - 0.0055 }
 }
 
 /** Holographic sight: squared hood with a wide rectangular window. */
@@ -1332,8 +1425,9 @@ function addScope(b: PartBuilder, z: number, railTop: number, axisY: number): { 
   // Ocular bell and rubber eyecup.
   b.tube('anodised', rTube, rOcu, 0.030, [0, axisY, z + 0.163], { seg: 18, faceted: true, caps: false, uv: 30, wear: 0.1 })
   b.tube('anodised', rOcu, rOcu, 0.028, [0, axisY, z + 0.192], { seg: 18, faceted: true, caps: false, uv: 30, wear: 0.15 })
-  b.tube('rubber', rOcu + 0.004, rOcu + 0.004, 0.016, [0, axisY, z + 0.212], { seg: 18, uv: 30, wear: 0.4 })
+  b.tube('rubber', rOcu + 0.004, rOcu + 0.004, 0.016, [0, axisY, z + 0.212], { seg: 18, uv: 30, wear: 0.25 })
   b.disc('glass', rOcu - 0.004, [0, axisY, z + 0.204], { seg: 28 })
+  b.ring('dark', rOcu - 0.006, rOcu - 0.0005, [0, axisY, z + 0.208], { seg: 28, uv: 20, wear: 0 })
   // Magnification ring with grip ribs.
   b.tube('anodised', rTube + 0.004, rTube + 0.004, 0.022, [0, axisY, z + 0.130], { seg: 18, faceted: true, uv: 34, wear: 0.4 })
   for (let i = 0; i < 10; i++) {
@@ -1504,7 +1598,9 @@ function buildRifle(mats: WeaponMaterials): WeaponModel {
   b.disc('dark', 0.0058, [0, 0, -0.5525], { seg: 16 })
 
   // --- stock ---------------------------------------------------------------
-  addCarbineStock(b, 0.100, 0.288, 0.004)
+  // Second-from-collapsed position: 79cm overall. A fully extended stock puts
+  // the buttpad through the near plane in any usable first person framing.
+  addCarbineStock(b, 0.100, 0.248, 0.004)
 
   // --- charging handle -----------------------------------------------------
   b.into(s.charging)
@@ -1520,19 +1616,20 @@ function buildRifle(mats: WeaponMaterials): WeaponModel {
   b.into(s.rh)
   addHand(b, {
     side: 1,
-    palm: [0.0315, -0.078, 0.050],
+    palm: [0.0325, -0.080, 0.048],
     rot: [-0.36, 0, 0.06],
-    wrist: [0.040, -0.126, 0.086],
-    elbow: [0.150, -0.320, 0.320],
+    wrist: [0.042, -0.128, 0.084],
+    elbow: [0.185, -0.430, 0.150],
     curl: 1,
+    indexFinger: true,
   })
   b.into(s.lh)
   addHand(b, {
     side: -1,
-    palm: [-0.0425, -0.006, -0.306],
+    palm: [-0.0435, -0.006, -0.300],
     rot: [-Math.PI / 2 + 0.12, 0, 0.1],
-    wrist: [-0.050, -0.030, -0.258],
-    elbow: [-0.185, -0.235, -0.060],
+    wrist: [-0.052, -0.032, -0.252],
+    elbow: [-0.200, -0.290, -0.040],
     curl: 0.92,
     thumbOver: true,
   })
@@ -1557,9 +1654,9 @@ function buildRifle(mats: WeaponMaterials): WeaponModel {
     windowRadius: optic.window,
     glassOffset: new THREE.Vector3(0, opticAxis, opticZ),
     reticleKind: 'dot',
-    reticleAngle: 0.012,
+    reticleAngle: 0.020,
     magDrop: buildMagDropMesh(mats, { slices: 7, width: 0.0265, depth: 0.046, sliceLen: 0.028, curve: 0.030 }),
-    overallLength: 0.845,
+    overallLength: 0.805,
   }
 }
 
@@ -1641,8 +1738,9 @@ function buildSmg(mats: WeaponMaterials): WeaponModel {
     palm: [0.0300, -0.080, 0.046],
     rot: [-0.30, 0, 0.06],
     wrist: [0.038, -0.124, 0.078],
-    elbow: [0.148, -0.310, 0.310],
+    elbow: [0.180, -0.420, 0.145],
     curl: 1,
+    indexFinger: true,
   })
   b.into(s.lh)
   addHand(b, {
@@ -1650,7 +1748,7 @@ function buildSmg(mats: WeaponMaterials): WeaponModel {
     palm: [-0.0295, -0.062, -0.214],
     rot: [-0.34, 0, -0.12],
     wrist: [-0.036, -0.104, -0.184],
-    elbow: [-0.170, -0.270, -0.030],
+    elbow: [-0.195, -0.320, -0.020],
     curl: 1,
   })
   b.into(root)
@@ -1674,7 +1772,7 @@ function buildSmg(mats: WeaponMaterials): WeaponModel {
     windowRadius: sight.window,
     glassOffset: new THREE.Vector3(0, sightAxis, sightZ),
     reticleKind: 'dot',
-    reticleAngle: 0.017,
+    reticleAngle: 0.024,
     magDrop: buildMagDropMesh(mats, { slices: 6, width: 0.024, depth: 0.038, sliceLen: 0.027, curve: 0.018 }),
     overallLength: 0.56,
   }
@@ -1766,8 +1864,9 @@ function buildSniper(mats: WeaponMaterials): WeaponModel {
     palm: [0.0325, -0.088, 0.070],
     rot: [-0.20, 0, 0.06],
     wrist: [0.042, -0.134, 0.104],
-    elbow: [0.152, -0.320, 0.330],
+    elbow: [0.185, -0.430, 0.165],
     curl: 1,
+    indexFinger: true,
   })
   b.into(s.lh)
   addHand(b, {
@@ -1775,7 +1874,7 @@ function buildSniper(mats: WeaponMaterials): WeaponModel {
     palm: [-0.0430, -0.010, -0.288],
     rot: [-Math.PI / 2 + 0.10, 0, 0.1],
     wrist: [-0.050, -0.034, -0.240],
-    elbow: [-0.185, -0.240, -0.050],
+    elbow: [-0.205, -0.300, -0.030],
     curl: 0.9,
     thumbOver: true,
   })
@@ -1879,8 +1978,9 @@ function buildPistol(mats: WeaponMaterials): WeaponModel {
     palm: [0.0295, -0.088, 0.058],
     rot: [-0.28, 0, 0.05],
     wrist: [0.038, -0.132, 0.090],
-    elbow: [0.140, -0.310, 0.300],
+    elbow: [0.170, -0.420, 0.150],
     curl: 1,
+    indexFinger: true,
   })
   b.into(s.lh)
   addHand(b, {
@@ -1888,7 +1988,7 @@ function buildPistol(mats: WeaponMaterials): WeaponModel {
     palm: [-0.0295, -0.086, 0.052],
     rot: [-0.28, 0, -0.05],
     wrist: [-0.040, -0.128, 0.086],
-    elbow: [-0.150, -0.300, 0.300],
+    elbow: [-0.180, -0.410, 0.150],
     curl: 0.75,
     thumbOver: true,
   })

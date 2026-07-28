@@ -6,8 +6,13 @@ const LOW = 0.25
 
 /**
  * Bottom-right ammunition block: magazine large, reserve small, weapon name,
- * fire mode and a row of magazine pips. The magazine size is inferred from the
- * largest count seen, so it works with whatever the weapon system loads.
+ * fire mode and a segmented bar showing what is left in the magazine. The
+ * magazine size is inferred from the largest count seen, so it works with
+ * whatever the weapon system loads.
+ *
+ * The bar reads the same value as the numeral on purpose — an empty gun shows
+ * an empty bar. An earlier version counted spare magazines there, which put a
+ * full seven-segment bar next to a `00` and made the readout unreadable.
  */
 export class AmmoPanel {
   readonly root: HTMLDivElement
@@ -79,8 +84,10 @@ export class AmmoPanel {
     this.resSlot.set(String(this.reserve))
     toggleClass(this.root, 'low', this.isLow)
 
-    const mags = Math.min(MAX_PIPS, Math.ceil(this.reserve / Math.max(1, this.magSize)))
-    for (let i = 0; i < MAX_PIPS; i++) toggleClass(this.pips[i], 'on', i < mags)
+    const fraction = this.mag / Math.max(1, this.magSize)
+    const lit = this.mag <= 0 ? 0 : Math.max(1, Math.min(MAX_PIPS, Math.round(fraction * MAX_PIPS)))
+    for (let i = 0; i < MAX_PIPS; i++) toggleClass(this.pips[i], 'on', i < lit)
+    toggleClass(this.root, 'dry', this.mag <= 0)
   }
 
   /** Subtle recoil punch on the counter each time a round leaves the gun. */

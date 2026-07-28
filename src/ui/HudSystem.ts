@@ -5,7 +5,7 @@ import { AmmoPanel } from './Ammo'
 import { Compass, type CompassMarker } from './Compass'
 import { Crosshair, type HitKind } from './Crosshair'
 import { BloodOverlay, DamageIndicators, MessageToast, Prompts, SprintArc, StatsOverlay } from './Indicators'
-import { Killfeed } from './Killfeed'
+import { Killfeed, type Side } from './Killfeed'
 import { Menus } from './Menus'
 import { Minimap, type Contact } from './Minimap'
 import { clamp, damp, el, installStyles, toggleClass } from './Style'
@@ -16,10 +16,17 @@ const MAX_CONTACTS = 16
 /** Two calls describing the same event within this window are one event. */
 const DEDUPE = 0.06
 
+/**
+ * Two disjoint callsign pools. The first six are the player's side, the last
+ * six the opposition, and `nameFor` only ever draws from the matching half —
+ * so a name is bound to a team for the whole match and the killfeed can colour
+ * by team without ever contradicting itself.
+ */
 const CALLSIGNS = [
-  'VOLK', 'HASSAN', 'ZAROV', 'MERAD', 'SOKOL', 'RASHID',
-  'BARIN', 'ORLOV', 'DUSHKA', 'KAMEN', 'TARIQ', 'NAZIR',
+  'MERAD', 'HASSAN', 'RASHID', 'KANE', 'ROSS', 'BRAVO',
+  'ZAROV', 'VOLK', 'ORLOV', 'SOKOL', 'DUSHKA', 'BARIN',
 ]
+const SIDE_POOL = 6
 const RANKS = ['PVT.', 'CPL.', 'SGT.', 'LT.']
 
 interface Blip {
@@ -181,13 +188,15 @@ export class HudSystem implements System, HudService {
         this.compass.setScore(`${pad2(this.kills)} / 12`)
         this.hitmarker('kill')
       }
+      const victimSide: Side = entity.team === 'player' ? 'friendly' : 'enemy'
+      const killerSide: Side = byPlayer ? 'you' : victimSide === 'enemy' ? 'friendly' : 'enemy'
       this.feed.add(
-        byPlayer ? 'YOU' : callsign(entity.id + 3),
-        entity.team === 'player' ? 'YOU' : callsign(entity.id),
+        byPlayer ? 'YOU' : nameFor(killerSide, entity.id + 3),
+        nameFor(victimSide, entity.id),
         weapon || this.weaponName,
         headshot,
-        byPlayer,
-        entity.team === 'player',
+        killerSide,
+        victimSide,
         this.ctx.elapsed,
       )
     }))
@@ -469,19 +478,19 @@ export class HudSystem implements System, HudService {
     this.kills = rng.int(4, 8)
     this.compass.setScore(`${pad2(this.kills)} / 12`)
     if (!this.ammoDriven) this.ammo.setAmmo(rng.int(14, 25), 120, 0)
+    // Draws are taken here, not inside the closures, so the seeded feed does
+    // not depend on the order `lateUpdate` happens to drain the queue.
     for (let i = 0; i < 3; i++) {
       const at = freeze - (3.4 - i * 1.35)
       const mine = i === 1
+      const killerSide: Side = mine ? 'you' : 'friendly'
+      const killer = mine ? 'YOU' : nameFor('friendly', rng.int(0, 40))
+      const victim = nameFor('enemy', rng.int(0, 40))
+      const headshot = rng.bool(0.35)
       this.pending.push({
         at,
         run: () => this.feed.add(
-          mine ? 'YOU' : callsign(rng.int(0, 40)),
-          callsign(rng.int(0, 40) + 7),
-          this.weaponName,
-          rng.bool(0.35),
-          mine,
-          false,
-          Math.max(0, at),
+          killer, victim, this.weaponName, headshot, killerSide, 'enemy', Math.max(0, at),
         ),
       })
     }
@@ -530,7 +539,9 @@ export class HudSystem implements System, HudService {
 
   killfeed(killer: string, victim: string, weapon: string, headshot: boolean): void {
     const mine = isPlayerName(killer)
-    this.feed.add(killer, victim, weapon, headshot, mine, isPlayerName(victim), this.ctx.elapsed)
+    const killerSide: Side = mine ? 'you' : isPlayerName(victim) ? 'enemy' : 'friendly'
+    const victimSide: Side = isPlayerName(victim) ? 'you' : 'enemy'
+    this.feed.add(killer, victim, weapon, headshot, killerSide, victimSide, this.ctx.elapsed)
     if (mine) {
       this.kills++
       this.compass.setScore(`${pad2(this.kills)} / 12`)
@@ -618,9 +629,11 @@ function isPlayerName(name: string): boolean {
   return n === 'you' || n === 'player' || n === 'operator'
 }
 
-function callsign(id: number): string {
-  const i = Math.abs(Math.round(id))
-  return `${RANKS[i % RANKS.length]} ${CALLSIGNS[i % CALLSIGNS.length]}`
+/** Picks a callsign from the half of the roster that belongs to `side`. */
+function nameFor(side: Side, id: number): string {
+  const i = Math.abs(Math.round(id)) % SIDE_POOL
+  const slot = side === 'enemy' ? SIDE_POOL + i : i
+  return `${RANKS[slot % RANKS.length]} ${CALLSIGNS[slot]}`
 }
 
 function pad2(v: number): string {

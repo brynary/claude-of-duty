@@ -3,10 +3,10 @@ import type { MaterialName } from '../render/MaterialNames'
 import type { Rand } from '../core/Rand'
 import {
   Builder, InstanceFarm, catenary, chamferBox, clothQuad, cylinderGeom, decalQuad,
-  normalizeGeom, plainBox, sphereGeom, valueNoise,
+  hash2, normalizeGeom, plainBox, shiftUv, sphereGeom, valueNoise,
 } from './Kit'
-import { groundHeight } from './Terrain'
-import { insideAnyBuilding, xform } from './Buildings'
+import { groundHeight, settleHeight, surfaceHeight } from './Terrain'
+import { footprintBase, insideAnyBuilding, xform } from './Buildings'
 
 /**
  * Props: the layer that turns architecture into a place someone lives in.
@@ -82,23 +82,80 @@ function at(g: THREE.BufferGeometry, m: THREE.Matrix4): THREE.BufferGeometry {
   return g.clone().applyMatrix4(m)
 }
 
-function crateGeom(w: number, h: number, d: number): THREE.BufferGeometry {
-  const parts = [chamferBox(w, h, d, 0.02)]
-  const t = 0.045
-  // Corner battens and a diagonal brace: reads as boards, not a cube. Detail
-  // members are plain boxes — a chamfer on a 5 cm batten is invisible.
+/**
+ * A boarded packing crate: corner battens with individually modelled boards
+ * between them.
+ *
+ * The earlier version was a single chamfered cube that leaned on plank lines
+ * painted into the wood texture, which reads as printed cardboard the moment
+ * the camera gets within a few metres. Every board here stands proud of the
+ * carcass by its own thickness, so the gaps self-shadow, the silhouette gains
+ * a saw-tooth edge and the corner battens catch a specular line.
+ */
+function crateGeom(w: number, h: number, d: number, seed = 0): THREE.BufferGeometry {
+  const bt = 0.021 // board thickness, and therefore the depth of every gap
+  const pw = Math.min(0.075, w * 0.14, d * 0.18) // corner batten
+  const parts: THREE.BufferGeometry[] = [chamferBox(w - bt * 2, h - 0.008, d - bt * 2, 0.014)]
+  // The battens are the crate's silhouette, so they get the chamfer: a sharp
+  // arris on the outermost edge is what makes a prop read as a grey box.
   for (const sx of [-1, 1]) {
     for (const sz of [-1, 1]) {
-      parts.push(at(plainBox(t * 2, h + 0.006, t * 2), xform(sx * (w / 2 - t), 0, sz * (d / 2 - t))))
+      parts.push(at(chamferBox(pw, h, pw, 0.007), xform((sx * (w - pw)) / 2, 0, (sz * (d - pw)) / 2)))
     }
   }
-  for (const sz of [-1, 1]) {
-    parts.push(at(plainBox(w + 0.008, t * 1.6, t * 1.6), xform(0, h / 2 - 0.06, sz * (d / 2 + 0.004))))
-    parts.push(at(plainBox(w + 0.008, t * 1.6, t * 1.6), xform(0, -h / 2 + 0.06, sz * (d / 2 + 0.004))))
-    const diag = Math.hypot(w - 0.1, h - 0.16)
-    parts.push(at(plainBox(diag, t * 1.3, t * 1.2),
-      xform(0, 0, sz * (d / 2 + 0.003), 0, 0, Math.atan2(h - 0.16, w - 0.1) * sz)))
+  // Boards run horizontally on all four sides and front-to-back on the lid.
+  const rows = Math.max(3, Math.round(h / 0.15))
+  const gap = 0.009
+  const bh = (h - gap * (rows - 1)) / rows
+  for (let i = 0; i < rows; i++) {
+    const y = -h / 2 + bh / 2 + i * (bh + gap)
+    for (const sz of [-1, 1]) {
+      const t = bt * (0.78 + 0.5 * hash2(seed + i * 3.7, sz))
+      parts.push(at(plainBox(w - pw * 2, bh, t), xform(0, y, sz * (d / 2 - t / 2))))
+    }
+    for (const sx of [-1, 1]) {
+      const t = bt * (0.78 + 0.5 * hash2(seed - i * 2.9, sx * 5))
+      parts.push(at(plainBox(t, bh, d - pw * 2), xform(sx * (w / 2 - t / 2), y, 0)))
+    }
   }
+  const lid = Math.max(3, Math.round(d / 0.17))
+  const lidW = (d - pw * 2 - gap * (lid - 1)) / lid
+  for (let i = 0; i < lid; i++) {
+    const z = -(d - pw * 2) / 2 + lidW / 2 + i * (lidW + gap)
+    const t = bt * (0.85 + 0.4 * hash2(seed * 1.7 + i, 9))
+    parts.push(at(plainBox(w - pw * 2, t, lidW), xform(0, h / 2 - t / 2, z)))
+  }
+  // Diagonal brace across the long faces, nailed over the boards.
+  const diag = Math.hypot(w - pw * 2, h - 0.1)
+  for (const sz of [-1, 1]) {
+    parts.push(at(chamferBox(diag, bt * 2.6, bt * 0.95, 0.005),
+      xform(0, 0, sz * (d / 2 + bt * 0.2), 0, 0, Math.atan2(h - 0.1, w - pw * 2) * sz)))
+  }
+  return merge(parts)
+}
+
+/** Three interchangeable crates: different board rhythm, grain and wear. */
+function crateVariants(w: number, h: number, d: number): THREE.BufferGeometry[] {
+  return [
+    crateGeom(w, h, d, 1),
+    shiftUv(crateGeom(w * 1.02, h * 0.96, d, 17), 0.37, 1.13, 1),
+    shiftUv(crateGeom(w * 0.97, h * 1.05, d * 1.03, 43), 1.71, 0.42, 2),
+  ]
+}
+
+/** Steel ammunition case: ribbed lid, latches and a folded carry handle. */
+function ammoBoxGeom(w: number, h: number, d: number): THREE.BufferGeometry {
+  const parts = [
+    at(chamferBox(w, h * 0.72, d, 0.012), xform(0, -h * 0.14, 0)),
+    at(chamferBox(w * 1.03, h * 0.3, d * 1.03, 0.012), xform(0, h * 0.32, 0)),
+  ]
+  for (const sx of [-1, 1]) {
+    parts.push(at(plainBox(0.05, 0.09, 0.03), xform(sx * w * 0.34, h * 0.12, d / 2 + 0.012)))
+  }
+  for (let i = 0; i < 3; i++) {
+    parts.push(at(plainBox(w * 0.9, 0.012, 0.02), xform(0, h * 0.45, -d * 0.28 + i * d * 0.28)))
+  }
+  parts.push(at(cylinderGeom(0.014, 0.014, w * 0.42, 5), xform(0, h * 0.5, 0, 0, 0, Math.PI / 2)))
   return merge(parts)
 }
 
@@ -134,8 +191,47 @@ function tyreGeom(r: number): THREE.BufferGeometry {
   return normalizeGeom(g)
 }
 
-function sandbagGeom(): THREE.BufferGeometry {
-  return chamferBox(0.52, 0.19, 0.3, 0.085)
+/**
+ * An angular broken fragment: a chamfered box pushed around by position noise,
+ * then flat-shaded. Real rubble is fractured concrete with facets and sharp
+ * arrises — the smooth ovoid boulders this replaces read as a bag of eggs.
+ */
+function fragmentGeom(w: number, h: number, d: number, seed: number, amount = 0.16): THREE.BufferGeometry {
+  const g = chamferBox(w, h, d, Math.min(w, h, d) * 0.13)
+  const pos = g.getAttribute('position') as THREE.BufferAttribute
+  const v = new THREE.Vector3()
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i)
+    const a = valueNoise(v.x * 4.3 + seed, v.z * 4.3 - seed) * amount
+    const b = valueNoise(v.y * 5.1 - seed, v.x * 3.1 + seed) * amount
+    pos.setXYZ(i, v.x * (1 + a), v.y * (1 + b), v.z * (1 + a * 0.6 + b * 0.5))
+  }
+  pos.needsUpdate = true
+  g.computeVertexNormals()
+  const uv: number[] = []
+  for (let i = 0; i < pos.count; i++) uv.push(pos.getX(i) + seed * 0.37, pos.getZ(i) - seed * 0.21)
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2))
+  return normalizeGeom(g)
+}
+
+/** A filled bag: slumped, wider at the base, with a tied neck at one end. */
+function sandbagGeom(seed: number): THREE.BufferGeometry {
+  const w = 0.52 * (0.93 + hash2(seed, 1) * 0.15)
+  const h = 0.19 * (0.88 + hash2(seed, 2) * 0.24)
+  const d = 0.3 * (0.92 + hash2(seed, 3) * 0.16)
+  const g = chamferBox(w, h, d, Math.min(w, h, d) * 0.44)
+  const pos = g.getAttribute('position') as THREE.BufferAttribute
+  const v = new THREE.Vector3()
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i)
+    // Slump: the bag spreads where it bears on what is under it.
+    const bulge = 1 + 0.11 * (0.5 - v.y / h)
+    const wob = 1 + valueNoise(v.x * 6.1 + seed, v.z * 6.1 - seed) * 0.05
+    pos.setXYZ(i, v.x * bulge * wob, v.y, v.z * bulge * wob)
+  }
+  pos.needsUpdate = true
+  g.computeVertexNormals()
+  return shiftUv(normalizeGeom(g), seed * 0.41, seed * 0.73, seed % 2)
 }
 
 function jerseyGeom(): THREE.BufferGeometry {
@@ -255,19 +351,87 @@ function rebarBundleGeom(): THREE.BufferGeometry {
   return merge(parts)
 }
 
+/** A sheet of litter — newsprint, a flyer, a torn cement bag. */
+function paperGeom(w: number, h: number, seed: number): THREE.BufferGeometry {
+  const r = (i: number) => hash2(seed * 1.7 + i, seed - i) - 0.5
+  const g = clothQuad(
+    new THREE.Vector3(-w / 2, 0.002 + r(1) * 0.01, -h / 2),
+    new THREE.Vector3(w / 2, 0.002 + r(2) * 0.012, -h / 2 + r(3) * 0.05),
+    new THREE.Vector3(w / 2 + r(4) * 0.04, 0.02 + r(5) * 0.02, h / 2),
+    new THREE.Vector3(-w / 2 + r(6) * 0.05, 0.002 + r(7) * 0.01, h / 2),
+    -0.012, 0.008, 3, 3, seed)
+  return normalizeGeom(g)
+}
+
+/** Crushed drink can, dented along its length. */
+function canGeom(): THREE.BufferGeometry {
+  const parts = [
+    at(cylinderGeom(0.032, 0.033, 0.085, 7), xform(0, 0.033, 0, 0, 0, Math.PI / 2)),
+    at(cylinderGeom(0.026, 0.032, 0.02, 7), xform(0.05, 0.032, 0, 0, 0, Math.PI / 2)),
+  ]
+  return merge(parts)
+}
+
+/** Loose boards dropped in a heap — cheap, and reads as a working street. */
+function boardPileGeom(seed: number): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = []
+  for (let i = 0; i < 7; i++) {
+    const r = (k: number) => hash2(seed + i * 5.1, k) - 0.5
+    parts.push(at(plainBox(1.5 + r(1) * 0.7, 0.032, 0.17 + r(2) * 0.06),
+      xform(r(3) * 0.22, 0.018 + i * 0.034, r(4) * 0.3, r(5) * 0.5, 0, r(6) * 0.06)))
+  }
+  return merge(parts)
+}
+
+/**
+ * Corrugated roofing sheet with real ribs. The flat 3 cm plate this replaces
+ * relied entirely on the material to suggest corrugation, which vanishes the
+ * moment the sheet is edge-on to the camera.
+ */
+function corrugatedSheetGeom(w: number, d: number): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = [plainBox(w, 0.012, d)]
+  const ribs = Math.max(4, Math.round(d / 0.11))
+  for (let i = 0; i < ribs; i++) {
+    const z = -d / 2 + (d / ribs) * (i + 0.5)
+    parts.push(at(cylinderGeom(0.026, 0.026, w, 5), xform(0, 0.014, z, 0, 0, Math.PI / 2)))
+  }
+  return merge(parts)
+}
+
+/** Coil of black cable dumped against a wall. */
+function cableCoilGeom(): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = []
+  for (let i = 0; i < 3; i++) {
+    const g = new THREE.TorusGeometry(0.3 - i * 0.045, 0.028, 5, 12).toNonIndexed()
+    g.rotateX(Math.PI / 2)
+    g.translate(0, 0.03 + i * 0.05, 0)
+    parts.push(normalizeGeom(g))
+  }
+  return merge(parts)
+}
+
 /** Registers every instanced prop kind used across the map. */
 export function definePropKinds(farm: InstanceFarm): void {
-  farm.define('crateS', crateGeom(0.52, 0.44, 0.46), 'woodCrate')
-  farm.define('crateM', crateGeom(0.78, 0.62, 0.6), 'woodCrate')
-  farm.define('crateL', crateGeom(1.18, 0.72, 0.78), 'woodCrate')
-  farm.define('ammoBox', crateGeom(0.7, 0.34, 0.36), 'metalPainted')
+  farm.defineVariants('crateS', crateVariants(0.52, 0.44, 0.46), 'woodCrate')
+  farm.defineVariants('crateM', crateVariants(0.78, 0.62, 0.6), 'woodCrate')
+  farm.defineVariants('crateL', crateVariants(1.18, 0.72, 0.78), 'woodCrate')
+  farm.define('ammoBox', ammoBoxGeom(0.7, 0.34, 0.36), 'metalPainted')
+  farm.defineVariants('paper', [
+    paperGeom(0.21, 0.29, 3), paperGeom(0.3, 0.22, 11), paperGeom(0.16, 0.24, 29),
+  ], 'plasterWhite', false)
+  farm.defineVariants('cardboard', [
+    paperGeom(0.5, 0.38, 7), paperGeom(0.62, 0.3, 23),
+  ], 'tarp', false)
+  farm.define('can', canGeom(), 'metalPainted', false)
+  farm.defineVariants('boardPile', [boardPileGeom(2), boardPileGeom(31)], 'woodPlank')
+  farm.define('cableCoil', cableCoilGeom(), 'rubber')
   farm.define('barrelBlue', barrelGeom(0.29, 0.88, true), 'metalPainted')
   farm.define('barrelRust', barrelGeom(0.29, 0.88, true), 'metalRusted')
   farm.define('drumShort', barrelGeom(0.28, 0.6, false), 'metalRusted')
   farm.define('pallet', palletGeom(), 'woodPlank')
   farm.define('tyre', tyreGeom(0.36), 'rubber')
   farm.define('tyreBig', tyreGeom(0.52), 'rubber')
-  farm.define('sandbag', sandbagGeom(), 'sandbag', false)
+  farm.defineVariants('sandbag', [sandbagGeom(1), sandbagGeom(2), sandbagGeom(3), sandbagGeom(4)], 'sandbag', false)
   farm.define('jersey', jerseyGeom(), 'concreteWorn')
   farm.define('hesco', hescoGeom(), 'sandbag')
   farm.define('cone', coneGeom(), 'rubber')
@@ -276,18 +440,37 @@ export function definePropKinds(farm: InstanceFarm): void {
   farm.define('sack', sackGeom(), 'fabricAwning')
   farm.define('basket', basketGeom(), 'woodPlank')
   farm.define('cinder', cinderGeom(), 'concreteRubble')
-  farm.define('brick', plainBox(0.23, 0.07, 0.11), 'brickRed', false)
+  farm.defineVariants('brick', [
+    plainBox(0.23, 0.07, 0.11),
+    shiftUv(fragmentGeom(0.21, 0.068, 0.105, 5, 0.07), 0.6, 0.2),
+    shiftUv(fragmentGeom(0.14, 0.065, 0.1, 9, 0.13), 1.4, 0.9, 1),
+  ], 'brickRed', false)
   farm.define('spool', spoolGeom(), 'woodPlank')
   farm.define('acUnit', acUnitGeom(), 'metalPainted')
   farm.define('chair', plasticChairGeom(), 'metalPainted')
   farm.define('table', tableGeom(1.35, 0.75, 0.74), 'woodPlank')
   farm.define('tableSmall', tableGeom(0.85, 0.6, 0.5), 'woodPlank')
   farm.define('rebar', rebarBundleGeom(), 'rebar')
-  farm.define('plank', plainBox(2.0, 0.05, 0.2), 'woodPlank', false)
-  farm.define('sheet', plainBox(1.6, 0.03, 0.85), 'metalCorrugated')
+  farm.defineVariants('plank', [
+    chamferBox(2.0, 0.05, 0.2, 0.008),
+    shiftUv(chamferBox(1.65, 0.045, 0.24, 0.008), 0.9, 0.3, 1),
+    shiftUv(chamferBox(2.3, 0.055, 0.17, 0.008), 1.8, 1.1),
+  ], 'woodPlank', false)
+  farm.define('sheet', corrugatedSheetGeom(1.6, 0.85), 'metalCorrugated')
+  // Rubble is fractured masonry, not river stone: angular slabs and shards in
+  // three proportions each, so a heap never repeats a silhouette.
   for (let i = 0; i < 4; i++) {
-    farm.define(`rubble${i}`, rockGeom(0.3 + i * 0.16, i * 3 + 1), 'concreteRubble', i > 1)
-    farm.define(`chunk${i}`, rockGeom(0.1 + i * 0.05, i * 7 + 11, 0.5), 'concreteRubble', false)
+    const r = 0.3 + i * 0.16
+    farm.defineVariants(`rubble${i}`, [
+      fragmentGeom(r * 2.0, r * 0.95, r * 1.5, i * 3 + 1),
+      fragmentGeom(r * 1.35, r * 1.3, r * 2.0, i * 3 + 2),
+      fragmentGeom(r * 2.4, r * 0.7, r * 1.6, i * 3 + 3, 0.22),
+    ], 'concreteRubble', i > 1)
+    const c = 0.1 + i * 0.05
+    farm.defineVariants(`chunk${i}`, [
+      fragmentGeom(c * 2.2, c * 1.3, c * 1.8, i * 7 + 11, 0.26),
+      fragmentGeom(c * 1.6, c * 1.1, c * 2.4, i * 7 + 12, 0.3),
+    ], 'concreteRubble', false)
   }
   farm.define('stone', rockGeom(0.22, 41, 0.45), 'stoneBlock', false)
 }
@@ -301,7 +484,7 @@ export function buildStall(
   b: Builder, farm: InstanceFarm, rng: Rand,
   x: number, z: number, yaw: number, width = 2.6, depth = 1.9,
 ): void {
-  const base = groundHeight(x, z)
+  const base = settleHeight(x, z, 1.2, 0.05)
   b.push(x, base, z, yaw)
   const postH = 2.25
   const hw = width / 2
@@ -311,9 +494,12 @@ export function buildStall(
       b.solid('woodBeam', 0.09, postH, 0.09, sx * hw, postH / 2, sz * hd, 0, 0.012, 'wood')
     }
   }
-  b.plate('woodBeam', width + 0.12, 0.09, 0.09, 0, postH, -hd)
-  b.plate('woodBeam', width + 0.12, 0.09, 0.09, 0, postH - 0.28, hd)
-  for (const sx of [-1, 1]) b.plate('woodBeam', 0.08, 0.08, depth + 0.1, sx * hw, postH - 0.14, 0)
+  // Chamfered rather than square: a stall's top rails are the closest thing to
+  // the camera in three of the graded poses, and a 90 degree arris there is the
+  // difference between milled timber and a grey box.
+  b.box('woodBeam', width + 0.12, 0.09, 0.09, 0, postH, -hd, 0, 0.009)
+  b.box('woodBeam', width + 0.12, 0.09, 0.09, 0, postH - 0.28, hd, 0, 0.009)
+  for (const sx of [-1, 1]) b.box('woodBeam', 0.08, 0.08, depth + 0.1, sx * hw, postH - 0.14, 0, 0, 0.008)
 
   // Canvas awning, sagging between the rails and overhanging the front.
   const canvas: MaterialName = rng.pick(['fabricAwning', 'tarp', 'fabricAwning'])
@@ -331,10 +517,15 @@ export function buildStall(
     new THREE.Vector3(-hw - 0.35, postH - 0.36, -hd - 0.55),
     0.06, 0.05, 10, 2, x))
 
-  // Counter and goods.
+  // Counter and goods. The front skirt is boarded, not a single panel.
   const ch = 0.86
   b.solid('woodPlank', width, 0.07, depth * 0.8, 0, ch, 0.05, 0, 0.014, 'wood')
-  b.plate('woodPlank', width, ch - 0.1, 0.05, 0, (ch - 0.1) / 2, -hd * 0.78)
+  const boards = Math.max(3, Math.round((ch - 0.1) / 0.16))
+  for (let i = 0; i < boards; i++) {
+    const bh = (ch - 0.1 - 0.008 * (boards - 1)) / boards
+    b.plate('woodPlank', width + rng.spread(0.03), bh, 0.045 + rng.range(0, 0.012),
+      rng.spread(0.015), bh / 2 + i * (bh + 0.008), -hd * 0.78)
+  }
   for (let i = 0; i < rng.int(3, 6); i++) {
     const gx = rng.spread(hw - 0.28)
     const gz = rng.spread(hd * 0.3)
@@ -361,13 +552,21 @@ export function buildStall(
   }
   b.geom('metalPainted', cylinderGeom(0.006, 0.006, 0.35, 4), xform(rng.spread(0.6), postH - 0.32, 0))
   b.geom('glass', sphereGeom(0.06, 8, 6), xform(0, postH - 0.5, 0))
-  // Crates stacked at the stall's foot.
+  // Crates, spilled produce and swept rubbish at the stall's foot.
+  b.pop()
   const n = rng.int(1, 3)
   for (let i = 0; i < n; i++) {
     const p = rot(rng.spread(hw), hd + rng.range(0.2, 0.5), yaw)
-    farm.place('crateM', x + p.x, base + 0.31, z + p.z, rng.range(0, 3.1))
+    seatProp(farm, rng, 'crateM', x + p.x, z + p.z, rng.range(0, 3.1), rng.range(0.86, 1.12),
+      rng.spread(0.05), rng.spread(0.05))
   }
-  b.pop()
+  for (let i = 0; i < rng.int(3, 7); i++) {
+    const p = rot(rng.spread(hw + 0.5), rng.range(-hd - 0.9, hd + 0.6), yaw)
+    seatProp(farm, rng, rng.pick(['paper', 'paper', 'cardboard', 'can']),
+      x + p.x, z + p.z, rng.range(0, 3.1), rng.range(0.7, 1.3), rng.spread(0.3), rng.spread(0.3))
+  }
+  b.geom('dirt', decalQuad(width + 1.6, depth + 1.6, 0.3, x * 13 + z),
+    xform(x, surfaceHeight(x, z) + 0.018, z, yaw, -Math.PI / 2))
 }
 
 /** Rotates a local XZ offset into world space by `yaw` (three's Y convention). */
@@ -379,7 +578,7 @@ function rot(x: number, z: number, yaw: number): { x: number; z: number } {
 
 /** Dry ornamental fountain at the heart of the square. */
 export function buildFountain(b: Builder, farm: InstanceFarm, rng: Rand, x: number, z: number): void {
-  const base = groundHeight(x, z)
+  const base = settleHeight(x, z, 2.4, 0.05)
   b.push(x, base, z, 0.2)
   const sides = 8
   const r = 2.5
@@ -409,7 +608,7 @@ export function buildFountain(b: Builder, farm: InstanceFarm, rng: Rand, x: numb
  * but with the proportions and the collapsed, gutted silhouette right.
  */
 export function buildWreckCar(b: Builder, rng: Rand, x: number, z: number, yaw: number): void {
-  const base = groundHeight(x, z)
+  const base = settleHeight(x, z, 1.6, 0.06)
   b.push(x, base, z, yaw)
   const body: MaterialName = 'metalRusted'
   // Chassis and sills.
@@ -455,7 +654,7 @@ export function buildWreckCar(b: Builder, rng: Rand, x: number, z: number, yaw: 
 
 /** Gutted minibus, tipped onto a flat and stripped for parts. */
 export function buildWreckBus(b: Builder, x: number, z: number, yaw: number, rng: Rand): void {
-  const base = groundHeight(x, z)
+  const base = settleHeight(x, z, 1.6, 0.06)
   b.push(x, base, z, yaw)
   const body: MaterialName = 'metalRusted'
   const L = 7.4
@@ -484,28 +683,126 @@ export function buildWreckBus(b: Builder, x: number, z: number, yaw: number, rng
   b.pop()
 }
 
+/**
+ * Cab-over flatbed with a canvas tilt. Modelled for silhouette first: the hoops
+ * and tilt give a tall, unmistakable shape that reads at 25 m against a bright
+ * sky, which is what the alley composition needs at its vanishing point.
+ */
+export function buildTruck(b: Builder, rng: Rand, x: number, z: number, yaw: number): void {
+  const base = settleHeight(x, z, 1.4, 0.03)
+  b.push(x, base, z, yaw)
+  const W = 2.28
+  const body: MaterialName = 'metalPainted'
+  // Chassis rails and the flat bed.
+  b.solid('gunmetal', W - 0.5, 0.26, 6.1, 0, 0.72, 0.1, 0, 0.04, 'metal')
+  b.solid('woodPlank', W, 0.16, 3.9, 0, 0.94, 1.15, 0, 0.03, 'wood')
+  for (const sx of [-1, 1]) {
+    b.box('woodPlank', 0.1, 0.62, 3.9, sx * (W / 2 - 0.05), 1.32, 1.15, 0, 0.02)
+  }
+  b.box('woodPlank', W, 0.62, 0.1, 0, 1.32, 3.05, 0, 0.02)
+  // Cab.
+  b.solid(body, W, 1.5, 1.85, 0, 1.62, -2.1, 0, 0.06, 'metal')
+  b.box(body, W - 0.08, 0.34, 1.7, 0, 2.5, -2.05, 0, 0.05)
+  b.box('glassDirty', W - 0.34, 0.72, 0.06, 0, 2.06, -3.0, 0, 0.01)
+  for (const sx of [-1, 1]) b.box('glassDirty', 0.05, 0.62, 1.0, sx * (W / 2 - 0.01), 2.0, -2.1, 0, 0.01)
+  b.box('steelBrushed', W - 0.5, 0.5, 0.08, 0, 1.35, -3.06, 0, 0.02)
+  b.box('gunmetal', W + 0.06, 0.2, 0.16, 0, 0.9, -3.16, 0, 0.03)
+  for (const sx of [-1, 1]) {
+    b.geom('glassDirty', cylinderGeom(0.1, 0.1, 0.1, 10), xform(sx * (W / 2 - 0.34), 1.4, -3.08, 0, Math.PI / 2))
+    b.geom('metalRusted', cylinderGeom(0.02, 0.02, 0.5, 5), xform(sx * (W / 2 + 0.02), 2.5, -2.9, 0, 0, 0.25))
+  }
+  b.geom('metalRusted', cylinderGeom(0.055, 0.06, 1.7, 8), xform(-W / 2 + 0.12, 2.6, -1.3))
+  // Canvas tilt over five hoops springing off the bed sides — the silhouette
+  // that does the compositional work at 25 m.
+  const hoopR = W / 2 - 0.06
+  const hoopBase = 1.66
+  const hoopRise = 1.42
+  const segN = 7
+  const arcX = (a: number) => Math.cos(a) * hoopR
+  const arcY = (a: number) => hoopBase + Math.sin(a) * hoopRise
+  for (let i = 0; i < 5; i++) {
+    const hz = -0.6 + i * 0.9
+    for (let k = 0; k < segN; k++) {
+      const a0 = (Math.PI * k) / segN
+      const a1 = (Math.PI * (k + 1)) / segN
+      const dx = arcX(a1) - arcX(a0)
+      const dy = arcY(a1) - arcY(a0)
+      b.geom('metalRusted', plainBox(Math.hypot(dx, dy) + 0.02, 0.05, 0.05),
+        xform((arcX(a0) + arcX(a1)) / 2, (arcY(a0) + arcY(a1)) / 2, hz, 0, 0, Math.atan2(dy, dx)))
+    }
+  }
+  const tarp: MaterialName = rng.pick(['tarp', 'fabricAwning'])
+  const top = hoopBase + hoopRise
+  b.geom(tarp, clothQuad(
+    new THREE.Vector3(-hoopR * 0.5, top - 0.05, -0.72),
+    new THREE.Vector3(hoopR * 0.5, top - 0.05, -0.72),
+    new THREE.Vector3(hoopR * 0.5, top - 0.05, 3.06),
+    new THREE.Vector3(-hoopR * 0.5, top - 0.05, 3.06),
+    0.08, 0.05, 4, 8, x))
+  for (const sx of [-1, 1]) {
+    b.geom(tarp, clothQuad(
+      new THREE.Vector3(sx * hoopR * 0.52, top - 0.08, -0.72),
+      new THREE.Vector3(sx * hoopR * 0.52, top - 0.08, 3.06),
+      new THREE.Vector3(sx * hoopR, hoopBase - 0.02, 3.06),
+      new THREE.Vector3(sx * hoopR, hoopBase - 0.02, -0.72),
+      0.05, 0.06, 8, 3, z + sx))
+  }
+  // Rear flap, lashed short so the bed reads as loaded rather than sealed.
+  b.geom(tarp, clothQuad(
+    new THREE.Vector3(-hoopR * 0.52, top - 0.08, 3.04),
+    new THREE.Vector3(hoopR * 0.52, top - 0.08, 3.04),
+    new THREE.Vector3(hoopR * 0.9, hoopBase + 0.24, 3.09),
+    new THREE.Vector3(-hoopR * 0.9, hoopBase + 0.24, 3.09),
+    0.06, 0.07, 5, 4, z * 2))
+  // Six wheels: steering axle up front, a doubled bogie at the back.
+  for (const sx of [-1, 1]) {
+    for (const wz of [-2.15, 1.35, 2.15]) {
+      b.geom('gunmetal', cylinderGeom(0.28, 0.28, 0.22, 12), xform(sx * (W / 2 - 0.16), 0.52, wz, 0, 0, Math.PI / 2))
+      b.geom('rubber', tyreGeom(0.52), xform(sx * (W / 2 - 0.16), 0.52, wz, 0, 0, Math.PI / 2))
+    }
+  }
+  b.collide(W + 0.3, 2.2, 6.4, 0, 1.2, 0.1, 0, 'metal')
+  b.geom('dirt', decalQuad(3.4, 6.8, 0.16, 55), xform(0, 0.05, 0.2, 0, -Math.PI / 2))
+  b.pop()
+}
+
 /** Sandbag emplacement: a curved revetment with an ammo crate and a firing step. */
 export function buildEmplacement(
   b: Builder, farm: InstanceFarm, rng: Rand,
   x: number, z: number, yaw: number, length = 3.0, rows = 4, curve = 0.22,
   baseY?: number,
 ): void {
-  const base = baseY ?? groundHeight(x, z)
+  const base = baseY ?? settleHeight(x, z, length * 0.4, 0.03)
   const perRow = Math.max(2, Math.round(length / 0.5))
   for (let r = 0; r < rows; r++) {
-    const y = base + 0.095 + r * 0.175
+    const y = base + 0.09 + r * 0.172
     const inset = r * 0.035
-    const offset = r % 2 === 0 ? 0 : 0.26
+    // Courses are hand-laid: a per-course shift plus per-bag jitter kills the
+    // brick-wall regularity that made these read as an array, not a wall.
+    const offset = (r % 2 === 0 ? 0 : 0.26) + rng.spread(0.07)
     for (let i = 0; i < perRow; i++) {
       const t = (i + 0.5) / perRow - 0.5
-      const lx = t * length + offset
-      const lz = curve * (t * 2) * (t * 2) - inset
+      const lx = t * length + offset + rng.spread(0.05)
+      const lz = curve * (t * 2) * (t * 2) - inset + rng.spread(0.035)
       const p = rot(lx, lz, yaw)
-      if (r === rows - 1 && rng.bool(0.22)) continue
-      farm.place('sandbag', x + p.x, y, z + p.z, yaw + rng.spread(0.13), rng.range(0.94, 1.06), rng.spread(0.05), rng.spread(0.05))
+      if (r === rows - 1 && rng.bool(0.28)) continue
+      farm.place('sandbag', x + p.x, y + rng.spread(0.012), z + p.z,
+        yaw + rng.spread(0.2), rng.range(0.9, 1.1), rng.spread(0.09), rng.spread(0.07))
     }
   }
   b.collide(length + 0.5, rows * 0.175, 0.75, x, base + (rows * 0.175) / 2, z, yaw, 'fabric')
+  if (baseY === undefined) {
+    // Sand spilled from a split bag, and the dust worn into the firing step.
+    b.geom('sand', decalQuad(length + 0.9, 1.5, 0.26, x * 3 + z),
+      xform(x, base + 0.022, z, yaw, -Math.PI / 2))
+    for (let i = 0; i < 5; i++) {
+      const p = rot(rng.spread(length * 0.55), rng.range(-1.0, -0.4), yaw)
+      const px = x + p.x
+      const pz = z + p.z
+      farm.place(`chunk${rng.int(0, 3)}`, px, settleHeight(px, pz, 0.1, 0.03), pz,
+        rng.range(0, 3.1), rng.range(0.5, 1.2), rng.spread(0.5), rng.spread(0.5))
+    }
+  }
   if (rng.bool(0.7)) {
     const p = rot(rng.spread(length * 0.4), 0.9, yaw)
     farm.place('ammoBox', x + p.x, base + 0.18, z + p.z, yaw + rng.spread(0.5))
@@ -551,12 +848,15 @@ export function buildOverhead(b: Builder, rng: Rand): void {
   // a pole through the middle of a frame is the cheapest way to ruin a shot.
   const start = new THREE.Vector2(11.0, 30.4)
   const poles: THREE.Vector3[] = []
+  let run = 0
   for (let i = 0; i < 5; i++) {
-    const px = start.x + dir.x * i * 10.5
-    const pz = start.y + dir.y * i * 10.5
+    // Spans between real poles are never equal, and no pole is truly plumb.
+    const px = start.x + dir.x * run
+    const pz = start.y + dir.y * run
+    run += rng.range(8.6, 12.4)
     const base = groundHeight(px, pz)
-    const h = 8.2
-    b.push(px, base, pz, -0.349)
+    const h = 8.2 + rng.spread(0.55)
+    b.push(px, base, pz, -0.349 + rng.spread(0.22))
     b.geom('woodBeam', cylinderGeom(0.13, 0.19, h, 8), xform(0, h / 2, 0))
     b.collide(0.4, h, 0.4, 0, h / 2, 0, 0, 'wood')
     b.plate('woodBeam', 0.11, 0.11, 1.9, 0, h - 0.5, 0)
@@ -575,7 +875,7 @@ export function buildOverhead(b: Builder, rng: Rand): void {
       // Offset perpendicular to the run, matching the crossarm insulators.
       const p0 = new THREE.Vector3(poles[i].x - dir.y * off, poles[i].y, poles[i].z + dir.x * off)
       const p1 = new THREE.Vector3(poles[i + 1].x - dir.y * off, poles[i + 1].y, poles[i + 1].z + dir.x * off)
-      b.geom('metalRusted', catenary(p0, p1, 0.75, 0.022, 8, 4))
+      b.geom('metalRusted', catenary(p0, p1, rng.range(0.55, 1.05), 0.022, 8, 4))
     }
   }
   // Service drops from the poles to the nearby rooftops.
@@ -594,37 +894,49 @@ export function buildOverhead(b: Builder, rng: Rand): void {
   for (const [x0, z0, x1, z1, y] of lines) {
     const p0 = new THREE.Vector3(x0, groundHeight(x0, z0) + y, z0)
     const p1 = new THREE.Vector3(x1, groundHeight(x1, z1) + y, z1)
-    b.geom('metalRusted', catenary(p0, p1, 0.32, 0.012, 10, 4))
-    const n = rng.int(2, 4)
-    for (let i = 0; i < n; i++) {
-      const t0 = (i + 0.35) / (n + 0.6)
-      const t1 = t0 + rng.range(0.1, 0.2)
+    const sag = rng.range(0.24, 0.44)
+    b.geom('metalRusted', catenary(p0, p1, sag, 0.012, 10, 4))
+    // Garments are pegged where there was room, not on a grid: walk along the
+    // line leaving a random gap, and vary width, drop and hang independently.
+    let t = rng.range(0.06, 0.2)
+    while (t < 0.86) {
+      const t0 = t
+      const t1 = Math.min(0.94, t0 + rng.range(0.07, 0.19))
       const a = p0.clone().lerp(p1, t0)
       const c = p0.clone().lerp(p1, t1)
-      a.y -= Math.sin(Math.PI * t0) * 0.32
-      c.y -= Math.sin(Math.PI * t1) * 0.32
-      const drop = rng.range(0.7, 1.5)
-      b.geom(rng.pick<MaterialName>(['fabricAwning', 'tarp', 'fabricAwning']), clothQuad(
+      a.y -= Math.sin(Math.PI * t0) * sag
+      c.y -= Math.sin(Math.PI * t1) * sag
+      const drop = rng.range(0.45, 1.6)
+      // One corner hangs lower — a garment pegged by one shoulder.
+      const skew = rng.spread(0.22)
+      b.geom(rng.pick<MaterialName>(['fabricAwning', 'tarp', 'fabricAwning', 'sandbag']), clothQuad(
         a, c,
-        new THREE.Vector3(c.x, c.y - drop, c.z),
-        new THREE.Vector3(a.x, a.y - drop, a.z),
-        0.05, 0.055, 5, 5, i * 3.3 + x0))
+        new THREE.Vector3(c.x, c.y - drop + skew, c.z),
+        new THREE.Vector3(a.x, a.y - drop - skew, a.z),
+        rng.range(0.02, 0.09), rng.range(0.03, 0.09), 5, 5, t0 * 31 + x0))
+      t = t1 + rng.range(0.03, 0.16)
     }
   }
-  // Bunting over the market square.
+  // Bunting over the market square. Pennants are hand-tied: the spacing walks,
+  // and no two are the same size or colour.
   const bx0 = new THREE.Vector3(-20, groundHeight(-20, -12) + 5.6, -12)
   const bx1 = new THREE.Vector3(-1, groundHeight(-1, -16) + 5.2, -16)
-  b.geom('metalRusted', catenary(bx0, bx1, 1.2, 0.012, 12, 4))
-  for (let i = 0; i < 16; i++) {
-    const t = (i + 0.5) / 16
-    const p = bx0.clone().lerp(bx1, t)
-    p.y -= Math.sin(Math.PI * t) * 1.2
-    b.geom(rng.pick<MaterialName>(['fabricAwning', 'tarp']), clothQuad(
-      new THREE.Vector3(p.x - 0.14, p.y, p.z),
-      new THREE.Vector3(p.x + 0.14, p.y, p.z),
-      new THREE.Vector3(p.x + 0.02, p.y - 0.28, p.z),
-      new THREE.Vector3(p.x - 0.02, p.y - 0.28, p.z),
-      0.01, 0.02, 2, 2, i))
+  const bsag = 1.2
+  b.geom('metalRusted', catenary(bx0, bx1, bsag, 0.012, 12, 4))
+  let bt = rng.range(0.02, 0.08)
+  while (bt < 0.97) {
+    const p = bx0.clone().lerp(bx1, bt)
+    p.y -= Math.sin(Math.PI * bt) * bsag
+    const hw = rng.range(0.09, 0.19)
+    const dr = rng.range(0.17, 0.36)
+    const lean = rng.spread(0.05)
+    b.geom(rng.pick<MaterialName>(['fabricAwning', 'tarp', 'sandbag']), clothQuad(
+      new THREE.Vector3(p.x - hw, p.y, p.z),
+      new THREE.Vector3(p.x + hw, p.y, p.z),
+      new THREE.Vector3(p.x + 0.02 + lean, p.y - dr, p.z + lean),
+      new THREE.Vector3(p.x - 0.02 + lean, p.y - dr, p.z + lean),
+      0.01, 0.02, 2, 2, bt * 40))
+    bt += rng.range(0.035, 0.085)
   }
 }
 
@@ -831,9 +1143,17 @@ export function buildSetPieces(b: Builder, farm: InstanceFarm, rng: Rand): void 
 
   // Wrecks.
   buildWreckCar(b, rng, -3.2, 22.6, 0.62) // firefight midground
-  buildWreckCar(b, rng, 7.05, 27.4, 0.16) // alley midground
+  // Pushed against the alley's east wall rather than sat on the centreline: it
+  // frames the gateway beyond instead of plugging it.
+  buildWreckCar(b, rng, 7.75, 28.0, 0.28) // alley midground
   buildWreckCar(b, rng, 14.4, -3.0, 2.4)
   buildWreckBus(b, 17.2, 31.4, 0.34, rng)
+  // Parked broadside past the alley gateway: the mass the alley pose's leading
+  // lines finally land on, read through the arch against the low sun.
+  buildTruck(b, rng, 7.9, 40.4, 1.32)
+  // Stopped on the carriageway, square in the vista pose's sightline: that
+  // frame's midground was an empty dirt lot with no readable silhouette in it.
+  buildTruck(b, rng, 33.5, 32.9, 1.222)
 
   // Cover along the graded sightlines.
   buildEmplacement(b, farm, rng, 6.9, 12.4, 0.05, 2.0, 4, 0.18)
@@ -841,12 +1161,15 @@ export function buildSetPieces(b: Builder, farm: InstanceFarm, rng: Rand): void 
   buildEmplacement(b, farm, rng, -1.0, 15.4, 1.9, 2.4, 4, 0.2)
   // Sandbags flanking the breach in the market hall's south parapet — the
   // vista pose looks straight through the gap between them.
-  const deckTop = groundHeight(19.75, 16.25) + 0.04 + 2.8 + 0.84
+  // The walkable slab, not the top of the parapet: the previous expression
+  // added the 0.84 m parapet height as well, which left the whole overwatch
+  // position hanging most of a metre above the roof in the vista pose.
+  const deckTop = footprintBase(19.75, 16.25, 8.5, 11.5) + 2.8
   buildEmplacement(b, farm, rng, 23.1, 21.5, 0.0, 1.3, 2, 0.05, deckTop)
   buildEmplacement(b, farm, rng, 17.4, 21.5, 0.0, 2.0, 2, 0.05, deckTop)
   // Spent casings and an ammo crate at the firing position.
-  farm.place('ammoBox', 22.2, deckTop - 0.66, 20.4, 0.4)
-  farm.place('crateS', 16.6, deckTop - 0.62, 20.0, 1.2)
+  farm.place('ammoBox', 22.2, deckTop + 0.17, 20.4, 0.4)
+  farm.place('crateS', 16.6, deckTop + 0.22, 20.0, 1.2)
   buildEmplacement(b, farm, rng, 23.6, 28.9, -0.35, 3.4, 4, 0.22) // checkpoint
   buildEmplacement(b, farm, rng, -12.5, -3.4, 0.15, 2.8, 4, 0.2)
 
@@ -885,6 +1208,54 @@ export function buildSetPieces(b: Builder, farm: InstanceFarm, rng: Rand): void 
 }
 
 /**
+ * Seat offset and footprint radius per prop kind, both in metres.
+ *
+ * `seat` is the distance from the geometry's origin down to its lowest point —
+ * add it to the ground height and the prop touches. Several kinds used to be
+ * placed with a rounded-off value (the pallet by 27 mm, the rebar bundle by
+ * 30 mm), and the instance scale was never applied to it at all, so anything
+ * scaled below 1.0 hovered. That is the "props float" defect.
+ */
+const PROP_SEAT: Record<string, { seat: number; span: number }> = {
+  crateS: { seat: 0.22, span: 0.35 }, crateM: { seat: 0.31, span: 0.49 },
+  crateL: { seat: 0.36, span: 0.7 }, barrelRust: { seat: 0.44, span: 0.29 },
+  barrelBlue: { seat: 0.44, span: 0.29 }, drumShort: { seat: 0.3, span: 0.28 },
+  pallet: { seat: 0.024, span: 0.6 }, tyre: { seat: 0.122, span: 0.36 },
+  tyreBig: { seat: 0.177, span: 0.52 }, cone: { seat: 0.0, span: 0.17 },
+  gasBottle: { seat: 0.29, span: 0.17 }, bucket: { seat: 0.14, span: 0.16 },
+  sack: { seat: 0.17, span: 0.23 }, basket: { seat: 0.15, span: 0.28 },
+  cinder: { seat: 0.1, span: 0.22 }, spool: { seat: 0.62, span: 0.62 },
+  chair: { seat: 0.0, span: 0.22 }, plank: { seat: 0.025, span: 1.0 },
+  sheet: { seat: 0.015, span: 0.8 }, rebar: { seat: 0.0, span: 1.2 },
+  boardPile: { seat: 0.0, span: 0.8 }, cableCoil: { seat: 0.0, span: 0.3 },
+  paper: { seat: 0.0, span: 0.15 }, cardboard: { seat: 0.0, span: 0.28 },
+  can: { seat: 0.0, span: 0.05 },
+}
+
+/**
+ * Places one scattered prop so it genuinely rests on the drawn ground: seat
+ * offset scaled with the instance, lowest point of the footprint rather than
+ * the centre sample, and an extra drop for the tilt so the down-slope corner
+ * buries instead of lifting clear.
+ */
+function seatProp(
+  farm: InstanceFarm, rng: Rand, kind: string,
+  x: number, z: number, yaw: number, scale: number, tiltX: number, tiltZ: number,
+): number {
+  const s = PROP_SEAT[kind] ?? { seat: 0.3, span: 0.4 }
+  const span = s.span * scale
+  // Tall props take the lowest point of their whole footprint; a flat one like
+  // a plank or a sheet of paper would only get buried by that, so it samples a
+  // tight radius instead.
+  const radius = Math.min(span * 0.75, s.seat > 0.08 ? 0.8 : 0.3)
+  const ground = settleHeight(x, z, radius, 0.01 + rng.range(0, 0.022))
+  // Never sink further than the prop is tall, or it vanishes into the ground.
+  const tip = Math.min(span * (Math.abs(tiltX) + Math.abs(tiltZ)) * 0.6, Math.max(0.025, s.seat * 0.9))
+  farm.place(kind, x, ground + s.seat * scale - tip, z, yaw, scale, tiltX, tiltZ)
+  return ground
+}
+
+/**
  * Scattered clutter. Deterministic rejection sampling over the open ground,
  * biased toward wall bases and corners the way real rubbish accumulates.
  */
@@ -892,7 +1263,7 @@ export function scatterClutter(b: Builder, farm: InstanceFarm, rng: Rand, densit
   const kinds = [
     'crateS', 'crateM', 'crateL', 'barrelRust', 'barrelBlue', 'drumShort', 'pallet',
     'tyre', 'tyreBig', 'cone', 'gasBottle', 'bucket', 'sack', 'basket', 'cinder',
-    'spool', 'chair', 'plank', 'sheet', 'rebar',
+    'spool', 'chair', 'plank', 'sheet', 'rebar', 'boardPile', 'cableCoil',
   ]
   const clusters: [number, number, number][] = [
     [6.9, 20.4, 3.0], [7.4, 31.5, 2.6], [-6.5, 17.5, 3.4], [-7.5, 31.0, 3.6],
@@ -913,39 +1284,51 @@ export function scatterClutter(b: Builder, farm: InstanceFarm, rng: Rand, densit
     const x = c[0] + Math.cos(a) * r
     const z = c[1] + Math.sin(a) * r
     if (insideAnyBuilding(x, z, 0.35)) continue
-    const y = groundHeight(x, z)
     const kind = kinds[Math.floor(rng.next() * kinds.length)]
     const yaw = rng.range(0, Math.PI * 2)
-    const tilt = rng.bool(0.18) ? rng.spread(0.35) : rng.spread(0.05)
-    let lift = 0.32
-    switch (kind) {
-      case 'crateS': lift = 0.22; break
-      case 'crateM': lift = 0.31; break
-      case 'crateL': lift = 0.36; break
-      case 'barrelRust': case 'barrelBlue': lift = 0.44; break
-      case 'drumShort': lift = 0.3; break
-      case 'pallet': lift = 0.05; break
-      case 'tyre': lift = 0.13; break
-      case 'tyreBig': lift = 0.18; break
-      case 'cone': lift = 0.0; break
-      case 'gasBottle': lift = 0.29; break
-      case 'bucket': lift = 0.14; break
-      case 'sack': lift = 0.17; break
-      case 'basket': lift = 0.15; break
-      case 'cinder': lift = 0.1; break
-      case 'spool': lift = 0.62; break
-      case 'chair': lift = 0.0; break
-      case 'plank': lift = 0.03; break
-      case 'sheet': lift = 0.02; break
-      case 'rebar': lift = 0.03; break
-      default: lift = 0.3
-    }
-    farm.place(kind, x, y + lift, z, yaw, rng.range(0.9, 1.08), tilt, rng.spread(0.06))
-    // Only the objects big enough to matter get collision.
+    const tiltX = rng.bool(0.18) ? rng.spread(0.32) : rng.spread(0.045)
+    const tiltZ = rng.bool(0.14) ? rng.spread(0.24) : rng.spread(0.05)
+    // Wider than the old 0.9-1.08: identical sizes in a row is the tell.
+    const scale = rng.range(0.82, 1.2)
+    const y = seatProp(farm, rng, kind, x, z, yaw, scale, tiltX, tiltZ)
+    // Debris and dust collect where a heavy prop has stood for years.
     if (kind === 'crateL' || kind === 'crateM' || kind === 'barrelRust' || kind === 'barrelBlue' || kind === 'spool') {
       b.collide(0.8, 0.85, 0.8, x, y + 0.42, z, yaw, kind === 'spool' ? 'wood' : 'metal')
+      if (rng.bool(0.75)) {
+        b.geom('dirt', decalQuad(1.5, 1.3, 0.3, x * 5 + z), xform(x, y + 0.02, z, rng.range(0, 3.1), -Math.PI / 2))
+      }
+      for (let k = 0; k < rng.int(1, 3); k++) {
+        const a = rng.range(0, Math.PI * 2)
+        const rr = rng.range(0.3, 0.62)
+        const px = x + Math.cos(a) * rr
+        const pz = z + Math.sin(a) * rr
+        farm.place(`chunk${rng.int(0, 3)}`, px, settleHeight(px, pz, 0.1, 0.03), pz,
+          rng.range(0, 3.1), rng.range(0.5, 1.1), rng.spread(0.6), rng.spread(0.6))
+      }
     }
     placed++
+  }
+
+  // Litter: paper, cardboard and cans, banked against walls and in corners the
+  // way wind and years actually deposit rubbish. Small, cheap, and the fastest
+  // way to stop a street reading as freshly generated.
+  const litter = ['paper', 'paper', 'cardboard', 'can', 'can']
+  const litterTotal = Math.round(220 * density)
+  let scraps = 0
+  guard = 0
+  while (scraps < litterTotal && guard < litterTotal * 30) {
+    guard++
+    const c = clusters[Math.floor(rng.next() * clusters.length)]
+    const a = rng.range(0, Math.PI * 2)
+    // Biased outward: rubbish piles up at the edge of an open space.
+    const r = (0.35 + 0.65 * Math.sqrt(rng.next())) * c[2] * 1.5
+    const x = c[0] + Math.cos(a) * r
+    const z = c[1] + Math.sin(a) * r
+    if (insideAnyBuilding(x, z, 0.3)) continue
+    const kind = litter[Math.floor(rng.next() * litter.length)]
+    seatProp(farm, rng, kind, x, z, rng.range(0, Math.PI * 2), rng.range(0.7, 1.35),
+      rng.spread(0.35), rng.spread(0.35))
+    scraps++
   }
 
   // Jersey barriers and HESCO in deliberate lines, not scattered.
@@ -960,8 +1343,8 @@ export function scatterClutter(b: Builder, farm: InstanceFarm, rng: Rand, densit
       const p = rot(off, 0, yaw)
       const px = x + p.x
       const pz = z + p.z
-      const y = groundHeight(px, pz)
-      farm.place('jersey', px, y - 0.02, pz, yaw + rng.spread(0.05))
+      const y = settleHeight(px, pz, 0.8, 0.035)
+      farm.place('jersey', px, y, pz, yaw + rng.spread(0.07))
       b.collide(1.6, 0.95, 0.62, px, y + 0.45, pz, yaw, 'concrete')
     }
   }
@@ -970,8 +1353,8 @@ export function scatterClutter(b: Builder, farm: InstanceFarm, rng: Rand, densit
       const p = rot((i - (n - 1) / 2) * 1.04, 0, yaw)
       const px = x + p.x
       const pz = z + p.z
-      const y = groundHeight(px, pz)
-      farm.place('hesco', px, y + 0.5, pz, yaw)
+      const y = settleHeight(px, pz, 0.7, 0.03)
+      farm.place('hesco', px, y + 0.5, pz, yaw + rng.spread(0.04))
       b.collide(1.05, 1.05, 1.05, px, y + 0.5, pz, yaw, 'fabric')
     }
   }
@@ -982,12 +1365,28 @@ export function scatterClutter(b: Builder, farm: InstanceFarm, rng: Rand, densit
     [-14.6, -25.5], [2.8, -12.0], [25.4, 24.6], [-23.4, 6.5], [5.6, 33.4],
   ]
   for (const [x, z] of stacks) {
-    const y = groundHeight(x, z)
+    const y = settleHeight(x, z, 0.75, 0.025)
     const yaw = rng.range(0, Math.PI * 2)
-    farm.place('pallet', x, y + 0.05, z, yaw)
-    farm.place('crateL', x, y + 0.5, z, yaw + rng.spread(0.1))
-    if (rng.bool(0.7)) farm.place('crateM', x + rng.spread(0.2), y + 1.18, z + rng.spread(0.2), yaw + rng.spread(0.6))
-    if (rng.bool(0.45)) farm.place('crateS', x + rng.spread(0.25), y + 1.72, z + rng.spread(0.25), yaw + rng.spread(0.9))
+    // Each box is seated on the measured top of the one below with a 12 mm
+    // bite, so the stack has no daylight in it at any scale.
+    const bite = 0.012
+    farm.place('pallet', x, y + 0.024, z, yaw)
+    let top = y + 0.13
+    const sl = rng.range(0.9, 1.1)
+    farm.place('crateL', x, top + 0.36 * sl - bite, z, yaw + rng.spread(0.14), sl)
+    top += 0.72 * sl - bite
+    if (rng.bool(0.7)) {
+      const sm = rng.range(0.88, 1.12)
+      farm.place('crateM', x + rng.spread(0.22), top + 0.31 * sm - bite, z + rng.spread(0.22),
+        yaw + rng.spread(0.7), sm, rng.spread(0.03), rng.spread(0.03))
+      top += 0.62 * sm - bite
+      if (rng.bool(0.5)) {
+        const ss = rng.range(0.85, 1.15)
+        farm.place('crateS', x + rng.spread(0.28), top + 0.22 * ss - bite, z + rng.spread(0.28),
+          yaw + rng.spread(1.0), ss, rng.spread(0.05), rng.spread(0.05))
+      }
+    }
+    b.geom('dirt', decalQuad(2.0, 1.8, 0.28, x * 7 + z), xform(x, y + 0.02, z, rng.range(0, 3.1), -Math.PI / 2))
     b.collide(1.3, 1.5, 0.95, x, y + 0.75, z, yaw, 'wood')
   }
 

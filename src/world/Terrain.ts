@@ -52,9 +52,9 @@ export const ZONES: GroundZone[] = [
   { name: 'eastroad', cx: 20, cz: -8, hw: 5, hd: 16, yaw: 0, mat: 'asphaltCracked', lift: 0.0, camber: 0.08, feather: 1.6 },
 ]
 
-interface Pothole { x: number; z: number; r: number; depth: number }
+export interface Pothole { x: number; z: number; r: number; depth: number }
 
-const POTHOLES: Pothole[] = [
+export const POTHOLES: Pothole[] = [
   { x: -2.5, z: 17.0, r: 1.5, depth: 0.13 },
   { x: -6.2, z: 27.5, r: 1.9, depth: 0.16 },
   { x: 1.2, z: 8.0, r: 1.2, depth: 0.09 },
@@ -119,6 +119,55 @@ export function groundHeight(x: number, z: number): number {
     }
   }
   return h
+}
+
+/**
+ * Height of the *rendered* ground triangle at (x, z).
+ *
+ * `groundHeight` is the analytic field; the terrain mesh samples it on a 1.6 m
+ * grid and interpolates linearly between those samples. Over every convex bump
+ * the drawn surface therefore sits *below* the analytic value — up to about
+ * 4 cm — and a prop seated on `groundHeight` visibly hovers. Seating props on
+ * the same interpolated surface the player can see removes that gap entirely.
+ */
+export function surfaceHeight(x: number, z: number): number {
+  if (Math.abs(x) >= INNER || Math.abs(z) >= INNER) return groundHeight(x, z)
+  const gx = (x + INNER) / INNER_CELL
+  const gz = (z + INNER) / INNER_CELL
+  const i = Math.floor(gx)
+  const j = Math.floor(gz)
+  const u = gx - i
+  const v = gz - j
+  const x0 = -INNER + i * INNER_CELL
+  const z0 = -INNER + j * INNER_CELL
+  const x1 = x0 + INNER_CELL
+  const z1 = z0 + INNER_CELL
+  const hA = groundHeight(x0, z0)
+  const hD = groundHeight(x1, z1)
+  // The grid emits (i,j)-(i,j+1)-(i+1,j+1) and (i,j)-(i+1,j+1)-(i+1,j); the
+  // diagonal between them runs u == v.
+  if (v >= u) {
+    const hB = groundHeight(x0, z1)
+    return hA + (hB - hA) * v + (hD - hB) * u
+  }
+  const hC = groundHeight(x1, z0)
+  return hA + (hC - hA) * u + (hD - hC) * v
+}
+
+/**
+ * The height a prop of footprint radius `radius` must sit at to touch the
+ * ground everywhere. Takes the lowest rendered surface under the footprint and
+ * bites `sink` into it, so contact edges disappear into the dirt rather than
+ * hovering over a slope.
+ */
+export function settleHeight(x: number, z: number, radius = 0.35, sink = 0.02): number {
+  let lo = surfaceHeight(x, z)
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2
+    const h = surfaceHeight(x + Math.cos(a) * radius, z + Math.sin(a) * radius)
+    if (h < lo) lo = h
+  }
+  return lo - sink
 }
 
 const _n = new THREE.Vector3()

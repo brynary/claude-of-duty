@@ -28,19 +28,31 @@ export interface GradeSettings {
 }
 
 /**
- * Tuned against the reference: strong enough to read as a deliberate grade,
- * restrained enough that the frame stays clean. Every number here is small on
- * purpose — the failure mode of a procedural grade is looking like a filter.
+ * Calibrated against measured frames rather than taste.
+ *
+ * The previous settings (contrast 0.26 around a 0.45 pivot, a 0.018–0.032 black
+ * floor) put 91% of an outdoor frame between sRGB 32 and 144 and never reached
+ * above 186 — a milky image that uses none of the top 40% of the range. The
+ * pivot sits low now because the scene's mid-tones land near 0.3 in display
+ * space, and the S-curve either side of it is roughly twice as steep, so
+ * shadows fall away and sunlit surfaces climb into the shoulder.
+ *
+ * Measured against the tone curve this grade sits on: scene luminance 0.02
+ * lands at sRGB 13, 0.18 at 132, 0.5 at 211, 1.0 at 237.
+ *
+ * The tints stay deliberately small. A split-tone strong enough to notice on a
+ * grey card is strong enough to turn a bright sky lavender, which is the exact
+ * failure the earlier +0.024 red highlight lift produced.
  */
 export const FILMIC_GRADE: GradeSettings = {
-  contrast: 0.26,
-  contrastPivot: 0.45,
-  toe: 1.06,
-  lift: [0.018, 0.023, 0.032],
-  shadowTint: [-0.006, 0.002, 0.013],
-  highlightTint: [0.024, 0.009, -0.018],
-  saturation: 1.07,
-  highlightDesaturation: 0.42,
+  contrast: 0.50,
+  contrastPivot: 0.31,
+  toe: 1.08,
+  lift: [0.007, 0.009, 0.013],
+  shadowTint: [-0.005, 0.000, 0.010],
+  highlightTint: [0.016, 0.005, -0.014],
+  saturation: 1.16,
+  highlightDesaturation: 0.45,
 }
 
 const REC709 = [0.2126, 0.7152, 0.0722] as const
@@ -104,11 +116,16 @@ export interface GradeLut {
 }
 
 /**
- * Bakes {@link gradeColor} into a `size^3` RGBA8 volume. 33 is the size every
- * .cube LUT in the industry uses; hardware trilinear filtering across it is
- * indistinguishable from evaluating the curve per pixel and costs one fetch.
+ * Bakes {@link gradeColor} into a `size^3` RGBA8 volume. Hardware trilinear
+ * filtering across it is indistinguishable from evaluating the curve per pixel
+ * and costs one fetch.
+ *
+ * 33 is the industry's .cube size, but this curve is far steeper than a film
+ * print LUT: near the pivot one node step spans about 15 levels out of 255, and
+ * an 8-bit volume that coarse contours in a clear sky. 41 nodes costs 275 KB
+ * once at boot and puts the step back under 10 levels.
  */
-export function createGradeLut(size = 33, settings: GradeSettings = FILMIC_GRADE): GradeLut {
+export function createGradeLut(size = 41, settings: GradeSettings = FILMIC_GRADE): GradeLut {
   const data = new Uint8Array(size * size * size * 4)
   const out = [0, 0, 0]
   const inv = 1 / (size - 1)

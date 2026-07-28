@@ -168,6 +168,7 @@ export class Viewmodel {
   private scopeMask!: THREE.Mesh
   private scopeMaskMat!: THREE.MeshBasicMaterial
   private keyLight!: THREE.DirectionalLight
+  private studioEnv: THREE.Texture | null = null
   private aimLocalInv = new THREE.Matrix4()
   private adsPos = new THREE.Vector3()
   private adsQuat = new THREE.Quaternion()
@@ -189,20 +190,32 @@ export class Viewmodel {
     const ctx = this.ctx
     const shadows = ctx.config.quality === 'high' || ctx.config.quality === 'ultra'
 
+    // The lighting system also parents a key/fill/rim rig into this scene. Two
+    // full rigs stacked is what blew the top rail to white, so measure what is
+    // already here and take whatever share is left.
+    let foreign = 0
+    ctx.viewmodelScene.traverse((o) => {
+      const l = o as THREE.Light
+      if (l.isLight) foreign += l.intensity
+    })
+    const share = foreign > 3 ? 0.42 : 1
+
     // View-space key light: the weapon always reads well regardless of where
     // the player is looking, which is what shipped shooters do.
-    const key = new THREE.DirectionalLight(0xfff0dd, 3.1)
+    const key = new THREE.DirectionalLight(0xfff0dd, 3.1 * share)
     key.position.set(0.55, 0.85, 0.35)
+    // Aimed at the middle of the posed weapon, not at the rig origin: the
+    // viewmodel now sits 0.25-1.1m ahead of the eye.
     const target = new THREE.Object3D()
-    target.position.set(0.02, -0.06, -0.34)
+    target.position.set(0.10, -0.10, -0.62)
     this.rig.add(target)
     key.target = target
     if (shadows) {
       key.castShadow = true
       key.shadow.mapSize.set(1024, 1024)
       const cam = key.shadow.camera
-      cam.left = -0.5; cam.right = 0.5; cam.top = 0.5; cam.bottom = -0.5
-      cam.near = 0.05; cam.far = 3.2
+      cam.left = -0.8; cam.right = 0.8; cam.top = 0.8; cam.bottom = -0.8
+      cam.near = 0.05; cam.far = 4.0
       cam.updateProjectionMatrix()
       key.shadow.bias = -0.0006
       key.shadow.normalBias = 0.0025
@@ -211,29 +224,36 @@ export class Viewmodel {
     this.rig.add(key)
     this.keyLight = key
 
-    // Cool rim from behind the shoulder separates the weapon from the world.
-    const rim = new THREE.DirectionalLight(0x9fc0ff, 1.7)
+    // Rim from behind the shoulder separates the weapon from the world. Kept
+    // near-neutral: a saturated blue rim on a near-black metal is indistinguish-
+    // able from the weapon being blue.
+    const rim = new THREE.DirectionalLight(0xa8b6cc, 1.1 * share)
     rim.position.set(-0.7, 0.35, 0.6)
     const rimTarget = new THREE.Object3D()
-    rimTarget.position.set(0, -0.05, -0.3)
+    rimTarget.position.set(0.08, -0.09, -0.58)
     this.rig.add(rimTarget)
     rim.target = rimTarget
     this.rig.add(rim)
 
     // Sky/ground bounce. World oriented, so it flips as the player looks around.
-    const fill = new THREE.HemisphereLight(0xa8c4e8, 0x2a241c, 0.75)
+    const fill = new THREE.HemisphereLight(0x94a3b5, 0x2a241c, 0.42 * share)
     ctx.viewmodelScene.add(fill)
 
-    const env = this.ctx.services.lighting?.environment
-    if (env) {
-      this.ctx.viewmodelScene.environment = env
-    } else {
-      this.ctx.viewmodelScene.environment = this.makeStudioEnvironment()
-    }
-    this.ctx.viewmodelScene.environmentIntensity = 0.85
+    // Weapon space gets its own probe, always. Handing the sky PMREM to a
+    // metalness-0.9 surface makes the weapon a mirror of the sky, and no amount
+    // of albedo tuning fixes it: at that metalness the albedo *is* the tint on
+    // a reflection of whatever the probe contains. A dark studio box with one
+    // bright lobe gives controlled specular that reads as gunmetal from every
+    // camera angle, which the sky probe can never do.
+    this.studioEnv = this.makeStudioEnvironment()
+    this.ctx.viewmodelScene.environment = this.studioEnv
+    this.ctx.viewmodelScene.environmentIntensity = 0.75
   }
 
-  /** Fallback IBL so metal still has something to reflect. */
+  /**
+   * Neutral studio probe: dark surround, one warm key lobe high and to the
+   * right, a dim cool bounce opposite it, and a dark floor.
+   */
   private makeStudioEnvironment(): THREE.Texture | null {
     try {
       const pmrem = new THREE.PMREMGenerator(this.ctx.renderer)
@@ -247,9 +267,14 @@ export class Viewmodel {
         m.position.set(pos[0], pos[1], pos[2])
         scene.add(m)
       }
-      panel(0x9fc4ff, 1.0, [0, 0, 0], [20, 20, 20])
-      panel(0xfff2d8, 3.2, [4, 6, -3], [5, 3, 5])
-      panel(0x243040, 0.5, [0, -8, 0], [20, 2, 20])
+      // Surround: near-black neutral. This is what most of the weapon reflects.
+      panel(0x2b2b2c, 0.55, [0, 0, 0], [20, 20, 20])
+      // Key lobe, warm, above and to the shooter's right.
+      panel(0xfff0d6, 2.4, [5.5, 6.5, -2.5], [4.5, 2.6, 4.5])
+      // Cool bounce opposite, kept dim so it tints rather than colours.
+      panel(0x93a6c0, 0.42, [-6.5, 1.5, 3.0], [4, 5, 4])
+      // Floor: warm dirt bounce, darker than the surround.
+      panel(0x1e1a15, 0.5, [0, -8, 0], [20, 2, 20])
       const rt = pmrem.fromScene(scene, 0.02)
       pmrem.dispose()
       scene.traverse((o) => {
@@ -331,7 +356,13 @@ export class Viewmodel {
 
     this.reticleMat.map = model.reticleKind === 'cross' ? this.mats.crossTexture : this.mats.dotTexture
     this.reticleMat.blending = model.reticleKind === 'cross' ? THREE.NormalBlending : THREE.AdditiveBlending
-    this.reticleMat.color.set(model.reticleKind === 'cross' ? 0xffffff : 0xff2a12)
+    if (model.reticleKind === 'cross') {
+      this.reticleMat.color.set(0xffffff)
+    } else {
+      // Above 1.0 in linear working space so the emitter crosses the bloom
+      // threshold and reads as a lit dot rather than a red decal.
+      this.reticleMat.color.setRGB(2.8, 0.30, 0.12, THREE.LinearSRGBColorSpace)
+    }
     this.reticleMat.needsUpdate = true
     this.reticle.visible = model.reticleKind !== 'none'
     this.scopeMask.visible = model.reticleKind === 'cross'
@@ -780,6 +811,8 @@ export class Viewmodel {
   }
 
   dispose(): void {
+    this.studioEnv?.dispose()
+    this.studioEnv = null
     for (const model of this.models.values()) {
       model.root.traverse((o) => {
         const mesh = o as THREE.Mesh

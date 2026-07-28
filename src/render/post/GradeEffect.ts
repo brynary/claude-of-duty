@@ -12,10 +12,13 @@ export type ToneMapOperator = 'agx' | 'aces' | 'neutral'
  * radiance into [0,1] and before anything else touches the pixel. Splitting
  * this across effects means round-tripping the colour space twice.
  *
- * AgX is the default operator. ACES is punchier out of the box but shears
- * saturated highlights toward yellow-white — muzzle flashes and sunlit ochre
- * plaster both lose their hue. AgX keeps the hue and lands flatter, which is
- * exactly what the grade LUT is there to fix.
+ * ACES is the default operator. AgX holds highlight hue better — it does not
+ * shear a muzzle flash toward yellow-white the way ACES does — but its log
+ * encoding spans 16.5 stops, and this scene only ever occupies about five of
+ * them. Measured on the same grade at matched mid-grey, AgX put scene luminance
+ * 0.02 at sRGB 19 and 0.57 at 186; ACES put them at 13 and 212. That extra
+ * spread at both ends is worth more here than highlight hue on the handful of
+ * pixels bright enough to shear.
  *
  * Output is display-referred and sRGB-encoded rather than linear. Everything
  * downstream — SMAA, temporal accumulation, grain, vignette — behaves better
@@ -65,6 +68,10 @@ vec3 acesFit(const in vec3 v) {
   return a / b;
 }
 
+// Stephen Hill's fit of the ACES RRT+ODT. Note there is no 1/0.6 pre-scale
+// here: that is Unreal's convention for matching its own exposure, and baking
+// it in silently brightened every mid-tone by a full stop while pretending the
+// exposure knob was at 1.0. Exposure is exposure; the curve is the curve.
 vec3 toneMapAces(const in vec3 linearColor) {
   const mat3 acesIn = mat3(
     0.59719, 0.07600, 0.02840,
@@ -76,7 +83,7 @@ vec3 toneMapAces(const in vec3 linearColor) {
     -0.53108, 1.10813, -0.07276,
     -0.07367, -0.00605, 1.07602
   );
-  return clamp(acesOut * acesFit(acesIn * (linearColor / 0.6)), 0.0, 1.0);
+  return clamp(acesOut * acesFit(acesIn * linearColor), 0.0, 1.0);
 }
 
 vec3 toneMapNeutral(const in vec3 linearColor) {
@@ -105,9 +112,9 @@ vec3 gradeEncode(const in vec3 c) {
 
 function buildFragmentShader(operator: ToneMapOperator): string {
   const call =
-    operator === 'aces' ? 'toneMapAces(scene)'
+    operator === 'agx' ? 'toneMapAgx(scene)'
       : operator === 'neutral' ? 'toneMapNeutral(scene)'
-        : 'toneMapAgx(scene)'
+        : 'toneMapAces(scene)'
 
   return /* glsl */ `
 uniform mediump sampler3D lut;
@@ -141,10 +148,10 @@ export class GradeEffect extends Effect {
   private readonly lut: GradeLut
 
   constructor({
-    operator = 'agx',
+    operator = 'aces',
     exposure = 1,
     lutStrength = 1,
-    lutSize = 33,
+    lutSize = 41,
     grade = FILMIC_GRADE,
   }: GradeEffectOptions = {}) {
     const lut = createGradeLut(lutSize, grade)

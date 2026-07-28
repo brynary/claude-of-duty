@@ -3,7 +3,17 @@ import type { WeaponKind } from './WeaponGeometry'
 
 export type FireMode = 'auto' | 'burst' | 'semi'
 
-/** Position + XYZ euler offset of the weapon root, in camera space. */
+/**
+ * Position + XYZ euler offset of the weapon root, in camera space.
+ *
+ * Framing rule for every hip pose below: the rearmost point of the weapon must
+ * stay at least ~0.19m in front of the eye. The viewmodel camera's near plane
+ * is 6mm, so a buttpad parked at 1cm does not clip away — it explodes across
+ * the lower half of the frame under extreme perspective, which is what made the
+ * first pass read as a gun smeared diagonally through screen centre. Pushing
+ * the whole weapon forward costs apparent size but buys a stable silhouette
+ * that stays inside the lower-right quadrant.
+ */
 export interface VmPose {
   pos: readonly [number, number, number]
   rot: readonly [number, number, number]
@@ -138,14 +148,20 @@ export const WEAPONS: readonly WeaponDef[] = [
       snap: 38, recovery: 9, permanent: 0.12, adsScale: 0.72,
       kickBack: 0.014, kickUp: 0.055, kickRoll: 0.030, visualSnap: 26,
     },
-    adsTime: 0.18, eyeRelief: 0.163, adsFovScale: 0.72, adsVmFov: 46,
+    // Eye relief is deliberately longer than the optic's real 60mm: it sets how
+    // much of the frame the sight housing eats at full ADS. 0.255m puts the
+    // 41mm tube at ~19% of frame height, which is the shipped-shooter read.
+    adsTime: 0.18, eyeRelief: 0.255, adsFovScale: 0.72, adsVmFov: 46,
     reloadTime: 2.1, reloadEmptyTime: 2.6, magOutAt: 0.30, magInAt: 0.56, chargeAt: 0.80,
     drawTime: 0.5, holsterTime: 0.32, sprintOutTime: 0.16, inspectTime: 2.4,
-    hip: { pos: [0.128, -0.105, -0.300], rot: [0.015, 0.070, 0.028] },
-    sprint: { pos: [0.090, -0.162, -0.265], rot: [-0.40, 0.60, 0.34] },
-    lowReady: { pos: [0.100, -0.082, -0.300], rot: [-0.155, 0.340, 0.060] },
+    // Measured against a 60 degree viewmodel camera at 16:9: 28.8% of screen
+    // width, top of the optic at 52% height, magazine tip on the bottom edge,
+    // nothing closer than 24cm to the eye.
+    hip: { pos: [0.132, -0.114, -0.500], rot: [0.014, 0.048, 0.108] },
+    sprint: { pos: [0.112, -0.170, -0.470], rot: [-0.42, 0.62, 0.36] },
+    lowReady: { pos: [0.126, -0.104, -0.540], rot: [-0.095, 0.170, 0.105] },
     bobScale: 1, swayScale: 1,
-    recoilPivot: [0, -0.02, 0.26],
+    recoilPivot: [0, -0.02, 0.22],
     shellVel: [2.6, 1.5, 0.5],
     muzzleFlashScale: 1,
     boltTravel: 0, slideLock: false,
@@ -168,14 +184,14 @@ export const WEAPONS: readonly WeaponDef[] = [
       snap: 42, recovery: 11, permanent: 0.08, adsScale: 0.76,
       kickBack: 0.010, kickUp: 0.042, kickRoll: 0.026, visualSnap: 30,
     },
-    adsTime: 0.14, eyeRelief: 0.150, adsFovScale: 0.80, adsVmFov: 50,
+    adsTime: 0.14, eyeRelief: 0.235, adsFovScale: 0.80, adsVmFov: 50,
     reloadTime: 1.95, reloadEmptyTime: 2.45, magOutAt: 0.28, magInAt: 0.54, chargeAt: 0.80,
     drawTime: 0.42, holsterTime: 0.28, sprintOutTime: 0.13, inspectTime: 2.2,
-    hip: { pos: [0.122, -0.096, -0.270], rot: [0.020, 0.075, 0.030] },
-    sprint: { pos: [0.086, -0.152, -0.240], rot: [-0.42, 0.64, 0.36] },
-    lowReady: { pos: [0.096, -0.078, -0.270], rot: [-0.160, 0.350, 0.065] },
+    hip: { pos: [0.124, -0.106, -0.470], rot: [0.016, 0.052, 0.104] },
+    sprint: { pos: [0.106, -0.160, -0.440], rot: [-0.44, 0.66, 0.38] },
+    lowReady: { pos: [0.118, -0.098, -0.500], rot: [-0.095, 0.175, 0.100] },
     bobScale: 1.1, swayScale: 1.15,
-    recoilPivot: [0, -0.02, 0.20],
+    recoilPivot: [0, -0.02, 0.18],
     shellVel: [2.9, 1.6, 0.4],
     muzzleFlashScale: 0.85,
     boltTravel: 0, slideLock: false,
@@ -198,14 +214,14 @@ export const WEAPONS: readonly WeaponDef[] = [
       snap: 30, recovery: 6, permanent: 0.0, adsScale: 0.9,
       kickBack: 0.040, kickUp: 0.150, kickRoll: 0.045, visualSnap: 15,
     },
-    adsTime: 0.34, eyeRelief: 0.274, adsFovScale: 0.30, adsVmFov: 40,
+    adsTime: 0.34, eyeRelief: 0.300, adsFovScale: 0.30, adsVmFov: 40,
     reloadTime: 2.7, reloadEmptyTime: 3.2, magOutAt: 0.28, magInAt: 0.55, chargeAt: 0.82,
     drawTime: 0.72, holsterTime: 0.45, sprintOutTime: 0.26, inspectTime: 2.8,
-    hip: { pos: [0.130, -0.114, -0.290], rot: [0.010, 0.062, 0.030] },
-    sprint: { pos: [0.096, -0.172, -0.255], rot: [-0.36, 0.56, 0.32] },
-    lowReady: { pos: [0.104, -0.092, -0.310], rot: [-0.140, 0.300, 0.055] },
+    hip: { pos: [0.136, -0.120, -0.505], rot: [0.012, 0.044, 0.102] },
+    sprint: { pos: [0.116, -0.176, -0.470], rot: [-0.38, 0.58, 0.34] },
+    lowReady: { pos: [0.130, -0.110, -0.545], rot: [-0.090, 0.160, 0.100] },
     bobScale: 0.8, swayScale: 0.75,
-    recoilPivot: [0, -0.02, 0.24],
+    recoilPivot: [0, -0.02, 0.22],
     shellVel: [2.2, 1.4, 0.6],
     muzzleFlashScale: 1.5,
     boltTravel: 0.07, slideLock: false,
@@ -228,14 +244,14 @@ export const WEAPONS: readonly WeaponDef[] = [
       snap: 44, recovery: 13, permanent: 0.05, adsScale: 0.8,
       kickBack: 0.012, kickUp: 0.075, kickRoll: 0.020, visualSnap: 32,
     },
-    adsTime: 0.16, eyeRelief: 0.300, adsFovScale: 0.82, adsVmFov: 50,
+    adsTime: 0.16, eyeRelief: 0.320, adsFovScale: 0.82, adsVmFov: 50,
     reloadTime: 1.65, reloadEmptyTime: 2.2, magOutAt: 0.26, magInAt: 0.56, chargeAt: 0.80,
     drawTime: 0.36, holsterTime: 0.24, sprintOutTime: 0.11, inspectTime: 2.0,
-    hip: { pos: [0.105, -0.085, -0.310], rot: [0.030, 0.055, 0.020] },
-    sprint: { pos: [0.080, -0.150, -0.280], rot: [-0.44, 0.52, 0.30] },
-    lowReady: { pos: [0.086, -0.070, -0.320], rot: [-0.170, 0.300, 0.050] },
+    hip: { pos: [0.104, -0.116, -0.330], rot: [0.028, 0.052, 0.088] },
+    sprint: { pos: [0.088, -0.166, -0.305], rot: [-0.46, 0.56, 0.32] },
+    lowReady: { pos: [0.098, -0.104, -0.360], rot: [-0.120, 0.180, 0.082] },
     bobScale: 1.15, swayScale: 1.3,
-    recoilPivot: [0, -0.06, 0.10],
+    recoilPivot: [0, -0.06, 0.08],
     shellVel: [3.1, 2.0, 0.3],
     muzzleFlashScale: 0.7,
     boltTravel: 0.026, slideLock: true,

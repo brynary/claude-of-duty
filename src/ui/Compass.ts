@@ -77,20 +77,28 @@ export class Compass {
     const g = this.sg
     g.clearRect(0, 0, stripW, this.h)
 
+    // Every tick is drawn twice — a dark casing offset a pixel down-right,
+    // then the bright stroke. A single light hairline disappears the moment
+    // the ribbon crosses a sunlit wall.
     const baseY = this.h - Math.round(4 * u)
-    for (let deg = 0; deg < 360; deg += 5) {
-      const x = Math.round(deg * this.ppd) + 0.5
-      const major = deg % 15 === 0
-      const cardinal = deg % 45 === 0
-      const len = cardinal ? 10 * u : major ? 7.5 * u : 4.5 * u
-      g.strokeStyle = cardinal
-        ? 'rgba(240,244,238,.8)'
-        : major ? 'rgba(232,236,231,.55)' : 'rgba(232,236,231,.3)'
-      g.lineWidth = Math.max(1, u)
-      g.beginPath()
-      g.moveTo(x, baseY)
-      g.lineTo(x, baseY - len)
-      g.stroke()
+    const off = Math.max(1, Math.round(u))
+    for (let pass = 0; pass < 2; pass++) {
+      const shadow = pass === 0
+      for (let deg = 0; deg < 360; deg += 5) {
+        const x = Math.round(deg * this.ppd) + 0.5 + (shadow ? off : 0)
+        const major = deg % 15 === 0
+        const cardinal = deg % 45 === 0
+        const len = cardinal ? 10 * u : major ? 7.5 * u : 4.5 * u
+        g.strokeStyle = shadow
+          ? 'rgba(4,7,6,.72)'
+          : cardinal ? 'rgba(242,246,240,.92)'
+            : major ? 'rgba(232,236,231,.72)' : 'rgba(232,236,231,.46)'
+        g.lineWidth = Math.max(1, shadow ? u * 1.3 : u)
+        g.beginPath()
+        g.moveTo(x, baseY + (shadow ? off : 0))
+        g.lineTo(x, baseY - len + (shadow ? off : 0))
+        g.stroke()
+      }
     }
 
     g.textAlign = 'center'
@@ -103,16 +111,16 @@ export class Compass {
         const primary = cardinal.length === 1
         g.font = `600 ${(primary ? 20 : 13.5) * u}px ${FONT}`
         setSpacing(g, (primary ? 1.6 : 1.2) * u)
-        g.fillStyle = 'rgba(6,9,8,.6)'
+        g.fillStyle = 'rgba(4,7,6,.78)'
         g.fillText(cardinal, x + u, labelY + Math.max(1, u))
-        g.fillStyle = primary ? 'rgba(242,246,240,.97)' : 'rgba(232,236,231,.68)'
+        g.fillStyle = primary ? 'rgba(242,246,240,.95)' : 'rgba(232,236,231,.8)'
         g.fillText(cardinal, x, labelY)
       } else {
         g.font = `500 ${10.5 * u}px ${FONT}`
         setSpacing(g, 0.9 * u)
-        g.fillStyle = 'rgba(6,9,8,.5)'
+        g.fillStyle = 'rgba(4,7,6,.72)'
         g.fillText(pad3(deg), x + u, labelY - 1 * u + u)
-        g.fillStyle = 'rgba(232,236,231,.46)'
+        g.fillStyle = 'rgba(232,236,231,.64)'
         g.fillText(pad3(deg), x, labelY - 1 * u)
       }
     }

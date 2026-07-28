@@ -60,6 +60,14 @@ export class ShadowCascade {
   readonly csm: CSM
   readonly lights: THREE.DirectionalLight[]
 
+  /**
+   * Chained onto every material the sweep finds, after the cascade's own hook.
+   * The sweep is the only place in the codebase that sees the whole set of lit
+   * world materials, so anything else that has to touch all of them — the sky
+   * occlusion term, for one — rides along rather than traversing twice.
+   */
+  materialHook: CompileHook | null = null
+
   private registered = new WeakSet<THREE.Material>()
   private sweepTimer = 0
   private readonly shadowMapSize: number
@@ -164,6 +172,7 @@ export class ShadowCascade {
     material.onBeforeCompile = (shader, renderer) => {
       previous.call(material, shader, renderer)
       csmHook.call(material, shader, renderer)
+      this.materialHook?.call(material, shader, renderer)
     }
     material.needsUpdate = true
   }

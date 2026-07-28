@@ -524,7 +524,9 @@ export class LightShafts {
         uTime: { value: 0 },
         uProjScale: { value: 600 },
         uColor: { value: new THREE.Vector3(color.r, color.g, color.b) },
-        uIntensity: { value: 2.6 },
+        // Just at the bloom threshold at their brightest, so a mote reads as a
+        // lit speck of dust rather than acquiring a halo of its own.
+        uIntensity: { value: 1.1 },
       },
       vertexShader: MOTE_VERTEX,
       fragmentShader: MOTE_FRAGMENT,

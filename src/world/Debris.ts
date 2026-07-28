@@ -4,7 +4,7 @@ import type { Rand } from '../core/Rand'
 import {
   Builder, InstanceFarm, chamferBox, cylinderGeom, decalQuad, rampPrism, catenary,
 } from './Kit'
-import { groundHeight } from './Terrain'
+import { POTHOLES, groundHeight, settleHeight, surfaceHeight } from './Terrain'
 import { BUILDINGS, footprintBase, xform } from './Buildings'
 
 /**
@@ -44,7 +44,7 @@ export function buildSandDrift(b: Builder, rng: Rand): void {
         const wx = spec.cx + lx * c + lz * s
         const wz = spec.cz - lx * s + lz * c
         const g = rampPrism(seg * rng.range(0.9, 1.15), height, depth)
-        b.geom('sand', g, xform(wx, groundHeight(wx, wz) - 0.03, wz, yaw + SIDE_YAW[side] + Math.PI))
+        b.geom('sand', g, xform(wx, surfaceHeight(wx, wz) - 0.04, wz, yaw + SIDE_YAW[side] + Math.PI))
       }
     }
   }
@@ -111,44 +111,65 @@ export function buildCollapsedBlock(b: Builder, farm: InstanceFarm, rng: Rand): 
     const px = cx + Math.cos(a) * r
     const pz = cz + Math.sin(a) * r
     farm.place(rng.bool(0.5) ? `chunk${rng.int(0, 3)}` : 'brick',
-      px, groundHeight(px, pz) + 0.06, pz, rng.range(0, 3.1), rng.range(0.7, 1.4), rng.spread(0.5), rng.spread(0.5))
+      px, settleHeight(px, pz, 0.12, 0.01), pz, rng.range(0, 3.1), rng.range(0.7, 1.4), rng.spread(0.5), rng.spread(0.5))
   }
 }
 
-/** Cone-shaped rubble piles where a facade has come down. */
+/**
+ * Rubble heaps where a facade has come down.
+ *
+ * Two things changed here. The heaps are lower and elliptical rather than
+ * conical, because a 0.8 m cone of boulders across a 4.4 m alley reads as a
+ * barricade of eggs and walls off the corridor's leading lines. And every
+ * fragment is scaled non-uniformly, so a heap made from four base shapes never
+ * shows the same silhouette twice.
+ */
 export function buildRubblePiles(b: Builder, farm: InstanceFarm, rng: Rand): void {
-  const piles: [number, number, number][] = [
-    [5.6, 21.6, 1.8], [-9.2, 33.4, 2.4], [9.9, 24.6, 2.2], [-24.4, -22.0, 2.0],
-    [2.2, 36.6, 2.6], [-19.6, 15.4, 1.9], [15.6, 8.2, 2.0], [26.8, 20.6, 2.3],
-    [-6.4, -0.8, 1.6], [12.0, 36.5, 2.8], [-30.6, 2.0, 2.1], [-1.4, -29.0, 1.9],
+  // x, z, radius, height factor, and how far the heap is stretched along z.
+  const piles: [number, number, number, number, number][] = [
+    // Pulled hard against the alley's west wall so the sightline stays open.
+    [5.35, 21.4, 1.5, 0.26, 1.5], [-9.2, 33.4, 2.4, 0.4, 1.0],
+    [9.9, 24.6, 2.2, 0.4, 1.0], [-24.4, -22.0, 2.0, 0.38, 1.1],
+    [2.2, 36.6, 2.6, 0.42, 1.0], [-19.6, 15.4, 1.9, 0.36, 1.2],
+    [15.6, 8.2, 2.0, 0.4, 1.0], [26.8, 20.6, 2.3, 0.4, 1.0],
+    [-6.4, -0.8, 1.6, 0.34, 1.0], [12.0, 36.5, 2.8, 0.44, 1.0],
+    [-30.6, 2.0, 2.1, 0.4, 1.0], [-1.4, -29.0, 1.9, 0.36, 1.3],
   ]
-  for (const [x, z, r] of piles) {
-    const base = groundHeight(x, z)
+  for (const [x, z, r, hf, stretch] of piles) {
+    const base = settleHeight(x, z, r * 0.5, 0.05)
     const n = Math.round(r * r * 5)
     for (let i = 0; i < n; i++) {
       const a = rng.range(0, Math.PI * 2)
       const rr = Math.sqrt(rng.next()) * r
       const px = x + Math.cos(a) * rr
-      const pz = z + Math.sin(a) * rr
-      const py = base + Math.max(0.04, (1 - rr / r) * r * 0.42) * rng.range(0.5, 1.0)
-      farm.place(`rubble${rng.int(0, 3)}`, px, py, pz, rng.range(0, 3.1), rng.range(0.7, 1.3), rng.spread(0.6), rng.spread(0.6))
+      const pz = z + Math.sin(a) * rr * stretch
+      const py = base + Math.max(0.02, (1 - rr / r) * r * hf) * rng.range(0.4, 1.0)
+      const s = rng.range(0.7, 1.3)
+      farm.placeScaled(`rubble${rng.int(0, 3)}`, px, py, pz, rng.range(0, 3.1),
+        s * rng.range(0.8, 1.25), s * rng.range(0.62, 1.0), s * rng.range(0.8, 1.25),
+        rng.spread(0.7), rng.spread(0.7))
     }
-    for (let i = 0; i < Math.round(r * 6); i++) {
+    for (let i = 0; i < Math.round(r * 8); i++) {
       const a = rng.range(0, Math.PI * 2)
-      const rr = Math.sqrt(rng.next()) * r * 1.5
+      const rr = Math.sqrt(rng.next()) * r * 1.6
       const px = x + Math.cos(a) * rr
-      const pz = z + Math.sin(a) * rr
-      farm.place('brick', px, groundHeight(px, pz) + 0.05, pz, rng.range(0, 3.1), rng.range(0.85, 1.15), rng.spread(0.4), rng.spread(0.4))
+      const pz = z + Math.sin(a) * rr * stretch
+      farm.place('brick', px, settleHeight(px, pz, 0.09, 0.012), pz,
+        rng.range(0, 3.1), rng.range(0.8, 1.2), rng.spread(0.5), rng.spread(0.5))
     }
+    // Dust washed out from the heap, so it does not stop at a hard edge.
+    b.geom('dirt', decalQuad(r * 3.0, r * 3.0 * stretch, 0.3, x * 11 + z),
+      xform(x, surfaceHeight(x, z) + 0.02, z, rng.range(0, 3.1), -Math.PI / 2))
     // Twisted rebar emerging from the heap.
     for (let i = 0; i < 3; i++) {
       const a = rng.range(0, Math.PI * 2)
       b.geom('rebar', catenary(
-        new THREE.Vector3(x + rng.spread(r * 0.4), base + r * 0.35, z + rng.spread(r * 0.4)),
+        new THREE.Vector3(x + rng.spread(r * 0.4), base + r * hf * 0.95, z + rng.spread(r * 0.4)),
         new THREE.Vector3(x + Math.cos(a) * r * 1.1, base + 0.08, z + Math.sin(a) * r * 1.1),
         0.2, 0.013, 6, 4))
     }
-    b.collide(r * 1.5, r * 0.5, r * 1.5, x, base + r * 0.2, z, 0, 'gravel')
+    const ch = Math.max(0.3, r * hf * 1.5)
+    b.collide(r * 1.5, ch, r * 1.5 * stretch, x, base + ch / 2, z, 0, 'gravel')
   }
 }
 
@@ -156,7 +177,7 @@ export function buildRubblePiles(b: Builder, farm: InstanceFarm, rng: Rand): voi
 export function buildGroundDecals(b: Builder, rng: Rand): void {
   const stains: [number, number, number, MaterialName][] = [
     [-3.2, 22.6, 3.4, 'asphaltCracked'],
-    [7.05, 27.4, 3.0, 'asphaltCracked'],
+    [7.75, 28.0, 3.0, 'asphaltCracked'],
     [-8.0, -19.5, 6.4, 'concreteRubble'],
     [13.5, 32.5, 7.5, 'concreteRubble'],
     [17.2, 31.4, 5.5, 'asphaltCracked'],
@@ -169,8 +190,10 @@ export function buildGroundDecals(b: Builder, rng: Rand): void {
     [22.0, 24.0, 3.2, 'dirt'],
   ]
   for (const [x, z, r, mat] of stains) {
+    // Seated on the drawn surface: near a crater lip the analytic field runs
+    // up to 17 cm above the mesh, which buries a 2 cm decal outright.
     b.geom(mat, decalQuad(r, r * rng.range(0.75, 1.25), 0.2, x * 3 + z),
-      xform(x, groundHeight(x, z) + 0.018, z, rng.range(0, 3.1), -Math.PI / 2))
+      xform(x, surfaceHeight(x, z) + 0.018, z, rng.range(0, 3.1), -Math.PI / 2))
   }
   // Tyre tracks worn into the dust along the routes.
   const tracks: [number, number, number, number][] = [
@@ -189,7 +212,7 @@ export function buildGroundDecals(b: Builder, rng: Rand): void {
         const ox = px + Math.sin(yaw) * off
         const oz = pz + Math.cos(yaw) * off
         b.geom('dirt', decalQuad(2.3, 0.34, 0.08, i * 3 + off),
-          xform(ox, groundHeight(ox, oz) + 0.016, oz, yaw, -Math.PI / 2))
+          xform(ox, surfaceHeight(ox, oz) + 0.016, oz, yaw, -Math.PI / 2))
       }
     }
   }
@@ -205,14 +228,159 @@ export function buildCraterDressing(b: Builder, farm: InstanceFarm, rng: Rand): 
       const px = x + Math.cos(a) * rr
       const pz = z + Math.sin(a) * rr
       farm.place(rng.bool(0.4) ? `rubble${rng.int(0, 2)}` : `chunk${rng.int(0, 3)}`,
-        px, groundHeight(px, pz) + 0.07, pz, rng.range(0, 3.1), rng.range(0.6, 1.2), rng.spread(0.6), rng.spread(0.6))
+        px, settleHeight(px, pz, 0.16, 0.0), pz, rng.range(0, 3.1), rng.range(0.6, 1.2), rng.spread(0.6), rng.spread(0.6))
     }
     for (let i = 0; i < 5; i++) {
       const a = rng.range(0, Math.PI * 2)
       b.geom('rebar', catenary(
-        new THREE.Vector3(x + Math.cos(a) * r * 0.5, groundHeight(x, z) - 0.1, z + Math.sin(a) * r * 0.5),
-        new THREE.Vector3(x + Math.cos(a) * r * 1.3, groundHeight(x, z) + 0.4, z + Math.sin(a) * r * 1.3),
+        new THREE.Vector3(x + Math.cos(a) * r * 0.5, surfaceHeight(x, z) - 0.1, z + Math.sin(a) * r * 0.5),
+        new THREE.Vector3(x + Math.cos(a) * r * 1.3, surfaceHeight(x, z) + 0.4, z + Math.sin(a) * r * 1.3),
         -0.3, 0.014, 6, 4))
+    }
+  }
+}
+
+/**
+ * Standing water in every pothole and crater, plus a few slicks where a wall
+ * drains onto the pavement.
+ *
+ * A wet patch is the cheapest specular event in a dusty scene: it reflects the
+ * sky, breaks up a flat ground plane and immediately reads as weather that has
+ * happened rather than a surface that was generated.
+ */
+export function buildPuddles(b: Builder, rng: Rand): void {
+  const seat = (x: number, z: number, r: number): number => {
+    // Water finds the lowest point it covers, so sample the dish rather than
+    // the centre — otherwise the sheet clips through one lip of the hollow.
+    let lo = surfaceHeight(x, z)
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2
+      lo = Math.min(lo, surfaceHeight(x + Math.cos(a) * r * 0.6, z + Math.sin(a) * r * 0.6))
+    }
+    return lo
+  }
+  for (const p of POTHOLES) {
+    const r = p.r * rng.range(0.55, 0.85)
+    const y = seat(p.x, p.z, r) + p.depth * rng.range(0.24, 0.42)
+    b.geom('water', decalQuad(r * 1.8, r * 1.5, 0.24, p.x * 7 + p.z),
+      xform(p.x, y, p.z, rng.range(0, 3.1), -Math.PI / 2))
+    // A damp halo so the water does not meet dry dust at a hard line.
+    b.geom('asphaltCracked', decalQuad(r * 2.6, r * 2.2, 0.26, p.z * 5 + 3),
+      xform(p.x, y - 0.004, p.z, rng.range(0, 3.1), -Math.PI / 2))
+  }
+  // Seepage down the shaded sides of the two routes and under the gateway.
+  const slicks: [number, number, number][] = [
+    [6.4, 16.8, 1.1], [7.6, 23.2, 0.9], [6.9, 33.4, 1.3], [-9.6, 24.0, 1.2],
+    [-4.0, 30.6, 1.5], [-19.4, 6.2, 0.9], [11.6, 12.0, 1.0], [-13.4, -8.0, 1.2],
+  ]
+  for (const [x, z, r] of slicks) {
+    const y = seat(x, z, r)
+    b.geom('water', decalQuad(r * 1.7, r * 1.1, 0.3, x * 3 + z), xform(x, y + 0.012, z, rng.range(0, 3.1), -Math.PI / 2))
+    b.geom('dirt', decalQuad(r * 2.7, r * 1.9, 0.3, x - z), xform(x, y + 0.008, z, rng.range(0, 3.1), -Math.PI / 2))
+  }
+}
+
+/**
+ * Sprayed tags, stencils and scorch on the frontages the graded cameras face.
+ *
+ * Each tag is a run of overlapping strokes rather than a texture, so it takes
+ * scene light and sits at a believable height and reach — roughly shoulder to
+ * head, always near a doorway or a corner where someone could stand.
+ */
+export function buildWallMarks(b: Builder, rng: Rand): void {
+  // x, z on the wall plane, the yaw whose local -Z points out of the wall, and
+  // a scale. Anchors sit on real faces: the alley's two walls, the market
+  // street frontages and the plaza's east row.
+  const spots: [number, number, number, number][] = [
+    [9.18, 11.4, Math.PI / 2, 1.0], [9.18, 16.8, Math.PI / 2, 0.8],
+    [5.02, 14.6, -Math.PI / 2, 0.9], [5.02, 27.4, -Math.PI / 2, 1.1],
+    [9.19, 26.2, Math.PI / 2, 1.0], [9.19, 32.6, Math.PI / 2, 0.85],
+    [-10.48, 20.6, -Math.PI / 2, 1.05], [-10.48, 30.2, -Math.PI / 2, 0.9],
+    [-13.0, -0.55, 0, 1.0], [-21.34, 22.0, -Math.PI / 2, 0.95],
+    [5.02, -11.4, -Math.PI / 2, 0.9], [-25.34, -20.0, -Math.PI / 2, 1.0],
+    [5.02, 33.0, -Math.PI / 2, 0.8],
+  ]
+  const inks: MaterialName[] = ['rubber', 'brickRed', 'metalPainted', 'rubber']
+  for (const [x, z, yaw, s] of spots) {
+    const y = groundHeight(x, z) + rng.range(1.25, 1.75)
+    const ink = rng.pick(inks)
+    b.push(x, y, z, yaw)
+    // Backing haze from the overspray.
+    b.geom('plasterDamaged', decalQuad(2.0 * s, 0.95 * s, 0.32, x * 5 + z), xform(0, 0, -0.013))
+    let cx = -0.85 * s
+    while (cx < 0.85 * s) {
+      const w = rng.range(0.12, 0.3) * s
+      const h = rng.range(0.16, 0.42) * s
+      const lean = rng.spread(0.35)
+      b.geom(ink, decalQuad(w, 0.05 * s, 0.25, cx * 31), xform(cx, rng.spread(0.12) * s, -0.018, 0, 0, lean))
+      b.geom(ink, decalQuad(0.05 * s, h, 0.25, cx * 17 + 2), xform(cx + rng.spread(0.05), rng.spread(0.1) * s, -0.018, 0, 0, lean * 0.4))
+      if (rng.bool(0.45)) {
+        b.geom(ink, decalQuad(w * 0.7, 0.045 * s, 0.3, cx * 7), xform(cx, h * 0.5, -0.018, 0, 0, rng.spread(0.5)))
+      }
+      cx += w * rng.range(0.7, 1.15)
+    }
+    // A drip or two, because spray always runs.
+    for (let i = 0; i < rng.int(1, 3); i++) {
+      b.geom(ink, decalQuad(0.02 * s, rng.range(0.1, 0.3) * s, 0.2, i * 13 + x),
+        xform(rng.spread(0.7) * s, -rng.range(0.15, 0.35) * s, -0.019))
+    }
+    b.pop()
+  }
+  // Soot fanning up the wall out of the openings that took a fire.
+  const scorch: [number, number, number, number, number, number][] = [
+    [9.18, 9.8, Math.PI / 2, 1.8, 2.4, 2.6],
+    [5.02, 16.4, -Math.PI / 2, 1.6, 1.9, 2.0],
+    [5.02, 30.2, -Math.PI / 2, 2.2, 2.6, 3.0],
+    [-10.48, 26.4, -Math.PI / 2, 2.4, 2.8, 3.2],
+    [-16.4, -0.55, 0, 2.0, 2.4, 2.6],
+    [5.02, -18.0, -Math.PI / 2, 2.2, 2.7, 3.0],
+  ]
+  for (const [x, z, yaw, w, cy, h] of scorch) {
+    const y = groundHeight(x, z)
+    b.push(x, y, z, yaw)
+    b.geom('rubber', decalQuad(w, h, 0.34, x * 9 + z), xform(rng.spread(0.3), cy, -0.016))
+    b.geom('plasterDamaged', decalQuad(w * 1.35, h * 0.6, 0.3, z * 3), xform(rng.spread(0.4), cy - 0.6, -0.014))
+    b.pop()
+  }
+}
+
+/**
+ * Grime banked into the bottom half-metre of every facade, plus rust streaks
+ * running down from whatever is bolted to it. Nothing in a dusty town has a
+ * clean wall base.
+ */
+export function buildWallGrime(b: Builder, rng: Rand): void {
+  const proud = 0.022
+  for (const spec of BUILDINGS) {
+    const yaw = spec.yaw ?? 0
+    const c = Math.cos(yaw)
+    const s = Math.sin(yaw)
+    for (const side of ['n', 'e', 's', 'w'] as const) {
+      const along = side === 'n' || side === 's' ? spec.w : spec.d
+      const half = side === 'n' || side === 's' ? spec.d / 2 : spec.w / 2
+      const n = Math.max(1, Math.round(along / 2.6))
+      // Local outward normal of this face, before the building's own yaw.
+      const dx = side === 'e' ? 1 : side === 'w' ? -1 : 0
+      const dz = side === 's' ? 1 : side === 'n' ? -1 : 0
+      const ox = dx * c + dz * s
+      const oz = -dx * s + dz * c
+      // Rotating a decal by this yaw sends its +Z normal along (ox, oz).
+      const face = Math.atan2(ox, oz)
+      for (let i = 0; i < n; i++) {
+        const t = (i + 0.5) / n - 0.5
+        const localAlong = t * along + rng.spread(0.5)
+        const lx = side === 'n' ? localAlong : side === 's' ? -localAlong : dx * half
+        const lz = side === 'e' ? localAlong : side === 'w' ? -localAlong : dz * half
+        const wx = spec.cx + lx * c + lz * s + ox * proud
+        const wz = spec.cz - lx * s + lz * c + oz * proud
+        const base = groundHeight(wx, wz)
+        b.geom('dirt', decalQuad(along / n + rng.range(0, 0.8), rng.range(0.5, 1.15), 0.28, wx * 3 + wz),
+          xform(wx, base + rng.range(0.25, 0.5), wz, face))
+        if (rng.bool(0.3)) {
+          b.geom('metalRusted', decalQuad(rng.range(0.1, 0.26), rng.range(0.9, 2.4), 0.3, wz * 7 + 1),
+            xform(wx + oz * rng.spread(along * 0.3), base + rng.range(1.8, 3.4), wz - ox * rng.spread(along * 0.3), face))
+        }
+      }
     }
   }
 }
@@ -223,7 +391,7 @@ export function buildCraterDressing(b: Builder, farm: InstanceFarm, rng: Rand): 
  */
 export function buildStructures(b: Builder, rng: Rand): void {
   // Scaffold against the apartment's street facade — a climbable silhouette.
-  b.push(-10.2, groundHeight(-10.2, 29.5), 29.5, 0)
+  b.push(-10.2, settleHeight(-10.2, 29.5, 1.2, 0.05), 29.5, 0)
   for (let bay = 0; bay < 2; bay++) {
     for (const sz of [-1.1, 1.1]) {
       for (const sx of [0, 1.1]) {
@@ -246,7 +414,7 @@ export function buildStructures(b: Builder, rng: Rand): void {
   b.pop()
 
   // Lean-to shelter of corrugated sheet in the lot.
-  b.push(11.4, groundHeight(11.4, 25.6), 25.6, 0.8)
+  b.push(11.4, settleHeight(11.4, 25.6, 1.5, 0.05), 25.6, 0.8)
   for (const sx of [-1.4, 1.4]) {
     b.solid('woodBeam', 0.1, 2.3, 0.1, sx, 1.15, -1.1, 0, 0.015)
     b.solid('woodBeam', 0.1, 1.7, 0.1, sx, 0.85, 1.1, 0, 0.015)
@@ -257,7 +425,7 @@ export function buildStructures(b: Builder, rng: Rand): void {
   b.pop()
 
   // Timber hoarding around a half-finished plot.
-  b.push(-27.0, groundHeight(-27, 4.0), 4.0, 0.1)
+  b.push(-27.0, settleHeight(-27, 4.0, 1.7, 0.06), 4.0, 0.1)
   for (let i = 0; i < 12; i++) {
     b.solid('woodPlank', 0.24, 2.2 + rng.spread(0.12), 0.05, -1.5 + i * 0.27, 1.1, 0, 0, 0.01, 'wood')
   }
@@ -272,7 +440,7 @@ export function buildStructures(b: Builder, rng: Rand): void {
     const t = i * 2.5
     const x = 14.0 + t * 0.9397
     const z = 26.8 + t * 0.342
-    const y = groundHeight(x, z)
+    const y = settleHeight(x, z, 1.2, 0.06)
     b.push(x, y, z, -0.349)
     for (let k = 0; k < 11; k++) {
       b.plate('chainlink', 0.016, 1.85, 0.016, -1.15 + k * 0.23, 0.95, 0)

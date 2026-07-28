@@ -4,19 +4,54 @@ import { SkyDome } from './Sky'
 import { ShadowCascade } from './lighting/ShadowCascade'
 import { LightPool, type LightLease } from './lighting/LightPool'
 import { LightShafts } from './lighting/LightShafts'
+import { SkyOcclusion } from './lighting/SkyOcclusion'
 import {
   DEFAULT_TIME_OF_DAY, SKY_PARAMS, SKY_SCALE_VISIBLE,
   luminance, skyColor, sunBeamColor, sunDirectionFor,
 } from './lighting/SkyModel'
 
-/** Luminance the key light lands on with the sun high enough to matter. */
-const SUN_TARGET_LUMINANCE = 5.0
+/**
+ * Luminance the key light lands on with the sun high enough to matter.
+ *
+ * This and HEMISPHERE_INTENSITY together set the single number that decides
+ * whether a daylight frame reads as daylight: the ratio between a surface in
+ * the sun and the same surface in shade. Hard afternoon sun in a dry climate
+ * runs four to five stops, so a mid-albedo wall wants to sit near sRGB 210 lit
+ * and near sRGB 65 shaded. Anything flatter packs the whole frame into a
+ * midtone band and looks like an overcast render of a sunny scene.
+ *
+ * The absolute value is scene-referred and is only meaningful next to the post
+ * chain's exposure — see SKY_SCALE_VISIBLE in SkyModel for the full
+ * calibration. Changing exposure without changing these, or the reverse, moves
+ * the whole frame.
+ */
+const SUN_TARGET_LUMINANCE = 2.1
 /** Sky-bounce fill, deliberately a small fraction of the key. */
-const HEMISPHERE_INTENSITY = 0.16
+const HEMISPHERE_INTENSITY = 0.075
+
+/**
+ * Warm bounce standing in for the light a sunlit floor throws back into a room
+ * the sun never reaches. Short range and unshadowed: it is fill, not a key.
+ */
+const INTERIOR_FILL_INTENSITY = 5.2
+const INTERIOR_FILL_RANGE = 12
 
 const POOL_SIZE: Record<string, number> = { low: 3, medium: 4, high: 5, ultra: 5 }
-const INTERIOR_FILLS: Record<string, number> = { low: 0, medium: 2, high: 3, ultra: 3 }
-const FOG_DENSITY: Record<string, number> = { low: 0.0065, medium: 0.006, high: 0.0055, ultra: 0.0055 }
+const INTERIOR_FILLS: Record<string, number> = { low: 0, medium: 3, high: 4, ultra: 4 }
+/**
+ * Aerial perspective only. Halved from the value that milked out every frame —
+ * at the old density a facade sixty metres away was already a tenth of the way
+ * to fog colour and the horizon was half gone, which flattens depth instead of
+ * describing it.
+ */
+const FOG_DENSITY: Record<string, number> = { low: 0.0034, medium: 0.0032, high: 0.0030, ultra: 0.0030 }
+
+/**
+ * Fog radiance rolls off towards this rather than being hard-clipped, so haze
+ * into a low sun stays visibly brighter and warmer than haze away from it
+ * instead of both landing on the same near-white.
+ */
+const FOG_ROLLOFF = 0.44
 
 /**
  * Sun, sky, image-based ambient, the shadow cascade, volumetric shafts and the
@@ -53,13 +88,10 @@ export class LightingSystem implements System, LightingService {
   private cascade: ShadowCascade | null = null
   private pool!: LightPool
   private shafts!: LightShafts
+  private readonly occlusion = new SkyOcclusion()
   private hemisphere = new THREE.HemisphereLight(0x9dbdea, 0x6a5c46, HEMISPHERE_INTENSITY)
   private fog = new THREE.FogExp2(0xb9c9d8, 0.0055)
   private interiorFills: THREE.PointLight[] = []
-  private viewmodelRig = new THREE.Group()
-  private viewmodelKey = new THREE.PointLight(0xffecd3, 6.5, 0, 2)
-  private viewmodelFill = new THREE.PointLight(0x9dbdea, 1.7, 0, 2)
-  private viewmodelRim = new THREE.PointLight(0xfff2de, 3.2, 0, 2)
 
   private ctx!: GameContext
   private timeOfDay = DEFAULT_TIME_OF_DAY
@@ -82,7 +114,6 @@ export class LightingSystem implements System, LightingService {
   private readonly tmpDir2 = new THREE.Vector3()
   private readonly tmpVec = new THREE.Vector3()
   private readonly tmpQuat = new THREE.Quaternion()
-  private readonly viewmodelKeyRest = new THREE.Vector3(-0.62, 0.72, 0.34).normalize()
 
   init(ctx: GameContext): void {
     this.ctx = ctx
@@ -94,7 +125,7 @@ export class LightingSystem implements System, LightingService {
     scene.add(this.sky.sunSource)
     scene.add(this.hemisphere)
 
-    this.baseFogDensity = FOG_DENSITY[config.quality] ?? 0.0055
+    this.baseFogDensity = FOG_DENSITY[config.quality] ?? FOG_DENSITY.high
     this.fog.density = this.baseFogDensity
     this.fog.color.copy(this.fogColor)
     scene.fog = this.fog
@@ -110,6 +141,9 @@ export class LightingSystem implements System, LightingService {
       this.tmpDir.copy(this.sunDirection).negate(),
     )
     this.cascade.setColor(this.sunTint, this.sun.intensity)
+    // The cascade's sweep is the only pass that sees every lit world material,
+    // so the occlusion term rides on it rather than traversing the scene again.
+    this.cascade.materialHook = this.occlusion.patch
 
     this.pool = new LightPool(scene, POOL_SIZE[config.quality] ?? 4)
     this.shafts = new LightShafts(scene)
@@ -168,7 +202,7 @@ export class LightingSystem implements System, LightingService {
     // Ambient tint: the sky roughly opposite the sun, which is what actually
     // fills a shadow. Normalised so intensity alone controls its strength.
     this.tmpDir2.set(-this.sunDirection.x, 0.9, -this.sunDirection.z).normalize()
-    skyColor(this.tmpDir2, this.sunDirection, SKY_PARAMS, 1, this.ambientTint)
+    skyColor(this.tmpDir2, this.sunDirection, SKY_PARAMS, SKY_SCALE_VISIBLE, this.ambientTint)
     const peak = Math.max(this.ambientTint.r, this.ambientTint.g, this.ambientTint.b, 1e-4)
     this.ambientTint.setRGB(
       this.ambientTint.r / peak,
@@ -187,11 +221,11 @@ export class LightingSystem implements System, LightingService {
       THREE.LinearSRGBColorSpace,
     )
     this.hemisphere.groundColor.copy(this.bounceTint)
+    // Enclosed surfaces fall back to bounce, and bounce is the colour of what
+    // it bounced off — never the blue of a sky they cannot see.
+    this.occlusion.setBounceColor(this.bounceTint)
 
     for (const fill of this.interiorFills) fill.color.copy(this.bounceTint)
-    this.viewmodelKey.color.copy(this.sunTint)
-    this.viewmodelFill.color.copy(this.ambientTint)
-    this.viewmodelRim.color.copy(this.sunTint)
 
     this.updateFogColor(this.tmpDir.set(0, 0.05, -1))
   }
@@ -211,10 +245,11 @@ export class LightingSystem implements System, LightingService {
       // sky, which reads as bright blue rather than gunmetal.
     }
 
-    // The probe needs the level's collision, which lands during the level
+    // Both probes need the level's collision, which lands during the level
     // system's init, and a settled physics world.
     if (this.shaftsDirty && this.frames > 2) {
       this.shaftsDirty = false
+      this.occlusion.bake(ctx)
       this.rebuildShafts(ctx)
     }
   }
@@ -258,16 +293,17 @@ export class LightingSystem implements System, LightingService {
     this.tmpDir2.normalize()
     skyColor(this.tmpDir2, this.sunDirection, SKY_PARAMS, SKY_SCALE_VISIBLE * 0.92, this.fogSample)
 
-    // Looking into a low sun the horizon runs to several hundred nits of
-    // forward-scattered light. Left alone it would bleach every distant surface
-    // to white, so the haze is capped while its hue is kept.
-    const lum = luminance(this.fogSample)
-    const cap = 1.45
-    const scale = lum > cap ? cap / lum : 1
+    // Looking into a low sun the horizon carries several times the radiance of
+    // the sky behind the camera, and haze at that level bleaches every distant
+    // surface. A hard cap fixes the brightness but flattens the difference —
+    // both directions end up on the same near-white, which is the milky look.
+    // A soft roll-off keeps the warm-into-the-sun, cool-away-from-it split that
+    // is what aerial perspective is actually for.
+    const k = FOG_ROLLOFF
     this.fogColor.setRGB(
-      this.fogSample.r * scale,
-      this.fogSample.g * scale,
-      this.fogSample.b * scale,
+      this.fogSample.r / (1 + this.fogSample.r / k),
+      this.fogSample.g / (1 + this.fogSample.g / k),
+      this.fogSample.b / (1 + this.fogSample.b / k),
       THREE.LinearSRGBColorSpace,
     )
   }
@@ -275,33 +311,56 @@ export class LightingSystem implements System, LightingService {
   // --- Shafts and interior fill --------------------------------------------
 
   private rebuildShafts(ctx: GameContext): void {
-    if (!ctx.config.volumetricLight) return
-    try {
-      // Tuned so a shaft reads clearly brighter than the ambient floor around
-      // it but never out-shines the sunlit patch it lands on.
-      this.shafts.build(ctx, this.sunDirection, this.sunTint, 0.18)
-    } catch (err) {
-      console.warn('[lighting] shaft probe failed', err)
-      return
-    }
-    // Park the interior fills in the rooms the probe found light entering.
-    const points = this.shafts.fillPoints
-    for (let i = 0; i < this.interiorFills.length; i++) {
-      const fill = this.interiorFills[i]
-      const point = points[i]
-      if (point) {
-        fill.position.copy(point)
-        fill.intensity = 3.2
-      } else {
-        fill.intensity = 0
+    if (ctx.config.volumetricLight) {
+      try {
+        // Tuned so a shaft reads clearly brighter than the ambient floor around
+        // it but never out-shines the sunlit patch it lands on.
+        this.shafts.build(ctx, this.sunDirection, this.sunTint, 0.18)
+      } catch (err) {
+        console.warn('[lighting] shaft probe failed', err)
       }
     }
+    this.placeInteriorFills()
+  }
+
+  /**
+   * Rooms the sun reaches get their fill under the shaft, which is where the
+   * bounce actually comes from. Rooms it does not reach still need something,
+   * or cutting the ambient by the occlusion term leaves them black — so the
+   * remaining fills go to the darkest interiors the occlusion bake found.
+   */
+  private placeInteriorFills(): void {
+    const lit = this.shafts.fillPoints
+    const dark = this.occlusion.interiorPoints
+    let slot = 0
+
+    for (let i = 0; i < lit.length && slot < this.interiorFills.length; i++, slot++) {
+      const fill = this.interiorFills[slot]
+      fill.position.copy(lit[i])
+      fill.intensity = INTERIOR_FILL_INTENSITY
+    }
+
+    for (let i = 0; i < dark.length && slot < this.interiorFills.length; i++) {
+      const point = dark[i]
+      let crowded = false
+      for (let j = 0; j < slot; j++) {
+        if (this.interiorFills[j].position.distanceToSquared(point) < 36) crowded = true
+      }
+      if (crowded) continue
+      const fill = this.interiorFills[slot++]
+      fill.position.copy(point)
+      // Unlit rooms have no sunlit floor patch to bounce off, only skylight
+      // through whatever opening they have, so they get rather less.
+      fill.intensity = INTERIOR_FILL_INTENSITY * 0.62
+    }
+
+    for (; slot < this.interiorFills.length; slot++) this.interiorFills[slot].intensity = 0
   }
 
   private buildInteriorFills(scene: THREE.Scene, count: number): void {
     for (let i = 0; i < count; i++) {
       // Faked bounce off a sunlit floor patch: warm, short range, no shadow.
-      const light = new THREE.PointLight(0xffd9a8, 0, 9, 2)
+      const light = new THREE.PointLight(0xffd9a8, 0, INTERIOR_FILL_RANGE, 2)
       light.color.copy(this.bounceTint)
       light.name = `interiorFill${i}`
       light.castShadow = false
@@ -313,37 +372,19 @@ export class LightingSystem implements System, LightingService {
   // --- Viewmodel -----------------------------------------------------------
 
   /**
-   * The weapon lives in its own scene with its own camera, so none of the world
-   * lighting reaches it. Point lights rather than directionals: if the weapon
-   * shares a material with the world, that material has been set up for the
-   * shadow cascade, and the cascade's shader treats every directional light in
-   * scope as a cascade of one sun.
+   * The weapon scene is lit entirely by the weapon system, which owns a studio
+   * rig and a studio environment probe tuned so the weapon reads as gunmetal
+   * whichever way the player faces.
+   *
+   * This system used to add a second rig here. Two stacked rigs over-exposed
+   * the weapon, and two of the three lights took their colour from the sky, so
+   * anything metallic picked up a strong blue cast — the weapon rendered as
+   * blue chrome. Lighting the viewmodel is a single owner's job; that owner is
+   * the weapon system.
    */
-  private setupViewmodelRig(ctx: GameContext): void {
-    this.viewmodelRig.name = 'viewmodelLightRig'
-    this.viewmodelKey.position.copy(this.viewmodelKeyRest).multiplyScalar(1.5)
-    this.viewmodelFill.position.set(0.9, -0.15, 0.75)
-    this.viewmodelRim.position.set(0.55, 0.45, -1.5)
-    for (const light of [this.viewmodelKey, this.viewmodelFill, this.viewmodelRim]) {
-      light.castShadow = false
-      this.viewmodelRig.add(light)
-    }
-    ctx.viewmodelScene.add(this.viewmodelRig)
-  }
+  private setupViewmodelRig(_ctx: GameContext): void {}
 
-  private updateViewmodelRig(ctx: GameContext): void {
-    const vm = ctx.viewmodelCamera
-    this.viewmodelRig.position.copy(vm.position)
-    this.viewmodelRig.quaternion.copy(vm.quaternion)
-
-    // Swing the key partly towards the real sun so turning through the world
-    // reads on the weapon, without ever letting it fall completely dark.
-    ctx.camera.getWorldQuaternion(this.tmpQuat).invert()
-    this.tmpDir.copy(this.sunDirection).applyQuaternion(this.tmpQuat)
-    this.tmpDir.multiplyScalar(0.45).addScaledVector(this.viewmodelKeyRest, 0.55)
-    if (this.tmpDir.lengthSq() < 1e-5) this.tmpDir.copy(this.viewmodelKeyRest)
-    this.viewmodelKey.position.copy(this.tmpDir).normalize().multiplyScalar(1.5)
-  }
+  private updateViewmodelRig(_ctx: GameContext): void {}
 
   // --- Dynamic lights ------------------------------------------------------
 
@@ -392,13 +433,10 @@ export class LightingSystem implements System, LightingService {
     this.cascade?.dispose()
     this.shafts?.dispose()
     this.pool?.dispose()
+    this.occlusion.dispose()
     this.sky.dispose()
     this.sun.dispose()
     this.hemisphere.dispose()
     for (const fill of this.interiorFills) fill.dispose()
-    this.viewmodelKey.dispose()
-    this.viewmodelFill.dispose()
-    this.viewmodelRim.dispose()
-    this.viewmodelRig.removeFromParent()
   }
 }

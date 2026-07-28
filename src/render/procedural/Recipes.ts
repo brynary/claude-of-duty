@@ -17,6 +17,7 @@ import {
   modulateColor,
   offsetColor,
   powField,
+  resampleField,
   saturate,
   smoothstep,
   smoothstepField,
@@ -218,10 +219,142 @@ function grain(n: Noise, s: number, freq: number, salt: number, octaves = 3): Fi
   return n.fbm(s, s, freq, freq, octaves, 0.5, salt)
 }
 
+// --- Per-cell variation ---------------------------------------------------
+
+/**
+ * A second, independent random value per cell, derived from an existing cell
+ * id field.
+ *
+ * Cell patterns hand back one random number per cell. If hue, value and
+ * roughness all key off that single number they end up perfectly correlated —
+ * every pale stone is also the smoothest stone — and the surface reads as a
+ * one-dimensional ramp no matter how wide the palette is. Multiplying by a
+ * large irrational-ish constant and taking the fraction decorrelates them
+ * while staying exactly constant within each cell.
+ */
+function reroll(id: Field, k: number): Field {
+  const out = new Float32Array(id.length)
+  for (let i = 0; i < id.length; i++) {
+    const v = id[i] * k
+    out[i] = v - Math.floor(v)
+  }
+  return out
+}
+
+/** `1 - f`, for turning a face mask into a joint mask and back. */
+function invert(f: Field): Field {
+  const out = new Float32Array(f.length)
+  for (let i = 0; i < f.length; i++) out[i] = 1 - f[i]
+  return out
+}
+
+/**
+ * Builds a soft mask at a capped working resolution and stretches it out.
+ *
+ * Staining, chipping, soot and impact pocks are all shapes measured in
+ * centimetres at least; none of them carries texel-level detail. Generating
+ * them at the resolution of a hero surface is a sixteen-fold cost for a
+ * difference nobody can resolve, so they are built at 256 and resampled.
+ */
+function lowRes(s: number, make: (ws: number) => Field): Field {
+  const ws = Math.min(s, 256)
+  return resampleField(make(ws), ws, ws, s, s)
+}
+
+/** Downscales a full-resolution field to a mask generator's working size. */
+function toLowRes(f: Field, s: number): Field {
+  const ws = Math.min(s, 256)
+  return resampleField(f, s, s, ws, ws)
+}
+
+// --- Weathering -----------------------------------------------------------
+
+/**
+ * Soot: a hard-edged core inside a much wider halo.
+ *
+ * Cooking fires, blast marks and burnt-out vehicles all leave this signature,
+ * and it is the strongest "something happened here" signal a texture can
+ * carry. Soot is nearly achromatic and very dark, so it also does useful work
+ * pulling a frame's black point down.
+ */
+function soot(n: Noise, s: number, coverage: number, salt: number): { core: Field; halo: Field } {
+  const broad = n.fbmPerlin(s, s, 3, 3, 5, 0.6, salt)
+  const detail = n.fbm(s, s, 15, 15, 4, 0.5, salt + 1)
+  const mixed = field(s, s)
+  for (let i = 0; i < mixed.length; i++) mixed[i] = broad[i] * 0.72 + detail[i] * 0.28
+  const tCore = quantile(mixed, 1 - coverage)
+  const tHalo = quantile(mixed, 1 - Math.min(0.9, coverage * 3.4))
+  const core = field(s, s)
+  const halo = field(s, s)
+  for (let i = 0; i < core.length; i++) {
+    core[i] = smoothstep(tCore, tCore + 0.05, mixed[i])
+    halo[i] = smoothstep(tHalo, tHalo + 0.28, mixed[i])
+  }
+  return { core, halo }
+}
+
+export interface WeatherOptions {
+  /** Gravity staining below every ledge and crack, 0..1. */
+  streak: number
+  /** Broad airborne soiling film, 0..1. */
+  soil: number
+  /** Soot and scorch coverage, 0..1. Zero for surfaces that never see fire. */
+  burn: number
+  salt: number
+  /** Roughness the dirt drags the surface towards. */
+  dirtRough?: number
+}
+
+/**
+ * The standard outdoor weathering stack, applied over a finished albedo.
+ *
+ * Airborne soiling, gravity staining and soot. Every outdoor surface in a
+ * lived-in place carries all three; authoring them ad hoc per recipe is how a
+ * library ends up looking like a paint catalogue. Called last so it sits on top
+ * of whatever structural colour the recipe established.
+ */
+function weather(b: SurfaceBuild, n: Noise, s: number, o: WeatherOptions): void {
+  const rough = o.dirtRough ?? 0.96
+  // Nothing in this stack has detail above a few cycles per metre, so it is
+  // built at a fixed working resolution and stretched. On a 1024 hero surface
+  // that is a sixteen-fold saving for no visible difference.
+  const ws = Math.min(s, 256)
+  const up = (f: Field): Field => resampleField(f, ws, ws, s, s)
+
+  if (o.soil > 0) {
+    const film = stretch(n.fbmPerlin(ws, ws, 5, 5, 5, 0.6, o.salt), 1.5)
+    const filmUp = up(powField(copyField(film), 1.7))
+    mixColor(b.albedo, L(0x625a4b), filmUp, 0.44 * o.soil)
+    // A second, much broader film at a different scale: one octave of dirt
+    // reads as a pattern, two read as accumulation.
+    const wide = stretch(n.fbmPerlin(ws, ws, 2, 2, 4, 0.6, o.salt + 1), 1.3)
+    mixColor(b.albedo, L(0x4f4a3e), up(powField(wide, 2.2)), 0.3 * o.soil)
+    jitter(b.rough, filmUp, 0.12 * o.soil)
+  }
+  if (o.streak > 0) {
+    const runs = up(gravityStreaks(ws, ws, n, {
+      freq: 26, coverage: 0.62, lengthMin: 0.25, lengthMax: 1, startMin: 0.3, startMax: 1, salt: o.salt + 5,
+    }))
+    const heavy = up(gravityStreaks(ws, ws, n, {
+      freq: 8, coverage: 0.3, lengthMin: 0.45, lengthMax: 1, startMin: 0.55, startMax: 1, salt: o.salt + 6,
+    }))
+    mixColor(b.albedo, L(0x35301f), runs, 0.52 * o.streak)
+    mixColor(b.albedo, L(0x473d2b), heavy, 0.4 * o.streak)
+    toward(b.rough, runs, rough, 0.55 * o.streak)
+  }
+  if (o.burn > 0) {
+    const burn = soot(n, ws, 0.055 * o.burn, o.salt + 9)
+    const core = up(burn.core)
+    mixColor(b.albedo, L(0x3a352e), up(burn.halo), 0.42)
+    mixColor(b.albedo, L(0x1c1a18), core, 0.82)
+    toward(b.rough, core, 0.97, 0.9)
+  }
+}
+
 // --- Ground ---------------------------------------------------------------
 
 function buildAsphalt(n: Noise, s: number, cracked: boolean): SurfaceBuild {
-  const b = blank(s, L(0x34332f), 0.8, 0, 1.3)
+  const b = blank(s, L(0x34332f), 0.8, 0, 2.3)
   // 10-20 mm aggregate: coarse enough to catch light, fine enough that it does
   // not read as cobbles the moment the camera drops to eye height.
   const agg = n.worley(s, s, 96, 96, 1, 1)
@@ -266,29 +399,37 @@ function buildAsphalt(n: Noise, s: number, cracked: boolean): SurfaceBuild {
   jitter(b.rough, macro, 0.16)
   // Polished tyre paths: slightly smoother, slightly darker.
   toward(b.rough, patch, 0.5, 0.55)
-  b.aoInAlbedo = 0.4
+  weather(b, n, s, { streak: 0, soil: 0.55, burn: 0.6, salt: 640 })
+  b.aoStrength = 1.25
+  b.aoInAlbedo = 0.5
   return b
 }
 
 function buildConcrete(n: Noise, s: number, worn: number): SurfaceBuild {
-  const b = blank(s, L(0x7b756b), 0.82, 0, 1.9)
+  // Relief amplitude, not normal-map strength, is what makes a wall read at a
+  // grazing angle. A 0.16-deep mid field spread over 14 cycles a tile is a 2
+  // degree tilt — invisible. The form-board undulation and the mid field below
+  // put real centimetre-scale shape into the surface, and the normal strength
+  // then only has to carry it rather than manufacture it.
+  const b = blank(s, L(0x7b756b), 0.82, 0, 3.0)
   const blotch = stretch(n.fbmPerlin(s, s, 3, 3, 4, 0.58, 11), 1.8)
+  const board = n.fbmPerlin(s, s, 5, 5, 3, 0.5, 19)
   const mid = stretch(n.fbm(s, s, 14, 14, 4, 0.5, 12), 1.35)
   const fine = grain(n, s, 130, 13, 3)
   const pores = n.worley(s, s, 46, 46, 14, 1)
-  const streaks = gravityStreaks(s, s, n, {
+  const streaks = lowRes(s, (w) => gravityStreaks(w, w, n, {
     freq: 26, coverage: 0.42, lengthMin: 0.2, lengthMax: 0.75, startMin: 0.35, startMax: 1, salt: 15,
-  })
+  }))
 
   for (let i = 0; i < b.height.length; i++) {
     // Air voids left by the pour. Kept shallow and sparse: a deep pinpoint
     // dimple turns into a hard black dot the moment ambient occlusion runs.
     const pore = saturate(1 - pores.f1[i] * 4.2) * (pores.id[i] > 0.74 ? 1 : 0)
-    b.height[i] = 0.62 + mid[i] * 0.16 + fine[i] * 0.1 - pore * 0.11
+    b.height[i] = 0.5 + (board[i] - 0.5) * 0.26 + mid[i] * 0.26 + fine[i] * 0.13 - pore * 0.16
   }
 
   if (worn > 0) {
-    const spall = chipMask(s, s, n, { fx: 5, fy: 5, coverage: 0.22 * worn, hardness: 0.75, salt: 16 })
+    const spall = lowRes(s, (w) => chipMask(w, w, n, { fx: 5, fy: 5, coverage: 0.22 * worn, hardness: 0.75, salt: 16 }))
     const rubbleAgg = n.worley(s, s, 60, 60, 17, 1)
     const cracks = n.worley(s, s, 9, 9, 18, 1)
     const crackLine = field(s, s)
@@ -297,8 +438,8 @@ function buildConcrete(n: Noise, s: number, worn: number): SurfaceBuild {
     }
     for (let i = 0; i < b.height.length; i++) {
       const exposedAgg = saturate(1 - rubbleAgg.f1[i] * 2.4)
-      b.height[i] -= spall[i] * (0.16 - exposedAgg * 0.1)
-      b.height[i] -= crackLine[i] * 0.3
+      b.height[i] -= spall[i] * (0.26 - exposedAgg * 0.14)
+      b.height[i] -= crackLine[i] * 0.42
     }
     mixColor(b.albedo, L(0x757065), spall, 0.6)
     mixColor(b.albedo, L(0x4c4740), crackLine, 0.8)
@@ -307,15 +448,18 @@ function buildConcrete(n: Noise, s: number, worn: number): SurfaceBuild {
 
   // Warm grey with genuine colour blotching — flat grey concrete is the single
   // most common failure in procedural environments.
-  gradientCells(b.albedo, blotch, [L(0x6b6559), L(0x827c71), L(0x948d81), L(0x767066)], 0.8)
-  offsetColor(b.albedo, mid, 0.055)
+  gradientCells(b.albedo, blotch, [L(0x54503f), L(0x6b6559), L(0x827c71), L(0x9c9589), L(0x6e685c)], 0.88)
+  gradientCells(b.albedo, board, [L(0x5d584c), L(0x8b8578)], 0.3)
+  offsetColor(b.albedo, mid, 0.075)
   mixColor(b.albedo, L(0x433f39), streaks, 0.5)
   mixColor(b.albedo, L(0x9d988d), scaled(fine, 0.3), 1)
 
   ramp(b.rough, fine, 0.7, 0.94)
   jitter(b.rough, blotch, 0.14)
   toward(b.rough, streaks, 0.96, 0.5)
-  b.aoInAlbedo = 0.4
+  weather(b, n, s, { streak: 0.85, soil: 0.7, burn: 0.45, salt: 660 })
+  b.aoStrength = 1.3
+  b.aoInAlbedo = 0.48
   return b
 }
 
@@ -331,17 +475,24 @@ function buildConcreteRubble(n: Noise, s: number): SurfaceBuild {
     const facets = Math.round(facet[i] * 3) / 3
     b.height[i] = saturate(chunks.height[i] * 0.72 + small.height[i] * 0.3 + facets * 0.1 + dust[i] * 0.06)
   }
-  gradientCells(b.albedo, chunks.id, [L(0x7d766a), L(0x9c9488), L(0xb0a99b)], 0.75)
-  mixColor(b.albedo, L(0x5a544b), chunks.gap, 0.7)
+  tintCells(b.albedo, chunks.id, [
+    L(0x847c6f), L(0xa39a8c), L(0x6d675d), L(0x9a8b72), L(0x8b5b43), L(0xb2ab9c),
+  ], 0.88)
+  const chunkValue = reroll(chunks.id, 53.7)
+  const chunkShade = field(s, s)
+  for (let i = 0; i < chunkShade.length; i++) chunkShade[i] = 0.74 + 0.54 * chunkValue[i]
+  modulateColor(b.albedo, chunkShade, 1)
+  mixColor(b.albedo, L(0x2d271f), chunks.gap, 0.78)
   mixColor(b.albedo, L(0xa9a091), scaled(dust, 0.4), 1)
   // Exposed rebar rust flecks in the broken faces.
-  const rust = chipMask(s, s, n, { fx: 16, fy: 16, coverage: 0.05, hardness: 0.8, salt: 25 })
-  mixColor(b.albedo, L(0x7a4726), rust, 0.7)
+  const rust = lowRes(s, (w) => chipMask(w, w, n, { fx: 16, fy: 16, coverage: 0.08, hardness: 0.8, salt: 25 }))
+  mixColor(b.albedo, L(0x7a4726), rust, 0.75)
 
   ramp(b.rough, dust, 0.82, 0.98)
-  jitter(b.rough, chunks.id, 0.1)
-  b.aoStrength = 1.35
-  b.aoInAlbedo = 0.5
+  jitter(b.rough, reroll(chunks.id, 29.3), 0.2)
+  weather(b, n, s, { streak: 0, soil: 0.6, burn: 0.7, salt: 540 })
+  b.aoStrength = 1.6
+  b.aoInAlbedo = 0.58
   return b
 }
 
@@ -367,8 +518,9 @@ function buildSand(n: Noise, s: number): SurfaceBuild {
 
   ramp(b.rough, fine, 0.88, 0.99)
   jitter(b.rough, drift, 0.06)
-  b.aoStrength = 0.7
-  b.aoInAlbedo = 0.3
+  weather(b, n, s, { streak: 0, soil: 0.3, burn: 0.3, salt: 680 })
+  b.aoStrength = 0.8
+  b.aoInAlbedo = 0.34
   return b
 }
 
@@ -395,98 +547,181 @@ function buildDirt(n: Noise, s: number): SurfaceBuild {
 
   ramp(b.rough, fine, 0.82, 0.98)
   toward(b.rough, damp, 0.72, 0.4)
-  b.aoStrength = 1.1
-  b.aoInAlbedo = 0.45
+  weather(b, n, s, { streak: 0, soil: 0.5, burn: 0.5, salt: 700 })
+  b.aoStrength = 1.25
+  b.aoInAlbedo = 0.52
   return b
 }
 
+/**
+ * Crushed aggregate.
+ *
+ * Two things separate real rubble from a field of identical domes. The first
+ * is geometry: quarried stone fractures into flat facets, so the domes are
+ * flattened hard and then quantised into planes that each catch light on their
+ * own. The second is that no two stones are the same rock — hue, value and
+ * gloss are rerolled independently per cell from a palette that spans
+ * limestone, granite, basalt, sandstone and broken brick, which is what a real
+ * road base actually contains.
+ */
 function buildGravel(n: Noise, s: number): SurfaceBuild {
-  const b = blank(s, L(0x8c857a), 0.88, 0, 3.6)
-  const big = pebbles(s, s, n, { fx: 16, fy: 16, salt: 51, jitter: 1, flatten: 1.5, gap: 0.1 })
-  const small = pebbles(s, s, n, { fx: 34, fy: 34, salt: 52, jitter: 1, flatten: 1.3, gap: 0.18 })
-  const fines = grain(n, s, 90, 53, 3)
-  const dustField = n.fbmPerlin(s, s, 4, 4, 3, 0.55, 54)
+  const b = blank(s, L(0x8c857a), 0.88, 0, 4.8)
+  const big = pebbles(s, s, n, { fx: 25, fy: 25, salt: 51, jitter: 1, flatten: 2.9, gap: 0.04 })
+  const mid = pebbles(s, s, n, { fx: 43, fy: 43, salt: 52, jitter: 1, flatten: 2.2, gap: 0.1 })
+  const small = pebbles(s, s, n, { fx: 76, fy: 76, salt: 57, jitter: 1, flatten: 1.8, gap: 0.16 })
+  const fines = grain(n, s, 120, 53, 3)
+  const facet = n.fbm(s, s, 54, 54, 3, 0.45, 54)
+  const silt = n.fbmPerlin(s, s, 5, 5, 4, 0.55, 55)
+  const damp = stretch(n.fbmPerlin(s, s, 3, 3, 4, 0.6, 56), 1.7)
 
-  for (let i = 0; i < b.height.length; i++) {
-    b.height[i] = saturate(big.height[i] * 0.68 + small.height[i] * 0.42 + fines[i] * 0.1)
+  const stack = field(s, s)
+  for (let i = 0; i < stack.length; i++) {
+    stack[i] = saturate(big.height[i] * 0.74 + mid.height[i] * 0.4 + small.height[i] * 0.24)
   }
-  gradientCells(b.albedo, big.id, [L(0x6b655c), L(0x8d8479), L(0xa9a094), L(0x7a6d5e)], 0.8)
-  tintCells(b.albedo, small.id, [L(0x777066), L(0x968d80), L(0x5f574d)], 0.28)
-  // Fines and dust wash into the voids between stones.
-  mixColor(b.albedo, L(0x8a8172), big.gap, 0.55)
-  offsetColor(b.albedo, dustField, 0.06)
+  for (let i = 0; i < b.height.length; i++) {
+    const planes = Math.round(facet[i] * 3) / 3
+    b.height[i] = saturate(stack[i] * 0.88 + planes * 0.1 * stack[i] + fines[i] * 0.07)
+  }
 
-  ramp(b.rough, fines, 0.78, 0.96)
-  jitter(b.rough, big.id, 0.14)
-  b.aoStrength = 1.4
+  const value = reroll(big.id, 37.13)
+  const gloss = reroll(big.id, 91.77)
+  tintCells(b.albedo, big.id, [
+    L(0x968b74), L(0x6a635a), L(0xb3a993), L(0x8a6f4e),
+    L(0x96543a), L(0x4e4a45), L(0xa3936f), L(0x7a6a55),
+  ], 0.95)
+  // Independent per-stone value, so the palette reads as a mixture of rock
+  // types rather than as eight fixed swatches.
+  const shade = field(s, s)
+  for (let i = 0; i < shade.length; i++) shade[i] = 0.72 + 0.58 * value[i]
+  modulateColor(b.albedo, shade, 1)
+  tintCells(b.albedo, mid.id, [L(0x6e685e), L(0x9a9081), L(0x7f6c55), L(0x565452)], 0.3)
+  offsetColor(b.albedo, fines, 0.05)
+
+  // Dirt packs down into the voids and dust settles on the exposed crowns —
+  // the pair is what gives a stone field depth instead of bubble-wrap relief.
+  const voids = field(s, s)
+  for (let i = 0; i < voids.length; i++) voids[i] = saturate(1 - stack[i] * 1.9)
+  mixColor(b.albedo, L(0x2c261e), voids, 0.74)
+  const tops = field(s, s)
+  for (let i = 0; i < tops.length; i++) tops[i] = saturate(stack[i] * 1.7 - 0.55) * silt[i]
+  mixColor(b.albedo, L(0x9c8f75), tops, 0.32)
+  mixColor(b.albedo, L(0x3b352b), powField(copyField(damp), 2), 0.3)
+
+  ramp(b.rough, fines, 0.74, 0.95)
+  jitter(b.rough, gloss, 0.26)
+  toward(b.rough, voids, 0.98, 0.6)
+  toward(b.rough, damp, 0.52, 0.35)
+  weather(b, n, s, { streak: 0, soil: 0.55, burn: 0.5, salt: 500 })
+  b.aoStrength = 1.7
+  b.aoScale = 0.85
   b.aoInAlbedo = 0.5
   return b
 }
 
 function buildCobblestone(n: Noise, s: number): SurfaceBuild {
-  const b = blank(s, L(0x6f6a62), 0.72, 0, 4.6)
-  // 8 setts across a 2 m tile => 250 mm stones with a 20 mm joint.
-  const stones = setts(s, s, n, { fx: 8, fy: 8, salt: 61, jitter: 0.95, joint: 0.09, crown: 0.4 })
+  const b = blank(s, L(0x6f6a62), 0.72, 0, 5.4)
+  // 8 setts across a 2 m tile => 250 mm stones with a 25 mm joint.
+  const stones = setts(s, s, n, { fx: 8, fy: 8, salt: 61, jitter: 0.95, joint: 0.1, crown: 0.55 })
   const chisel = n.fbm(s, s, 44, 44, 4, 0.5, 62)
   const wearField = n.fbmPerlin(s, s, 3, 3, 3, 0.55, 63)
-  const grit = grain(n, s, 140, 64, 2)
+  const grit = grain(n, s, 150, 64, 2)
+  const weeds = lowRes(s, (w) => chipMask(w, w, n, { fx: 4, fy: 4, coverage: 0.16, hardness: 0.4, salt: 66 }))
 
+  // The joint has to stay at the bottom of the height range or the surface
+  // reads as a printed pattern. Shaping the dome *inside* a hard face mask —
+  // rather than taking a root of the whole field, which lifts the joint with
+  // it — is what buys real grout depth.
+  const face = field(s, s)
+  for (let i = 0; i < face.length; i++) face[i] = smoothstep(0, 0.16, stones.height[i])
   for (let i = 0; i < b.height.length; i++) {
-    // Setts are domed on top but nearly flat where feet and tyres polish them,
-    // and split into facets rather than reading as poured pebbles.
     const dome = Math.pow(stones.height[i], 0.5)
     const facet = Math.round(chisel[i] * 3) / 3
-    b.height[i] = saturate(dome * 0.78 + facet * 0.13 + grit[i] * 0.05)
+    b.height[i] = saturate(face[i] * (0.3 + dome * 0.56 + facet * 0.12) + grit[i] * 0.05)
   }
-  gradientCells(b.albedo, stones.id, [L(0x554f48), L(0x6e6860), L(0x847c70), L(0x5e5a55)], 0.85)
-  // Mud and grit packed into the joints.
-  mixColor(b.albedo, L(0x3a3327), stones.gap, 0.8)
-  const joint = stones.gap
+
+  const value = reroll(stones.id, 41.31)
+  const gloss = reroll(stones.id, 73.19)
+  tintCells(b.albedo, stones.id, [
+    L(0x5c5347), L(0x736c60), L(0x8a7c66), L(0x4d4b4a), L(0x715c45), L(0x928674),
+  ], 0.9)
+  const shade = field(s, s)
+  for (let i = 0; i < shade.length; i++) shade[i] = 0.76 + 0.5 * value[i]
+  modulateColor(b.albedo, shade, 1)
   offsetColor(b.albedo, chisel, 0.05)
+
+  // Mud, grit and the odd weed packed into the joints. The joint is the
+  // dirtiest part of any paved surface by a wide margin.
+  const joint = stones.gap
+  // Grit-filled, not a drawn outline: the joint colour varies along its length
+  // so it does not read as a comic-book border at gameplay distance.
+  mixColor(b.albedo, L(0x453d30), joint, 0.62)
+  const jointGrit = field(s, s)
+  for (let i = 0; i < jointGrit.length; i++) jointGrit[i] = joint[i] * grit[i]
+  mixColor(b.albedo, L(0x7a7161), jointGrit, 0.38)
+  const weedMask = field(s, s)
+  for (let i = 0; i < weedMask.length; i++) weedMask[i] = weeds[i] * joint[i]
+  mixColor(b.albedo, L(0x4a5230), weedMask, 0.55)
 
   const polish = field(s, s)
   for (let i = 0; i < polish.length; i++) polish[i] = saturate(stones.height[i] * 1.4 - 0.35) * saturate(wearField[i] * 1.6 - 0.2)
-  ramp(b.rough, grit, 0.68, 0.9)
-  toward(b.rough, polish, 0.32, 0.8)
-  toward(b.rough, joint, 0.96, 0.7)
-  b.aoStrength = 1.35
-  b.aoInAlbedo = 0.45
+  ramp(b.rough, grit, 0.66, 0.9)
+  jitter(b.rough, gloss, 0.2)
+  toward(b.rough, polish, 0.3, 0.8)
+  toward(b.rough, joint, 0.97, 0.75)
+  weather(b, n, s, { streak: 0, soil: 0.5, burn: 0.45, salt: 520 })
+  b.aoStrength = 1.5
+  b.aoScale = 0.9
+  b.aoInAlbedo = 0.42
   return b
 }
 
 // --- Walls and architecture ----------------------------------------------
 
 function buildPlaster(n: Noise, s: number, base: Rgb, damage: number, substrate: Rgb): SurfaceBuild {
-  const b = blank(s, base, 0.85, 0, 2.1)
+  const b = blank(s, base, 0.85, 0, 3.4)
   const trowel = stretch(n.fbmPerlin(s, s, 5, 5, 4, 0.55, 71), 1.7)
+  // Hand-applied render is never flat: it bellies out between the guides and
+  // sags away at the arrises. This is the scale that catches raking light.
+  const bellies = n.fbmPerlin(s, s, 16, 16, 3, 0.5, 82)
   const stipple = grain(n, s, 90, 72, 3)
   const fineCrack = n.ridged(s, s, 6, 6, 5, 0.5, 73)
-  const patches = chipMask(s, s, n, { fx: 4, fy: 4, coverage: 0.3, hardness: 0.35, salt: 74 })
-  const streaks = gravityStreaks(s, s, n, {
+  const patches = lowRes(s, (w) => chipMask(w, w, n, { fx: 4, fy: 4, coverage: 0.3, hardness: 0.35, salt: 74 }))
+  const streaks = lowRes(s, (w) => gravityStreaks(w, w, n, {
     freq: 22, coverage: 0.62, lengthMin: 0.3, lengthMax: 1, startMin: 0.4, startMax: 1, salt: 75,
-  })
+  }))
   const soiling = stretch(n.fbmPerlin(s, s, 6, 6, 5, 0.6, 79), 1.5)
 
   const hairline = field(s, s)
   for (let i = 0; i < hairline.length; i++) hairline[i] = saturate((fineCrack[i] - 0.8) * 8)
 
   for (let i = 0; i < b.height.length; i++) {
-    b.height[i] = 0.66 + trowel[i] * 0.14 + stipple[i] * 0.09 - hairline[i] * 0.16
+    b.height[i] = 0.54 + trowel[i] * 0.24 + (bellies[i] - 0.5) * 0.18 + stipple[i] * 0.12 - hairline[i] * 0.24
   }
+
+  // Even the undamaged render is pocked. A wall in this setting has been shot
+  // at, scraped by vehicles and had things nailed into it; a perfectly smooth
+  // one is the fastest way to read as a fresh procedural surface.
+  const strays = lowRes(s, (w) => craters(w, w, n, 7, w / 55, 80))
+  const gouges = scratches(s, s, n, 24, 190, 5, 81)
+  for (let i = 0; i < b.height.length; i++) {
+    b.height[i] += strays[i] * 0.3 - gouges[i] * 0.09
+  }
+  mixColor(b.albedo, L(0x4a443a), scaled(strays, -1), 1)
+  mixColor(b.albedo, L(0xa89f8c), gouges, 0.4)
 
   // Blown render: chunks fall away and expose the masonry behind.
   if (damage > 0) {
-    const exposure = convexMask(b.height, s, s, 5, 8)
-    const chips = chipMask(s, s, n, {
+    const exposure = toLowRes(convexMask(b.height, s, s, 5, 8), s)
+    const chips = lowRes(s, (w) => chipMask(w, w, n, {
       fx: 4, fy: 4, coverage: 0.26 * damage, hardness: 0.9, salt: 76, exposure, exposureWeight: 0.3,
-    })
+    }))
     const sub = bricks(s, s, n, {
       rows: 12, cols: 4, jointPx: s / 90, bevelPx: s / 200, stagger: 0.5, heightJitter: 0.1, jointDepth: 0.55, salt: 77,
     })
-    const pock = craters(s, s, n, Math.round(26 * damage), s / 42, 78)
+    const pock = lowRes(s, (w) => craters(w, w, n, Math.round(26 * damage), w / 42, 78))
     for (let i = 0; i < b.height.length; i++) {
-      b.height[i] = b.height[i] * (1 - chips[i]) + (sub.height[i] * 0.5 + 0.1) * chips[i]
-      b.height[i] += pock[i] * 0.28
+      b.height[i] = b.height[i] * (1 - chips[i]) + (sub.height[i] * 0.62 + 0.04) * chips[i]
+      b.height[i] += pock[i] * 0.34
     }
     mixColor(b.albedo, substrate, chips, 0.9)
     // A pale halo of crushed plaster around every break.
@@ -499,22 +734,36 @@ function buildPlaster(n: Noise, s: number, base: Rgb, damage: number, substrate:
   }
 
   // Patch repairs never match the original render.
+  // Render is patched, re-patched and sun-bleached unevenly. A twelve percent
+  // tonal spread reads as one flat coat of paint; this is closer to three.
   gradientCells(b.albedo, trowel, [
-    [base[0] * 0.86, base[1] * 0.86, base[2] * 0.9],
+    [base[0] * 0.66, base[1] * 0.68, base[2] * 0.76],
+    [base[0] * 0.88, base[1] * 0.89, base[2] * 0.93],
     base,
-    [Math.min(0.88, base[0] * 1.1), Math.min(0.88, base[1] * 1.08), Math.min(0.88, base[2] * 1.04)],
-  ], 0.75)
-  mixColor(b.albedo, [base[0] * 0.82, base[1] * 0.84, base[2] * 0.86], patches, 0.4)
+    [Math.min(0.88, base[0] * 1.16), Math.min(0.88, base[1] * 1.13), Math.min(0.88, base[2] * 1.07)],
+  ], 0.85)
+  gradientCells(b.albedo, bellies, [
+    [base[0] * 0.8, base[1] * 0.82, base[2] * 0.88], base,
+  ], 0.3)
+  mixColor(b.albedo, [base[0] * 0.7, base[1] * 0.74, base[2] * 0.8], patches, 0.55)
+  // Nobody re-renders a whole wall. Holes get filled with whatever mix was to
+  // hand and never get repainted, so a lived-in facade carries big patches of
+  // bare grey cement that do not match the render around them at all.
+  const repair = lowRes(s, (w) => chipMask(w, w, n, { fx: 3, fy: 3, coverage: 0.11, hardness: 0.62, salt: 83 }))
+  mixColor(b.albedo, L(0x847d6e), repair, 0.6)
+  toward(b.rough, repair, 0.93, 0.6)
   // Airborne soiling: a broad, uneven film that never lets render read as paper.
   mixColor(b.albedo, L(0x6d6555), powField(copyField(soiling), 1.6), 0.34)
   mixColor(b.albedo, L(0x443f36), streaks, 0.5)
   mixColor(b.albedo, L(0x4c463c), hairline, 0.3)
-  offsetColor(b.albedo, stipple, 0.045)
+  offsetColor(b.albedo, stipple, 0.07)
 
   ramp(b.rough, stipple, 0.76, 0.94)
   jitter(b.rough, trowel, 0.12)
   toward(b.rough, streaks, 0.97, 0.45)
-  b.aoInAlbedo = 0.4
+  weather(b, n, s, { streak: 0.9, soil: 0.7, burn: 0.4, salt: 580 })
+  b.aoStrength = 1.35
+  b.aoInAlbedo = 0.5
   return b
 }
 
@@ -536,9 +785,9 @@ function buildStucco(n: Noise, s: number): SurfaceBuild {
     }
   }
   const coarse = n.worley(s, s, 44, 44, 84, 1)
-  const streaks = gravityStreaks(s, s, n, {
+  const streaks = lowRes(s, (w) => gravityStreaks(w, w, n, {
     freq: 18, coverage: 0.45, lengthMin: 0.2, lengthMax: 0.8, startMin: 0.4, startMax: 1, salt: 85,
-  })
+  }))
   const blotch = stretch(n.fbmPerlin(s, s, 3, 3, 4, 0.55, 86), 1.8)
 
   for (let i = 0; i < b.height.length; i++) {
@@ -551,30 +800,35 @@ function buildStucco(n: Noise, s: number): SurfaceBuild {
 
   ramp(b.rough, swirl, 0.8, 0.96)
   jitter(b.rough, blotch, 0.1)
-  b.aoStrength = 1.2
-  b.aoInAlbedo = 0.42
+  weather(b, n, s, { streak: 0.9, soil: 0.7, burn: 0.4, salt: 600 })
+  b.aoStrength = 1.4
+  b.aoInAlbedo = 0.52
   return b
 }
 
 function buildBrick(n: Noise, s: number, painted: boolean): SurfaceBuild {
-  const b = blank(s, L(0x8d4a35), 0.86, 0, 3.2)
+  const b = blank(s, L(0x8d4a35), 0.86, 0, 4.2)
   // 12 courses x 4 bricks over a 0.9 m tile => 215 x 65 mm bricks with 10 mm joints.
+  // The arris ramp has to be several texels wide or it is the first thing the
+  // mip chain throws away, and a brick wall whose joints have flattened out is
+  // exactly the "printed wallpaper" failure. s/110 keeps a ~9 mm chamfer that
+  // still reads two mip levels down.
   const p = bricks(s, s, n, {
-    rows: 12, cols: 4, jointPx: s / 78, bevelPx: s / 260, stagger: 0.5, heightJitter: 0.1, jointDepth: 0.38, salt: 91,
+    rows: 12, cols: 4, jointPx: s / 78, bevelPx: s / 110, stagger: 0.5, heightJitter: 0.14, jointDepth: 0.3, salt: 91,
   })
   const faceGrain = grain(n, s, 120, 92, 3)
   const coarse = n.worley(s, s, 90, 90, 93, 1)
   const mortarGrain = n.fbm(s, s, 60, 60, 4, 0.5, 94)
-  const chipEdge = convexMask(p.height, s, s, 4, 10)
-  const chips = chipMask(s, s, n, { fx: 12, fy: 12, coverage: 0.1, hardness: 0.85, salt: 95, exposure: chipEdge, exposureWeight: 0.5 })
-  const streaks = gravityStreaks(s, s, n, {
+  const chipEdge = toLowRes(convexMask(p.height, s, s, 4, 10), s)
+  const chips = lowRes(s, (w) => chipMask(w, w, n, { fx: 12, fy: 12, coverage: 0.1, hardness: 0.85, salt: 95, exposure: chipEdge, exposureWeight: 0.5 }))
+  const streaks = lowRes(s, (w) => gravityStreaks(w, w, n, {
     freq: 20, coverage: 0.4, lengthMin: 0.15, lengthMax: 0.6, startMin: 0.4, startMax: 1, salt: 96,
-  })
-  const efflor = chipMask(s, s, n, { fx: 7, fy: 7, coverage: 0.12, hardness: 0.15, salt: 97 })
+  }))
+  const efflor = lowRes(s, (w) => chipMask(w, w, n, { fx: 7, fy: 7, coverage: 0.12, hardness: 0.15, salt: 97 }))
 
   for (let i = 0; i < b.height.length; i++) {
     const pit = saturate(1 - coarse.f1[i] * 3.6) * p.face[i]
-    b.height[i] = p.height[i] + faceGrain[i] * 0.05 * p.face[i] + mortarGrain[i] * 0.07 * (1 - p.face[i]) - pit * 0.08 - chips[i] * 0.12
+    b.height[i] = p.height[i] + (faceGrain[i] - 0.5) * 0.11 * p.face[i] + mortarGrain[i] * 0.1 * (1 - p.face[i]) - pit * 0.11 - chips[i] * 0.18
   }
 
   // Every brick is fired slightly differently — flat brick colour is a giveaway.
@@ -597,18 +851,20 @@ function buildBrick(n: Noise, s: number, painted: boolean): SurfaceBuild {
   toward(b.rough, chips, 0.94, 0.7)
 
   if (painted) {
-    // Paint bridges the joints, fills the fine texture and then flakes off the
-    // brick arrises first, letting the fired clay show through.
-    const paintChips = chipMask(s, s, n, {
-      fx: 4, fy: 4, coverage: 0.26, hardness: 0.9, salt: 98, exposure: chipEdge, exposureWeight: 0.4,
-    })
+    // Paint bridges the joints, fills the fine texture and then flakes off in
+    // patches. Weighting the failure hard towards the arris mask outlines every
+    // single joint in bare clay, which reads as red mortar rather than as
+    // peeling limewash — so exposure only nudges the blotches here.
+    const paintChips = lowRes(s, (w) => chipMask(w, w, n, {
+      fx: 4, fy: 4, coverage: 0.34, hardness: 0.7, salt: 98, exposure: chipEdge, exposureWeight: 0.14,
+    }))
     const paintFade = n.fbmPerlin(s, s, 3, 3, 4, 0.55, 99)
     const coverage = field(s, s)
     for (let i = 0; i < coverage.length; i++) coverage[i] = 1 - paintChips[i]
-    const paintCol: Rgb = L(0xb9c2bd)
-    const paintCol2: Rgb = L(0x93a09c)
+    const paintCol: Rgb = L(0xc4bdaa)
+    const paintCol2: Rgb = L(0xa39d8c)
     const paintField = colorField(s, s)
-    gradientCells(paintField, paintFade, [paintCol2, paintCol, L(0xcfd4cd)], 1)
+    gradientCells(paintField, paintFade, [paintCol2, paintCol, L(0xd8d1bd)], 1)
     for (let p2 = 0; p2 < coverage.length; p2++) {
       const t = coverage[p2]
       const i = p2 * 3
@@ -622,42 +878,51 @@ function buildBrick(n: Noise, s: number, painted: boolean): SurfaceBuild {
     mixColor(b.albedo, L(0x4a4239), streaks, 0.3)
   }
 
-  b.aoStrength = 1.25
-  b.aoInAlbedo = 0.45
+  weather(b, n, s, { streak: 0.9, soil: 0.7, burn: 0.45, salt: 560 })
+  b.aoStrength = 1.5
+  b.aoInAlbedo = 0.5
   return b
 }
 
 function buildStoneBlock(n: Noise, s: number): SurfaceBuild {
-  const b = blank(s, L(0xa39a89), 0.82, 0, 3.8)
+  const b = blank(s, L(0xa39a89), 0.82, 0, 4.6)
   // 4 courses x 2 blocks over a 2 m tile => 1 m x 0.5 m ashlar.
   const p = bricks(s, s, n, {
     rows: 4, cols: 2, jointPx: s / 60, bevelPx: s / 120, stagger: 0.5, heightJitter: 0.14, jointDepth: 0.4, salt: 101,
   })
   const chisel = n.ridged(s, s, 24, 24, 4, 0.5, 102)
   const pit = n.worley(s, s, 34, 34, 103, 1)
-  const weather = n.fbmPerlin(s, s, 4, 4, 4, 0.55, 104)
-  const moss = chipMask(s, s, n, { fx: 5, fy: 5, coverage: 0.2, hardness: 0.25, salt: 105 })
-  const streaks = gravityStreaks(s, s, n, {
+  const weathering = n.fbmPerlin(s, s, 4, 4, 4, 0.55, 104)
+  const moss = lowRes(s, (w) => chipMask(w, w, n, { fx: 5, fy: 5, coverage: 0.2, hardness: 0.25, salt: 105 }))
+  const streaks = lowRes(s, (w) => gravityStreaks(w, w, n, {
     freq: 14, coverage: 0.5, lengthMin: 0.2, lengthMax: 0.8, startMin: 0.35, startMax: 1, salt: 106,
-  })
+  }))
 
   for (let i = 0; i < b.height.length; i++) {
     const pock = saturate(1 - pit.f1[i] * 3.2) * p.face[i]
-    b.height[i] = p.height[i] + chisel[i] * 0.1 * p.face[i] - pock * 0.1
+    b.height[i] = p.height[i] + (chisel[i] - 0.4) * 0.2 * p.face[i] - pock * 0.16
   }
-  tintCells(b.albedo, p.id, [L(0x958b7a), L(0xa89e8c), L(0xb6ac98), L(0x8a8272)], 0.9)
+  tintCells(b.albedo, p.id, [L(0x958b7a), L(0xa89e8c), L(0xb6ac98), L(0x8a8272), L(0x9d9077), L(0x7f7869)], 0.92)
+  // Ashlar is quarried in batches: courses drift in tone across a facade and
+  // individual blocks sit noticeably lighter or darker than their neighbours.
+  const blockValue = reroll(p.id, 47.9)
+  const blockShade = field(s, s)
+  for (let i = 0; i < blockShade.length; i++) blockShade[i] = 0.82 + 0.36 * blockValue[i]
+  modulateColor(b.albedo, blockShade, 1)
   offsetColor(b.albedo, chisel, 0.07)
-  const joint = field(s, s)
-  for (let i = 0; i < joint.length; i++) joint[i] = 1 - p.face[i]
-  mixColor(b.albedo, L(0x6e675b), joint, 0.85)
+  const joint = invert(p.face)
+  mixColor(b.albedo, L(0x726b5c), joint, 0.75)
   mixColor(b.albedo, L(0x4d5236), moss, 0.35)
   mixColor(b.albedo, L(0x4c463c), streaks, 0.4)
-  offsetColor(b.albedo, weather, 0.05)
+  offsetColor(b.albedo, weathering, 0.05)
 
   ramp(b.rough, chisel, 0.74, 0.94)
+  jitter(b.rough, reroll(p.id, 83.1), 0.16)
   toward(b.rough, joint, 0.95, 0.7)
-  b.aoStrength = 1.3
-  b.aoInAlbedo = 0.45
+  weather(b, n, s, { streak: 0.85, soil: 0.65, burn: 0.4, salt: 620 })
+  b.aoStrength = 1.1
+  b.aoScale = 0.55
+  b.aoInAlbedo = 0.38
   return b
 }
 
@@ -666,16 +931,16 @@ function buildTileRoof(n: Noise, s: number): SurfaceBuild {
   // 5 pans x 4 courses over a 1.3 m tile => 260 mm wide, 325 mm to the lap.
   const p = pantiles(s, s, n, { cols: 5, rows: 4, overlap: 0.22, salt: 111 })
   const clay = grain(n, s, 80, 112, 3)
-  const algae = chipMask(s, s, n, { fx: 6, fy: 6, coverage: 0.3, hardness: 0.25, salt: 113 })
-  const chipped = chipMask(s, s, n, { fx: 20, fy: 20, coverage: 0.07, hardness: 0.9, salt: 114 })
-  const weather = n.fbmPerlin(s, s, 3, 3, 4, 0.55, 115)
+  const algae = lowRes(s, (w) => chipMask(w, w, n, { fx: 6, fy: 6, coverage: 0.3, hardness: 0.25, salt: 113 }))
+  const chipped = lowRes(s, (w) => chipMask(w, w, n, { fx: 20, fy: 20, coverage: 0.07, hardness: 0.9, salt: 114 }))
+  const weathering = n.fbmPerlin(s, s, 3, 3, 4, 0.55, 115)
 
   for (let i = 0; i < b.height.length; i++) {
     b.height[i] = saturate(p.height[i] + clay[i] * 0.05 - chipped[i] * 0.14)
   }
   tintCells(b.albedo, p.id, [L(0x9c4f34), L(0xb26240), L(0x8a4630), L(0xc07048), L(0x7d4531)], 0.9)
   offsetColor(b.albedo, clay, 0.05)
-  gradientCells(b.albedo, weather, [L(0x8c5138), L(0xa85c3c), L(0xbb7a55)], 0.35)
+  gradientCells(b.albedo, weathering, [L(0x8c5138), L(0xa85c3c), L(0xbb7a55)], 0.35)
   // Algae collects in the shaded lap where water sits longest.
   const shade = field(s, s)
   for (let i = 0; i < shade.length; i++) shade[i] = saturate(1 - p.height[i] * 1.9)
@@ -687,13 +952,14 @@ function buildTileRoof(n: Noise, s: number): SurfaceBuild {
   ramp(b.rough, clay, 0.66, 0.88)
   toward(b.rough, algaeMask, 0.95, 0.6)
   toward(b.rough, chipped, 0.93, 0.8)
-  b.aoStrength = 1.4
-  b.aoInAlbedo = 0.45
+  weather(b, n, s, { streak: 0.5, soil: 0.85, burn: 0.4, salt: 720 })
+  b.aoStrength = 1.55
+  b.aoInAlbedo = 0.55
   return b
 }
 
 function buildTileFloor(n: Noise, s: number): SurfaceBuild {
-  const b = blank(s, L(0xa9a294), 0.4, 0, 2.4)
+  const b = blank(s, L(0xa9a294), 0.4, 0, 2.9)
   // 4 x 4 tiles over a 1.2 m tile => 300 mm ceramic.
   const p = bricks(s, s, n, {
     rows: 4, cols: 4, jointPx: s / 70, bevelPx: s / 150, stagger: 0, heightJitter: 0.04, jointDepth: 0.42, salt: 121,
@@ -725,8 +991,9 @@ function buildTileFloor(n: Noise, s: number): SurfaceBuild {
   toward(b.rough, scuff, 0.68, 0.7)
   toward(b.rough, grout, 0.95, 0.9)
   toward(b.rough, broken, 0.9, 0.8)
-  b.aoStrength = 1.15
-  b.aoInAlbedo = 0.35
+  weather(b, n, s, { streak: 0, soil: 0.8, burn: 0.5, salt: 740 })
+  b.aoStrength = 1.35
+  b.aoInAlbedo = 0.48
   return b
 }
 
@@ -738,11 +1005,11 @@ function buildMetalPainted(n: Noise, s: number): SurfaceBuild {
   const orangePeel = grain(n, s, 110, 132, 3)
   const scratch = scratches(s, s, n, 190, 30, 6, 133)
   const exposure = convexMask(dent, s, s, 6, 6)
-  const chips = chipMask(s, s, n, { fx: 9, fy: 9, coverage: 0.13, hardness: 0.92, salt: 134, exposure, exposureWeight: 0.4 })
+  const chips = lowRes(s, (w) => chipMask(w, w, n, { fx: 9, fy: 9, coverage: 0.13, hardness: 0.92, salt: 134, exposure: toLowRes(exposure, s), exposureWeight: 0.4 }))
   const rust = rustBlooms(s, s, n, { fx: 6, fy: 6, coverage: 0.09, salt: 135, weep: 0.12 })
-  const grime = gravityStreaks(s, s, n, {
+  const grime = lowRes(s, (w) => gravityStreaks(w, w, n, {
     freq: 16, coverage: 0.45, lengthMin: 0.15, lengthMax: 0.7, startMin: 0.35, startMax: 1, salt: 136,
-  })
+  }))
   const fade = n.fbmPerlin(s, s, 3, 3, 4, 0.55, 137)
 
   for (let i = 0; i < b.height.length; i++) {
@@ -767,7 +1034,9 @@ function buildMetalPainted(n: Noise, s: number): SurfaceBuild {
   for (let i = 0; i < b.metal.length; i++) {
     b.metal[i] = saturate(chips[i] * 0.9 * (1 - rust.core[i]) + scratch[i] * 0.35)
   }
-  b.aoInAlbedo = 0.35
+  weather(b, n, s, { streak: 0.85, soil: 0.7, burn: 0.55, salt: 760 })
+  b.aoStrength = 1.15
+  b.aoInAlbedo = 0.45
   return b
 }
 
@@ -797,8 +1066,9 @@ function buildMetalRusted(n: Noise, s: number): SurfaceBuild {
   toward(b.rough, heavy, 0.94, 0.95)
   toward(b.rough, rust.halo, 0.72, 0.4)
   for (let i = 0; i < b.metal.length; i++) b.metal[i] = saturate(0.92 - heavy[i] * 0.85 - rust.halo[i] * 0.18)
-  b.aoStrength = 1.2
-  b.aoInAlbedo = 0.4
+  weather(b, n, s, { streak: 0.8, soil: 0.6, burn: 0.5, salt: 780 })
+  b.aoStrength = 1.35
+  b.aoInAlbedo = 0.5
   return b
 }
 
@@ -860,10 +1130,15 @@ function buildSteelBrushed(n: Noise, s: number): SurfaceBuild {
 }
 
 function buildGunmetal(n: Noise, s: number): SurfaceBuild {
-  const b = blank(s, L(0x3c3e42), 0.36, 1, 1.7)
-  const blast = grain(n, s, 90, 171, 3)
+  // Bead-blast grain has to stay well under one cycle per screen pixel or it
+  // stops reading as a finish and starts reading as sandpaper crawling over
+  // the surface. At three tile repeats across a receiver, 90 cycles per tile
+  // was doing exactly that; 34 lands the grain where a real phosphate coat
+  // sits, and the fine machining lines carry the detail instead.
+  const b = blank(s, L(0x3c3e42), 0.36, 1, 3.0)
+  const blast = grain(n, s, 34, 171, 3)
   const cast = n.fbmPerlin(s, s, 9, 9, 4, 0.55, 172)
-  const micro = scratches(s, s, n, 260, 40, 6, 173)
+  const micro = scratches(s, s, n, 150, 30, 6, 173)
   const wearField = n.fbmPerlin(s, s, 5, 5, 4, 0.6, 174)
   const exposure = convexMask(cast, s, s, 5, 7)
   const polish = field(s, s)
@@ -948,16 +1223,16 @@ function buildWood(
   s: number,
   opts: { rows: number; cuts: number; base: Rgb; dark: Rgb; light: Rgb; weathered: number; ringFreq: number; salt: number },
 ): SurfaceBuild {
-  const b = blank(s, opts.base, 0.75, 0, 2.7)
+  const b = blank(s, opts.base, 0.75, 0, 3.4)
   const p = planks(s, s, n, {
     rows: opts.rows, cuts: opts.cuts, jointPx: s / 100, bevelPx: s / 220, heightJitter: 0.08, jointDepth: 0.42, salt: opts.salt,
   })
   const g = woodGrain(n, s, opts.ringFreq, 0.55, Math.max(1, Math.round(opts.rows * 0.8)), opts.salt + 1)
   const silver = n.fbmPerlin(s, s, 4, 4, 4, 0.55, opts.salt + 2)
   const splits = scratches(s, s, n, 30, 260, 8, opts.salt + 3)
-  const dirt = gravityStreaks(s, s, n, {
+  const dirt = lowRes(s, (w) => gravityStreaks(w, w, n, {
     freq: 20, coverage: 0.35, lengthMin: 0.1, lengthMax: 0.5, startMin: 0.4, startMax: 1, salt: opts.salt + 4,
-  })
+  }))
 
   for (let i = 0; i < b.height.length; i++) {
     // Latewood is harder and stands proud once the surface weathers.
@@ -980,8 +1255,9 @@ function buildWood(
   jitter(b.rough, silver, 0.12)
   toward(b.rough, joint, 0.94, 0.7)
   toward(b.rough, g.knots, 0.55, 0.6)
-  b.aoStrength = 1.15
-  b.aoInAlbedo = 0.4
+  weather(b, n, s, { streak: 0.6, soil: 0.45, burn: 0.3, salt: opts.salt + 400, dirtRough: 0.92 })
+  b.aoStrength = 1.3
+  b.aoInAlbedo = 0.46
   return b
 }
 
@@ -990,7 +1266,7 @@ function buildWoodPainted(n: Noise, s: number): SurfaceBuild {
     rows: 5, cuts: 2, base: L(0x8a7458), dark: L(0x5e4c37), light: L(0xa08a68), weathered: 0.3, ringFreq: 9, salt: 201,
   })
   const exposure = convexMask(b.height, s, s, 5, 8)
-  const chips = chipMask(s, s, n, { fx: 6, fy: 6, coverage: 0.38, hardness: 0.93, salt: 205, exposure, exposureWeight: 0.45 })
+  const chips = lowRes(s, (w) => chipMask(w, w, n, { fx: 6, fy: 6, coverage: 0.38, hardness: 0.93, salt: 205, exposure: toLowRes(exposure, s), exposureWeight: 0.45 }))
   const fade = n.fbmPerlin(s, s, 3, 3, 4, 0.55, 206)
   const crackle = n.ridged(s, s, 40, 40, 3, 0.5, 207)
   const paint = colorField(s, s)
@@ -1024,9 +1300,9 @@ function buildGlass(n: Noise, s: number, dirty: number): SurfaceBuild {
   // read as glass rather than as a hole in the wall.
   const ripple = n.fbmPerlin(s, s, 3, 3, 3, 0.5, 211)
   const dust = grain(n, s, 40, 212, 4)
-  const streak = gravityStreaks(s, s, n, {
+  const streak = lowRes(s, (w) => gravityStreaks(w, w, n, {
     freq: 30, coverage: 0.55, lengthMin: 0.3, lengthMax: 1, startMin: 0.5, startMax: 1, salt: 213,
-  })
+  }))
   const edgeGrime = n.fbmPerlin(s, s, 4, 4, 4, 0.6, 214)
   const spots = n.worley(s, s, 30, 30, 215, 1)
 
@@ -1056,9 +1332,9 @@ function buildFabric(
   const fuzz = grain(n, s, 150, opts.salt, 3)
   const sag = stretch(n.fbmPerlin(s, s, 4, 4, 3, 0.55, opts.salt + 1), 1.5)
   const creases = n.ridged(s, s, 7, 7, 4, 0.5, opts.salt + 2)
-  const stain = gravityStreaks(s, s, n, {
+  const stain = lowRes(s, (w) => gravityStreaks(w, w, n, {
     freq: 12, coverage: 0.4, lengthMin: 0.2, lengthMax: 0.8, startMin: 0.4, startMax: 1, salt: opts.salt + 3,
-  })
+  }))
   const fade = n.fbmPerlin(s, s, 3, 3, 4, 0.55, opts.salt + 4)
 
   for (let i = 0; i < b.height.length; i++) {
@@ -1108,9 +1384,9 @@ function buildTarp(n: Noise, s: number): SurfaceBuild {
   const creases = n.ridged(s, s, 5, 5, 5, 0.5, 221)
   const folds = n.fbmPerlin(s, s, 3, 3, 3, 0.55, 222)
   const scuff = grain(n, s, 90, 223, 3)
-  const dust = gravityStreaks(s, s, n, {
+  const dust = lowRes(s, (w) => gravityStreaks(w, w, n, {
     freq: 14, coverage: 0.4, lengthMin: 0.2, lengthMax: 0.9, startMin: 0.4, startMax: 1, salt: 224,
-  })
+  }))
 
   for (let i = 0; i < b.height.length; i++) {
     b.height[i] = w.height[i] * 0.3 + grid[i] * 0.16 + (folds[i] - 0.5) * 0.4 + saturate(creases[i] - 0.55) * 0.5
@@ -1129,27 +1405,74 @@ function buildTarp(n: Noise, s: number): SurfaceBuild {
   return b
 }
 
+/**
+ * Carbon-black rubber.
+ *
+ * Two things were making the tyres read navy. The albedo sat right on the
+ * 0.028 linear floor the baker clamps to, so every channel came out identical
+ * and the surface had no colour of its own at all; and with a full-strength
+ * environment the only thing left to see was the Fresnel reflection of a blue
+ * sky across a torus that is almost entirely grazing angle. The albedo is
+ * lifted clear of the clamp and given a warm carbon bias here, and the recipe
+ * asks for a quarter-strength environment in the table below.
+ *
+ * The tread is moulded as transverse lug bars, periodic along U only, with
+ * shallow circumferential grooves along V. The tyre meshes carry UVs in metres
+ * with U running around the circumference, so bars narrow in U land as real
+ * transverse lugs — and because both axes stay independently tileable the same
+ * texture still reads as moulded ribbed rubber on anything else that asks for
+ * it.
+ */
 function buildRubber(n: Noise, s: number): SurfaceBuild {
-  const b = blank(s, L(0x2b2b2c), 0.72, 0, 1.9)
+  const b = blank(s, L(0x343130), 0.8, 0, 3.4)
   const pebble = n.worley(s, s, 60, 60, 231, 1)
   const fine = grain(n, s, 180, 232, 3)
   const bloom = n.fbmPerlin(s, s, 4, 4, 4, 0.55, 233)
   const scuff = scratches(s, s, n, 120, 100, 6, 234)
+  const wobble = n.fbm(s, s, 6, 6, 3, 0.5, 235)
+
+  const LUGS = 12
+  const GROOVES = 3
+  const lug = field(s, s)
+  const groove = field(s, s)
+  for (let y = 0; y < s; y++) {
+    const v = y / s
+    const row = y * s
+    // Two lug lanes, offset half a pitch from each other, split by the
+    // circumferential grooves. Staggering is what stops a tread reading as a
+    // comb.
+    const g = (v * GROOVES) % 1
+    const inGroove = 1 - smoothstep(0.04, 0.12, Math.min(g, 1 - g))
+    const lane = ((v * GROOVES) | 0) % 2 === 0 ? 0 : 0.5
+    for (let x = 0; x < s; x++) {
+      const i = row + x
+      const u = (x / s) * LUGS + lane + (wobble[i] - 0.5) * 0.08
+      const f = u - Math.floor(u)
+      const bar = smoothstep(0.08, 0.2, f) * (1 - smoothstep(0.8, 0.92, f))
+      groove[i] = inGroove
+      lug[i] = bar * (1 - inGroove)
+    }
+  }
 
   for (let i = 0; i < b.height.length; i++) {
     const bump = saturate(1 - pebble.f1[i] * 3)
-    b.height[i] = 0.55 + bump * 0.16 + fine[i] * 0.1 - scuff[i] * 0.05
+    b.height[i] = 0.24 + lug[i] * 0.52 + bump * 0.1 + fine[i] * 0.08 - scuff[i] * 0.05
   }
-  gradientCells(b.albedo, bloom, [L(0x232324), L(0x2d2d2e), L(0x3a3a39)], 0.7)
-  // Antiozonant bloom: the grey chalky film that ages rubber.
-  mixColor(b.albedo, L(0x6a6a66), powField(copyField(bloom), 3), 0.3)
+  gradientCells(b.albedo, bloom, [L(0x2e2c2b), L(0x363332), L(0x413d3a)], 0.75)
+  // Antiozonant bloom: the grey chalky film that ages rubber, heaviest where
+  // the sidewall never flexes.
+  mixColor(b.albedo, L(0x6d685f), powField(copyField(bloom), 3), 0.34)
+  // Road film in the grooves, polished crowns on the lugs.
+  mixColor(b.albedo, L(0x241f1b), groove, 0.55)
+  mixColor(b.albedo, L(0x4a4642), scaled(lug, 0.45), 1)
   offsetColor(b.albedo, fine, 0.02)
 
-  ramp(b.rough, fine, 0.62, 0.88)
-  jitter(b.rough, bloom, 0.12)
-  toward(b.rough, scuff, 0.55, 0.5)
-  b.aoStrength = 0.9
-  b.aoInAlbedo = 0.3
+  ramp(b.rough, fine, 0.7, 0.94)
+  jitter(b.rough, bloom, 0.1)
+  toward(b.rough, lug, 0.6, 0.55)
+  toward(b.rough, scuff, 0.5, 0.5)
+  b.aoStrength = 1.2
+  b.aoInAlbedo = 0.35
   return b
 }
 
@@ -1345,7 +1668,7 @@ function buildBootLeather(n: Noise, s: number): SurfaceBuild {
   const cells = n.worley(s, s, 70, 70, 291, 1)
   const creases = n.ridged(s, s, 9, 9, 4, 0.5, 292)
   const fine = grain(n, s, 180, 293, 3)
-  const scuff = chipMask(s, s, n, { fx: 8, fy: 8, coverage: 0.28, hardness: 0.6, salt: 294 })
+  const scuff = lowRes(s, (w) => chipMask(w, w, n, { fx: 8, fy: 8, coverage: 0.28, hardness: 0.6, salt: 294 }))
   const dust = n.fbmPerlin(s, s, 4, 4, 4, 0.6, 295)
 
   for (let i = 0; i < b.height.length; i++) {
@@ -1372,6 +1695,24 @@ const GROUND_DUST = new THREE.Color(0.21, 0.18, 0.13)
 const WALL_DUST = new THREE.Color(0.24, 0.21, 0.16)
 const SAND_DUST = new THREE.Color(0.42, 0.34, 0.22)
 
+/** Warm dark grime: what collects in cavities and at the foot of every wall. */
+const GRIME = new THREE.Color(0.05, 0.043, 0.033)
+/** Cooler, greyer grime for stone and concrete. */
+const GREY_GRIME = new THREE.Color(0.042, 0.04, 0.036)
+
+/**
+ * Texture resolution tiers.
+ *
+ * `HERO2` is reserved for the handful of surfaces that actually fill frames —
+ * the two ground planes the player walks on and the wall types that make up
+ * most of the visible facades. Everything else drops a tier, because texel
+ * density only matters where the camera spends its pixels. Divide `size` by
+ * `worldSize` to get texels per metre; the hero surfaces land between 400 and
+ * 570, which is roughly where a shipped title sits for a surface you can put
+ * your face against.
+ */
+const HERO2 = 1024
+const HERO_PLUS = 768
 const HERO = 512
 const STD = 256
 const SMALL = 128
@@ -1380,112 +1721,175 @@ export const RECIPES: Record<MaterialName, MaterialSpec> = {
   // --- Ground -----------------------------------------------------------
   asphalt: {
     size: HERO, worldSize: 3, build: (n, s) => buildAsphalt(n, s, false),
-    triplanar: { macroScale: 0.045, macroAlbedo: 0.2, macroRough: 0.16, dustColor: SAND_DUST, dustAmount: 0.22 },
-    normalScale: 0.9, aoIntensity: 1,
+    triplanar: {
+      macroScale: 0.045, macroAlbedo: 0.2, macroRough: 0.16, dustColor: SAND_DUST, dustAmount: 0.24,
+      detailNormal: 0.45, cavityDirt: 0.6, grimeColor: GRIME, grimeAmount: 0.35, grimeHeight: 0.3,
+    },
+    normalScale: 1.1, aoIntensity: 1,
   },
   asphaltCracked: {
-    size: STD, worldSize: 3, build: (n, s) => buildAsphalt(n, s, true),
-    triplanar: { macroScale: 0.05, macroAlbedo: 0.22, macroRough: 0.16, dustColor: SAND_DUST, dustAmount: 0.26 },
-    normalScale: 1.1, aoIntensity: 1,
+    size: HERO, worldSize: 3, build: (n, s) => buildAsphalt(n, s, true),
+    triplanar: {
+      macroScale: 0.05, macroAlbedo: 0.22, macroRough: 0.16, dustColor: SAND_DUST, dustAmount: 0.28,
+      detailNormal: 0.45, cavityDirt: 0.7, grimeColor: GRIME, grimeAmount: 0.35, grimeHeight: 0.3,
+    },
+    normalScale: 1.3, aoIntensity: 1,
   },
   concrete: {
-    size: HERO, worldSize: 2.5, build: (n, s) => buildConcrete(n, s, 0),
-    triplanar: { macroScale: 0.05, macroAlbedo: 0.17, macroRough: 0.15, dustColor: WALL_DUST, dustAmount: 0.2 },
-    normalScale: 0.8, aoIntensity: 1,
+    size: HERO_PLUS, worldSize: 2.2, build: (n, s) => buildConcrete(n, s, 0),
+    triplanar: {
+      macroScale: 0.05, macroAlbedo: 0.17, macroRough: 0.15, dustColor: WALL_DUST, dustAmount: 0.22,
+      detailNormal: 0.5, cavityDirt: 0.6, grimeColor: GREY_GRIME, grimeAmount: 0.6, grimeHeight: 0.55,
+    },
+    normalScale: 1.15, aoIntensity: 1,
   },
   concreteWorn: {
-    size: HERO, worldSize: 2.5, build: (n, s) => buildConcrete(n, s, 1),
-    triplanar: { macroScale: 0.05, macroAlbedo: 0.2, macroRough: 0.17, dustColor: WALL_DUST, dustAmount: 0.28 },
-    normalScale: 1.0, aoIntensity: 1,
+    size: HERO_PLUS, worldSize: 2.2, build: (n, s) => buildConcrete(n, s, 1),
+    triplanar: {
+      macroScale: 0.05, macroAlbedo: 0.2, macroRough: 0.17, dustColor: WALL_DUST, dustAmount: 0.3,
+      detailNormal: 0.5, cavityDirt: 0.75, grimeColor: GREY_GRIME, grimeAmount: 0.72, grimeHeight: 0.65,
+    },
+    normalScale: 1.35, aoIntensity: 1,
   },
   concreteRubble: {
-    size: STD, worldSize: 2, build: buildConcreteRubble,
-    triplanar: { macroScale: 0.06, macroAlbedo: 0.2, macroRough: 0.14, dustColor: SAND_DUST, dustAmount: 0.4 },
-    normalScale: 1.2, aoIntensity: 1,
+    size: HERO, worldSize: 2, build: buildConcreteRubble,
+    triplanar: {
+      macroScale: 0.06, macroAlbedo: 0.2, macroRough: 0.14, dustColor: SAND_DUST, dustAmount: 0.42,
+      detailNormal: 0.35, cavityDirt: 0.8, grimeColor: GRIME, grimeAmount: 0.45, grimeHeight: 0.35,
+    },
+    normalScale: 1.4, aoIntensity: 1,
   },
   sand: {
-    size: HERO, worldSize: 4, build: buildSand,
-    triplanar: { macroScale: 0.035, macroAlbedo: 0.16, macroRough: 0.1, dustColor: SAND_DUST, dustAmount: 0.15 },
-    normalScale: 0.8, aoIntensity: 0.8,
+    size: HERO, worldSize: 3.4, build: buildSand,
+    triplanar: {
+      macroScale: 0.035, macroAlbedo: 0.16, macroRough: 0.1, dustColor: SAND_DUST, dustAmount: 0.15,
+      detailNormal: 0.4, cavityDirt: 0.3, grimeColor: GRIME, grimeAmount: 0.2, grimeHeight: 0.25,
+    },
+    normalScale: 1.0, aoIntensity: 0.8,
   },
   dirt: {
-    size: STD, worldSize: 3.5, build: buildDirt,
-    triplanar: { macroScale: 0.05, macroAlbedo: 0.2, macroRough: 0.14, dustColor: SAND_DUST, dustAmount: 0.25 },
-    normalScale: 1.0, aoIntensity: 1,
+    size: HERO, worldSize: 3.5, build: buildDirt,
+    triplanar: {
+      macroScale: 0.05, macroAlbedo: 0.2, macroRough: 0.14, dustColor: SAND_DUST, dustAmount: 0.26,
+      detailNormal: 0.5, cavityDirt: 0.65, grimeColor: GRIME, grimeAmount: 0.3, grimeHeight: 0.3,
+    },
+    normalScale: 1.25, aoIntensity: 1,
   },
   gravel: {
-    size: HERO, worldSize: 3, build: buildGravel,
-    triplanar: { macroScale: 0.055, macroAlbedo: 0.18, macroRough: 0.12, dustColor: SAND_DUST, dustAmount: 0.3 },
-    normalScale: 1.1, aoIntensity: 1,
+    size: HERO2, worldSize: 2.6, build: buildGravel,
+    triplanar: {
+      macroScale: 0.055, macroAlbedo: 0.2, macroRough: 0.16, dustColor: SAND_DUST, dustAmount: 0.32,
+      detailNormal: 0.35, cavityDirt: 0.55, grimeColor: GRIME, grimeAmount: 0.4, grimeHeight: 0.3,
+    },
+    normalScale: 1.5, aoIntensity: 1,
   },
   cobblestone: {
-    size: STD, worldSize: 2, build: buildCobblestone,
-    triplanar: { macroScale: 0.05, macroAlbedo: 0.18, macroRough: 0.16, dustColor: SAND_DUST, dustAmount: 0.22 },
-    normalScale: 1.1, aoIntensity: 1,
+    size: HERO2, worldSize: 2, build: buildCobblestone,
+    triplanar: {
+      macroScale: 0.05, macroAlbedo: 0.19, macroRough: 0.17, dustColor: SAND_DUST, dustAmount: 0.24,
+      detailNormal: 0.3, cavityDirt: 0.55, grimeColor: GRIME, grimeAmount: 0.4, grimeHeight: 0.3,
+    },
+    normalScale: 1.5, aoIntensity: 1,
   },
 
   // --- Walls ------------------------------------------------------------
   plasterWhite: {
-    size: HERO, worldSize: 2.5, build: (n, s) => buildPlaster(n, s, L(0xbfb9a9), 0, L(0x8a5342)),
-    triplanar: { macroScale: 0.05, macroAlbedo: 0.14, macroRough: 0.14, dustColor: WALL_DUST, dustAmount: 0.16 },
-    normalScale: 0.8, aoIntensity: 1,
+    size: HERO_PLUS, worldSize: 2.1, build: (n, s) => buildPlaster(n, s, L(0xbfb9a9), 0, L(0x8a5342)),
+    triplanar: {
+      macroScale: 0.05, macroAlbedo: 0.15, macroRough: 0.14, dustColor: WALL_DUST, dustAmount: 0.18,
+      detailNormal: 0.5, cavityDirt: 0.6, grimeColor: GRIME, grimeAmount: 0.75, grimeHeight: 0.6,
+    },
+    normalScale: 1.25, aoIntensity: 1,
   },
   plasterOchre: {
-    size: HERO, worldSize: 2.5, build: (n, s) => buildPlaster(n, s, L(0xbb914f), 0.35, L(0x8a5342)),
-    triplanar: { macroScale: 0.05, macroAlbedo: 0.16, macroRough: 0.14, dustColor: WALL_DUST, dustAmount: 0.18 },
-    normalScale: 0.95, aoIntensity: 1,
+    size: HERO_PLUS, worldSize: 2.1, build: (n, s) => buildPlaster(n, s, L(0xbb914f), 0.35, L(0x8a5342)),
+    triplanar: {
+      macroScale: 0.05, macroAlbedo: 0.17, macroRough: 0.14, dustColor: WALL_DUST, dustAmount: 0.2,
+      detailNormal: 0.5, cavityDirt: 0.65, grimeColor: GRIME, grimeAmount: 0.78, grimeHeight: 0.6,
+    },
+    normalScale: 1.35, aoIntensity: 1,
   },
   plasterDamaged: {
-    size: STD, worldSize: 2.5, build: (n, s) => buildPlaster(n, s, L(0xb2ab99), 1, L(0x8a5342)),
-    triplanar: { macroScale: 0.055, macroAlbedo: 0.18, macroRough: 0.16, dustColor: WALL_DUST, dustAmount: 0.24 },
-    normalScale: 1.2, aoIntensity: 1,
+    size: HERO, worldSize: 2.2, build: (n, s) => buildPlaster(n, s, L(0xb2ab99), 1, L(0x8a5342)),
+    triplanar: {
+      macroScale: 0.055, macroAlbedo: 0.19, macroRough: 0.16, dustColor: WALL_DUST, dustAmount: 0.26,
+      detailNormal: 0.45, cavityDirt: 0.8, grimeColor: GRIME, grimeAmount: 0.8, grimeHeight: 0.65,
+    },
+    normalScale: 1.5, aoIntensity: 1,
   },
   brickRed: {
     size: HERO, worldSize: 0.9, build: (n, s) => buildBrick(n, s, false),
-    triplanar: { macroScale: 0.06, macroAlbedo: 0.16, macroRough: 0.12, dustColor: WALL_DUST, dustAmount: 0.18, sharpness: 8 },
-    normalScale: 1.0, aoIntensity: 1,
+    triplanar: {
+      macroScale: 0.06, macroAlbedo: 0.17, macroRough: 0.12, dustColor: WALL_DUST, dustAmount: 0.2, sharpness: 8,
+      detailNormal: 0.22, cavityDirt: 0.75, grimeColor: GRIME, grimeAmount: 0.7, grimeHeight: 0.6,
+    },
+    normalScale: 1.55, aoIntensity: 1,
   },
   brickPainted: {
-    size: STD, worldSize: 0.9, build: (n, s) => buildBrick(n, s, true),
-    triplanar: { macroScale: 0.06, macroAlbedo: 0.14, macroRough: 0.14, dustColor: WALL_DUST, dustAmount: 0.18, sharpness: 8 },
-    normalScale: 0.9, aoIntensity: 1,
+    size: HERO, worldSize: 0.9, build: (n, s) => buildBrick(n, s, true),
+    triplanar: {
+      macroScale: 0.06, macroAlbedo: 0.15, macroRough: 0.14, dustColor: WALL_DUST, dustAmount: 0.2, sharpness: 8,
+      detailNormal: 0.22, cavityDirt: 0.7, grimeColor: GRIME, grimeAmount: 0.75, grimeHeight: 0.6,
+    },
+    normalScale: 1.4, aoIntensity: 1,
   },
   stuccoTan: {
-    size: STD, worldSize: 2, build: buildStucco,
-    triplanar: { macroScale: 0.05, macroAlbedo: 0.16, macroRough: 0.14, dustColor: WALL_DUST, dustAmount: 0.2 },
-    normalScale: 1.1, aoIntensity: 1,
+    size: HERO, worldSize: 2, build: buildStucco,
+    triplanar: {
+      macroScale: 0.05, macroAlbedo: 0.17, macroRough: 0.14, dustColor: WALL_DUST, dustAmount: 0.22,
+      detailNormal: 0.5, cavityDirt: 0.65, grimeColor: GRIME, grimeAmount: 0.75, grimeHeight: 0.6,
+    },
+    normalScale: 1.4, aoIntensity: 1,
   },
   stoneBlock: {
-    size: STD, worldSize: 2, build: buildStoneBlock,
-    triplanar: { macroScale: 0.045, macroAlbedo: 0.16, macroRough: 0.14, dustColor: WALL_DUST, dustAmount: 0.2, sharpness: 8 },
-    normalScale: 1.1, aoIntensity: 1,
+    size: HERO, worldSize: 2, build: buildStoneBlock,
+    triplanar: {
+      macroScale: 0.045, macroAlbedo: 0.17, macroRough: 0.14, dustColor: WALL_DUST, dustAmount: 0.22, sharpness: 8,
+      detailNormal: 0.28, cavityDirt: 0.55, grimeColor: GREY_GRIME, grimeAmount: 0.72, grimeHeight: 0.6,
+    },
+    normalScale: 1.5, aoIntensity: 1,
   },
   tileRoof: {
     size: STD, worldSize: 1.3, build: buildTileRoof,
-    triplanar: { macroScale: 0.07, macroAlbedo: 0.18, macroRough: 0.14, dustColor: SAND_DUST, dustAmount: 0.3, sharpness: 4 },
-    normalScale: 1.2, aoIntensity: 1,
+    triplanar: {
+      macroScale: 0.07, macroAlbedo: 0.18, macroRough: 0.14, dustColor: SAND_DUST, dustAmount: 0.32, sharpness: 4,
+      detailNormal: 0.25, cavityDirt: 0.7, grimeColor: GRIME, grimeAmount: 0.2, grimeHeight: 0.3,
+    },
+    normalScale: 1.3, aoIntensity: 1,
   },
   tileFloor: {
-    size: STD, worldSize: 1.2, build: buildTileFloor,
-    triplanar: { macroScale: 0.07, macroAlbedo: 0.12, macroRough: 0.18, dustColor: WALL_DUST, dustAmount: 0.18, sharpness: 8 },
-    normalScale: 0.8, aoIntensity: 1,
+    size: HERO, worldSize: 1.2, build: buildTileFloor,
+    triplanar: {
+      macroScale: 0.07, macroAlbedo: 0.13, macroRough: 0.18, dustColor: WALL_DUST, dustAmount: 0.2, sharpness: 8,
+      detailNormal: 0.2, cavityDirt: 0.7, grimeColor: GRIME, grimeAmount: 0.3, grimeHeight: 0.25,
+    },
+    normalScale: 1.0, aoIntensity: 1,
   },
 
   // --- Metal ------------------------------------------------------------
   metalPainted: {
     size: STD, worldSize: 1.6, build: buildMetalPainted,
-    triplanar: { macroScale: 0.09, macroAlbedo: 0.12, macroRough: 0.12, dustColor: WALL_DUST, dustAmount: 0.2, sharpness: 8 },
-    normalScale: 0.9, aoIntensity: 1,
+    triplanar: {
+      macroScale: 0.09, macroAlbedo: 0.12, macroRough: 0.12, dustColor: WALL_DUST, dustAmount: 0.22, sharpness: 8,
+      detailNormal: 0.3, cavityDirt: 0.5, grimeColor: GRIME, grimeAmount: 0.6, grimeHeight: 0.35,
+    },
+    normalScale: 1.0, aoIntensity: 1,
   },
   metalRusted: {
     size: STD, worldSize: 1.6, build: buildMetalRusted,
-    triplanar: { macroScale: 0.09, macroAlbedo: 0.16, macroRough: 0.12, dustColor: WALL_DUST, dustAmount: 0.2, sharpness: 8 },
-    normalScale: 1.0, aoIntensity: 1,
+    triplanar: {
+      macroScale: 0.09, macroAlbedo: 0.16, macroRough: 0.12, dustColor: WALL_DUST, dustAmount: 0.22, sharpness: 8,
+      detailNormal: 0.35, cavityDirt: 0.6, grimeColor: GRIME, grimeAmount: 0.6, grimeHeight: 0.35,
+    },
+    normalScale: 1.15, aoIntensity: 1,
   },
   metalCorrugated: {
     size: STD, worldSize: 1, build: buildCorrugated,
-    triplanar: { macroScale: 0.08, macroAlbedo: 0.12, macroRough: 0.12, dustColor: WALL_DUST, dustAmount: 0.22, sharpness: 8 },
-    normalScale: 1.0, aoIntensity: 1,
+    triplanar: {
+      macroScale: 0.08, macroAlbedo: 0.12, macroRough: 0.12, dustColor: WALL_DUST, dustAmount: 0.24, sharpness: 8,
+      detailNormal: 0.25, cavityDirt: 0.55, grimeColor: GRIME, grimeAmount: 0.6, grimeHeight: 0.4,
+    },
+    normalScale: 1.1, aoIntensity: 1,
   },
   steelBrushed: {
     size: STD, worldSize: 1, build: buildSteelBrushed, triplanar: null, repeat: [2, 2],
@@ -1493,50 +1897,59 @@ export const RECIPES: Record<MaterialName, MaterialSpec> = {
     params: { envMapIntensity: 1.15 },
   },
   gunmetal: {
-    size: STD, worldSize: 0.35, build: buildGunmetal, triplanar: null, repeat: [3, 3],
-    normalScale: 0.7, aoIntensity: 0.8,
-    params: { envMapIntensity: 1.0 },
+    size: STD, worldSize: 0.35, build: buildGunmetal, triplanar: null, repeat: [2, 2],
+    normalScale: 0.6, aoIntensity: 0.8,
+    params: { envMapIntensity: 0.8 },
   },
   chainlink: {
     size: STD, worldSize: 0.4, build: buildChainlink,
-    triplanar: { macroScale: 0.12, macroAlbedo: 0.1, macroRough: 0.1, dustColor: WALL_DUST, dustAmount: 0.12, sharpness: 8 },
+    triplanar: {
+      macroScale: 0.12, macroAlbedo: 0.1, macroRough: 0.1, dustColor: WALL_DUST, dustAmount: 0.12, sharpness: 8,
+      detailNormal: 0, cavityDirt: 0.35, grimeAmount: 0,
+    },
     repeat: [8, 8],
-    normalScale: 0.9, aoIntensity: 0.7,
+    normalScale: 1.0, aoIntensity: 0.7,
     params: { alphaTest: 0.5, side: THREE.DoubleSide },
   },
   rebar: {
     size: SMALL, worldSize: 0.25, build: buildRebar, triplanar: null, repeat: [1, 3],
-    normalScale: 1.0, aoIntensity: 1,
+    normalScale: 1.1, aoIntensity: 1,
   },
 
   // --- Wood -------------------------------------------------------------
   woodPlank: {
-    size: STD, worldSize: 1.2,
+    size: HERO, worldSize: 1.2,
     build: (n, s) => buildWood(n, s, {
       rows: 5, cuts: 2, base: L(0x8a7458), dark: L(0x5a4833), light: L(0xa08a68), weathered: 1, ringFreq: 11, salt: 301,
     }),
-    triplanar: { macroScale: 0.07, macroAlbedo: 0.16, macroRough: 0.14, dustColor: WALL_DUST, dustAmount: 0.22, sharpness: 8 },
-    normalScale: 1.0, aoIntensity: 1,
+    triplanar: {
+      macroScale: 0.07, macroAlbedo: 0.17, macroRough: 0.14, dustColor: WALL_DUST, dustAmount: 0.24, sharpness: 8,
+      detailNormal: 0.3, cavityDirt: 0.7, grimeColor: GRIME, grimeAmount: 0.55, grimeHeight: 0.3,
+    },
+    normalScale: 1.25, aoIntensity: 1,
   },
   woodPainted: {
-    size: STD, worldSize: 1.2, build: buildWoodPainted, triplanar: null, repeat: [1, 1],
-    normalScale: 1.0, aoIntensity: 1,
+    size: HERO, worldSize: 1.2, build: buildWoodPainted, triplanar: null, repeat: [1, 1],
+    normalScale: 1.2, aoIntensity: 1,
   },
   woodCrate: {
-    size: STD, worldSize: 0.9,
+    size: HERO, worldSize: 0.9,
     build: (n, s) => buildWood(n, s, {
       rows: 4, cuts: 2, base: L(0xa8875c), dark: L(0x74593a), light: L(0xc0a072), weathered: 0.45, ringFreq: 8, salt: 311,
     }),
     triplanar: null, repeat: [1, 1],
-    normalScale: 1.0, aoIntensity: 1,
+    normalScale: 1.2, aoIntensity: 1,
   },
   woodBeam: {
-    size: STD, worldSize: 1.6,
+    size: HERO, worldSize: 1.6,
     build: (n, s) => buildWood(n, s, {
-      rows: 2, cuts: 0, base: L(0x6d5638), dark: L(0x453522), light: L(0x8a6f4a), weathered: 0.7, ringFreq: 6, salt: 321,
+      rows: 2, cuts: 0, base: L(0x6d5638), dark: L(0x453522), light: L(0x8a6f4a), weathered: 0.45, ringFreq: 6, salt: 321,
     }),
-    triplanar: { macroScale: 0.08, macroAlbedo: 0.16, macroRough: 0.12, dustColor: WALL_DUST, dustAmount: 0.2, sharpness: 8 },
-    normalScale: 1.1, aoIntensity: 1,
+    triplanar: {
+      macroScale: 0.08, macroAlbedo: 0.17, macroRough: 0.12, dustColor: WALL_DUST, dustAmount: 0.22, sharpness: 8,
+      detailNormal: 0.3, cavityDirt: 0.7, grimeColor: GRIME, grimeAmount: 0.5, grimeHeight: 0.3,
+    },
+    normalScale: 1.35, aoIntensity: 1,
   },
 
   // --- Soft / misc ------------------------------------------------------
@@ -1580,8 +1993,12 @@ export const RECIPES: Record<MaterialName, MaterialSpec> = {
     params: { side: THREE.DoubleSide, sheen: 0.2, sheenRoughness: 0.5, clearcoat: 0.15, clearcoatRoughness: 0.55 },
   },
   rubber: {
-    size: STD, worldSize: 0.6, build: buildRubber, triplanar: null, repeat: [1, 1],
-    normalScale: 0.9, aoIntensity: 0.9,
+    size: HERO, worldSize: 0.6, build: buildRubber, triplanar: null, repeat: [1, 1],
+    normalScale: 1.0, aoIntensity: 0.9,
+    // A tyre is the darkest dielectric in the scene. At full environment
+    // strength the only thing visible on it is a grazing-angle reflection of
+    // the sky, which is exactly what made these read navy blue.
+    params: { envMapIntensity: 0.35 },
   },
   foliage: {
     size: STD, worldSize: 1, build: buildFoliage, triplanar: null, repeat: [1, 1],

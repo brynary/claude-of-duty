@@ -1,19 +1,20 @@
 import * as THREE from 'three'
 import type { GameContext, System, LevelService } from '../core/Types'
+import type { MaterialName } from '../render/MaterialNames'
 import { Rand } from '../core/Rand'
 import { Builder, InstanceFarm, type StaticPhysics } from './Kit'
 import { buildKerbs, buildSteps, buildTerrain, groundHeight } from './Terrain'
 import {
-  BUILDINGS, buildBuilding, buildCompoundWalls, buildMarketHall, buildMinaret,
-  buildMosque, buildRoofClutter, buildSabat, buildSkyline, buildWaterTower,
+  BUILDINGS, buildAlleyTerminus, buildBuilding, buildCompoundWalls, buildMarketHall,
+  buildMinaret, buildMosque, buildRoofClutter, buildSabat, buildSkyline, buildWaterTower,
   footprintBase, type BuildResult,
 } from './Buildings'
 import {
   buildInteriors, buildOverhead, buildPosters, buildSetPieces, definePropKinds, scatterClutter,
 } from './Props'
 import {
-  buildCollapsedBlock, buildCraterDressing, buildGroundDecals, buildRubblePiles,
-  buildSandDrift, buildStructures,
+  buildCollapsedBlock, buildCraterDressing, buildGroundDecals, buildPuddles,
+  buildRubblePiles, buildSandDrift, buildStructures, buildWallGrime, buildWallMarks,
 } from './Debris'
 import { applyWind, buildTrees, defineFoliageKinds, scatterFoliage, type WindHandle } from './Foliage'
 
@@ -84,6 +85,7 @@ export class LevelSystem implements System, LevelService {
     buildMinaret(landmarks, rngBuild)
     buildMarketHall(landmarks, rngBuild, result)
     buildSabat(landmarks, rngBuild, result)
+    buildAlleyTerminus(landmarks, rngBuild, result)
     buildCompoundWalls(landmarks, rngBuild)
     buildWaterTower(landmarks, rngBuild)
 
@@ -118,6 +120,9 @@ export class LevelSystem implements System, LevelService {
     buildRubblePiles(debrisKit, farm, rngDebris)
     buildCraterDressing(debrisKit, farm, rngDebris)
     buildGroundDecals(debrisKit, rngDebris)
+    buildPuddles(debrisKit, rngDebris)
+    buildWallGrime(debrisKit, rngDebris)
+    buildWallMarks(debrisKit, rngDebris)
     buildStructures(debrisKit, rngDebris)
 
     // --- Foliage -----------------------------------------------------------
@@ -139,18 +144,22 @@ export class LevelSystem implements System, LevelService {
       this.root.add(g)
       bl.merge(g, mats, physics, { name: `block${key}` })
     }
-    const commit = (bl: Builder, name: string, cast = true, receive = true): void => {
+    const commit = (bl: Builder, name: string, cast = true, receive = true, noCast?: MaterialName[]): void => {
       const g = new THREE.Group()
       g.name = name
       g.matrixAutoUpdate = false
       this.root.add(g)
-      bl.merge(g, mats, physics, { name, cast, receive })
+      bl.merge(g, mats, physics, { name, cast, receive, noCast })
     }
+    // Stains, puddles and grime are flat quads a couple of centimetres off the
+    // surface they sit on. Letting them cast would print their own silhouette
+    // back onto that surface, so they light but never shadow.
+    const flatDressing: MaterialName[] = ['dirt', 'water', 'plasterDamaged']
     commit(landmarks, 'landmarks')
     commit(streetKit, 'street')
-    commit(propsKit, 'props')
+    commit(propsKit, 'props', true, true, ['dirt'])
     commit(overheadKit, 'overhead')
-    commit(debrisKit, 'debris')
+    commit(debrisKit, 'debris', true, true, flatDressing)
     commit(foliageKit, 'foliage')
 
     const skyGroup = new THREE.Group()
