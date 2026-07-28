@@ -56,8 +56,14 @@ real Call of Duty screenshots. Generic three.js "demo" look fails. Specifically:
 
 ```bash
 npx tsc --noEmit          # must be clean for your files
-npx vite build            # must succeed
 ```
+
+Do **not** run `vite build`, `vite preview` or the screenshot harness. Other
+agents are running concurrently and would race on `dist/` and on the port.
+Integration and visual grading happen centrally once everyone has finished.
+
+Note that `npx tsc --noEmit` will report errors from other agents' files while
+they are mid-write. Filter to your own paths and ignore the rest.
 
 Report back: what you built, the key techniques used, anything you could not
 finish, and any assumption another system needs to honour.
