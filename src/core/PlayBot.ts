@@ -114,6 +114,12 @@ export class PlayBotSystem implements System {
   private firingFor = 0
   private burstRest = 0
   private stuckFor = 0
+  /**
+   * How many waypoints the bot gave up on. Surfaced in the log because a run
+   * with several is measuring a route that no longer fits the level, not a
+   * player having a bad time, and the two look identical in the metrics.
+   */
+  private unreachable = 0
   private slideCooldown = 3
   private lastPos = new THREE.Vector3()
   private wantAds = false
@@ -368,16 +374,35 @@ export class PlayBotSystem implements System {
       this.frame.down.add('ControlLeft')
     }
 
-    // Unstick: if the bot has barely moved while trying to, jump and turn.
+    // Unstick, in two stages.
+    //
+    // The routes are hardcoded coordinates and the level has been rebuilt many
+    // times since they were written, so a waypoint can end up inside geometry
+    // and become permanently unreachable. The first version of this only jumped
+    // and turned 0.6 rad, which does not help against a wall: a `push` run
+    // wedged at t=3.4s and then logged `unstick` every 0.8s for the remaining
+    // 87 seconds, spinning on the spot and firing 240 rounds for zero hits
+    // while the telemetry recorded it as a legitimately terrible player.
+    //
+    // A vault or a small ledge deserves a jump. A waypoint the bot cannot reach
+    // deserves abandoning, so persistent failure now skips it. The harness has
+    // to survive the level changing underneath it, because it always will.
     const moved = player.position.distanceTo(this.lastPos)
     this.lastPos.copy(player.position)
     if (this.frame.down.size > 0 && moved < 0.01) {
       this.stuckFor += dt
-      if (this.stuckFor > 0.8) {
+      if (this.stuckFor > 0.6 && this.stuckFor - dt <= 0.6) {
         this.frame.pressed.add('Space')
-        this.aimYaw += 0.6
+        this.note('unstick: jump')
+      }
+      if (this.stuckFor > 2.0) {
+        this.waypoint += this.routeDir
+        const last = this.scenario.route.length - 1
+        if (this.waypoint > last) { this.waypoint = Math.max(0, last - 1); this.routeDir = -1 }
+        else if (this.waypoint < 0) { this.waypoint = Math.min(last, 1); this.routeDir = 1 }
         this.stuckFor = 0
-        this.note('unstick')
+        this.unreachable++
+        this.note(`unstick: abandoning waypoint, now ${this.waypoint}`)
       }
     } else {
       this.stuckFor = 0

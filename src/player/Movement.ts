@@ -146,7 +146,11 @@ export interface MoveIntent {
   walkHeld: boolean
   /** 0..1 aim-down-sights blend; suppresses sprint and slows the player. */
   ads: number
-  /** Firing or reloading — breaks sprint the way it does in CoD. */
+  /**
+   * Firing — breaks sprint the way it does in CoD. Deliberately *not* set by a
+   * reload: §3.3 `[measured]` has sprint cancelling a reload, not the other way
+   * round, so a reload must leave the player free to run.
+   */
   busy: boolean
 }
 
@@ -220,6 +224,12 @@ export class Locomotion {
   stance: Stance = 'stand'
   /** 0 standing, 1 fully crouched — drives the camera height and the collider. */
   crouchAmount = 0
+  /**
+   * True while something overhead is refusing the stand-up. Held crouch is one
+   * of the three ways to end up slow with no obvious cause, so the `?stats=1`
+   * readout names it rather than leaving the player to guess.
+   */
+  standBlocked = false
   height: number = MOVE.standHeight
   eyeHeight: number = MOVE.eyeStand
 
@@ -759,6 +769,16 @@ export class Locomotion {
     this.mantleProbeRest = 0
     this.stance = 'mantle'
     this.isSliding = false
+    // A mantle takes over the whole update — `stepLocomotion`, and with it
+    // `updateSprintState`, is skipped for its entire 0.37-0.62 s — so anything
+    // that state machine owns freezes rather than being re-evaluated. Left set,
+    // `isSprinting` stayed true across a climb the player was not even holding
+    // an input for, which reported as sprint time, drove the sprint viewmodel
+    // pose and FOV through the animation, and kept the weapon system re-arming
+    // its own sprint-out so the gun came back up after the feet landed instead
+    // of with them. `startSlide` already clears both for the same reason.
+    this.isSprinting = false
+    this.isTacSprinting = false
     this.onGround = false
     this.justMantled = true
     // The weapon comes back up as the feet land, not after.
@@ -814,7 +834,8 @@ export class Locomotion {
     else if (m.crouchHeld || this.forceCrouch > 0) target = 1
     else target = 0
 
-    if (target < this.crouchAmount && !this.canStand(true)) target = this.crouchAmount
+    this.standBlocked = target < this.crouchAmount && !this.canStand(true)
+    if (this.standBlocked) target = this.crouchAmount
 
     const k = this.isSliding ? 20 : (target > this.crouchAmount ? 15 : 11)
     this.crouchAmount += (target - this.crouchAmount) * approach(k, dt)

@@ -521,7 +521,7 @@ export class AiSystem implements System, AiService {
       // returns early once its soldier is dead, so a soldier killed while it
       // held the player never closes its own contact and every consumer counts
       // it as still watching for the rest of the run.
-      this.byId.get(s.id)?.onKilled()
+      this.byId.get(s.id)?.onRemoved()
       const bi = this.squad.members.findIndex((b) => b.soldier === s)
       if (bi >= 0) this.squad.members.splice(bi, 1)
       this.byId.delete(s.id)
@@ -631,12 +631,18 @@ export class AiSystem implements System, AiService {
   }
 
   dispose(): void {
+    // Teardown is a removal like any other. `retireDead` is the only path that
+    // closes a contact today because it is the only path that drops a live
+    // soldier, but a soldier holding the player when the system goes away
+    // leaves the same open contact behind, and consumers outlive this system.
+    for (const b of this.squad.members) b.onRemoved()
     for (const s of this.soldiers) s.dispose()
     for (const s of this.corpses) s.dispose()
     this.soldiers.length = 0
     this.corpses.length = 0
     this.enemies.length = 0
     this.squad.members.length = 0
+    this.byId.clear()
     for (const l of this.lights) l.removeFromParent()
     for (const a of this.assets) {
       a.geometry.dispose()

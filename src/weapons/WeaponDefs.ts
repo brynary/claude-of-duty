@@ -164,12 +164,34 @@ export const WEAPONS: readonly WeaponDef[] = [
     // the sights", corroborated by `adsSpread 0` in the shipped weapon files.
     spreadHip: 0.0295, spreadAds: 0, spreadPerShot: 0.0021, spreadMax: 0.055,
     spreadDecay: 0.10, spreadMoveMul: 1.7, spreadCrouchMul: 0.72, spreadJumpMul: 2.4,
-    // Budget: the sights must still be on a 0.35 m torso at the 26 m designed
-    // rifle distance after the 4 shots that make the kill, so the open-loop
-    // climb at shot 4 has to stay under 0.77 deg. adsScale is 1.0 because CoD4
-    // ships identical hip and ADS view kick [measured]; ADS buys spread, not
-    // recoil. `permanent` is 0 because CameraRig already folds 30% of every
-    // kick into the aim — carrying a second permanent term double-counted it.
+    // Budget: the sights must still be on the presented torso at the 26 m
+    // designed rifle distance after the 4 shots that make the kill. The climb
+    // is vertical, so it is spent against the torso's *height* — 0.84 m of
+    // chest and stomach is 1.85 deg at 26 m, so 0.93 deg of half-budget from a
+    // centre-mass hold. (The older note here compared the pitch climb against
+    // the 0.35 m torso *width*, which is the wrong axis.)
+    //
+    // Measured open loop, full ADS, trigger held, mean of 400 seeds at 60 Hz.
+    // Two columns because two things climb: `weapon` is the offset this file
+    // owns, `view` adds the 30% of each kick that CameraRig.RECOIL_KEEP folds
+    // permanently into the aim, and `view` is what the player must pull back.
+    //
+    //   shot     4      6      10     20     30
+    //   weapon  0.51   0.79   1.19   1.69   1.91  deg
+    //   view    0.66   1.03   1.55   2.22   2.53  deg
+    //
+    // So the kill burst ends 0.66 deg high — inside the 0.93 deg half-budget —
+    // and a held magazine tops out around 2.5 deg, which is a bias to pull
+    // against rather than a runaway. Horizontal stays under 0.1 deg throughout:
+    // §3.5 [stated] wants "a randomised cone with a directional bias, not a
+    // memorisable fixed spray pattern", so `yaw` is a third of `pitch` and the
+    // per-shot jitter (0.45, x1.6 on yaw) is larger than the pattern's own
+    // horizontal term, which never exceeds 0.32.
+    //
+    // adsScale is 1.0 because CoD4 ships identical hip and ADS view kick
+    // [measured]; ADS buys spread, not recoil. `permanent` is 0 because
+    // CameraRig already folds 30% of every kick into the aim — carrying a
+    // second permanent term double-counted it.
     recoil: {
       pitch: 0.0038, yaw: 0.0013, jitter: 0.45, pattern: RIFLE_PATTERN,
       snap: 38, recovery: 1.2, settle: 6.0, permanent: 0, adsScale: 1,
@@ -224,8 +246,11 @@ export const WEAPONS: readonly WeaponDef[] = [
     magSize: 32, reserve: 224, muzzleVelocity: 400, noiseRadius: 38,
     spreadHip: 0.0225, spreadAds: 0, spreadPerShot: 0.0020, spreadMax: 0.060,
     spreadDecay: 0.13, spreadMoveMul: 1.35, spreadCrouchMul: 0.80, spreadJumpMul: 2.0,
-    // Budget: 5 shots on a 0.35 m torso at the 13 m designed SMG distance,
-    // so the open-loop climb at shot 5 stays under 0.8 deg.
+    // Budget: 5 shots on the presented torso at the 13 m designed SMG distance.
+    // 0.84 m of torso height is 3.70 deg at 13 m, so 1.85 deg of half-budget.
+    // Measured open loop as for the M4A1: shot 5 is 0.58 deg weapon-owned /
+    // 0.75 deg including CameraRig's 30% fold, and shot 30 tops out at 1.75 /
+    // 2.32 deg. Comfortably inside the budget at the range this weapon is for.
     recoil: {
       pitch: 0.0034, yaw: 0.0012, jitter: 0.50, pattern: SMG_PATTERN,
       snap: 42, recovery: 1.4, settle: 6.0, permanent: 0, adsScale: 1,

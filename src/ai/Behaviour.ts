@@ -34,6 +34,47 @@ const COS_FOV_ALERT = Math.cos(1.65)
 const THREAT_TICK = 0.5
 
 /**
+ * How long a soldier must have been *out of contact* before the player counts
+ * as a fresh sighting and a new reaction window is rolled.
+ *
+ * `[estimated]`. §7.5 gives the window and says nothing about when it re-arms,
+ * and the free choice turns out to matter more than the window itself. The
+ * reaction models *being surprised*, and a soldier working a cover cycle in the
+ * middle of a firefight is not surprised when it steps out — but its own line
+ * of sight is blocked by the same cover that blocks the player's, so contact
+ * falls on every hide and a short threshold re-arms on every peek.
+ *
+ * Measured over 30 s, four soldiers at 16 m, mean of eight seeds, sweeping the
+ * hide length of the cover cycle. Damage reaching the player, and how many
+ * reaction windows the squad rolled:
+ *
+ * | hide | 1.5 s threshold | 6 s threshold |
+ * |---|---|---|
+ * | 1.2 s | 178 HP, 0 armed | 157 HP, 4 armed |
+ * | 1.8 s | **7 HP, 25 armed** | 144 HP, 4 armed |
+ * | 2.6 s | 140 HP, 0 armed | 131 HP, 4 armed |
+ * | 3.5 s | 87 HP, 0 armed | 79 HP, 4 armed |
+ * | none | 255 HP, 0 armed | 255 HP, 4 armed |
+ *
+ * Two things to read off that. First, the short threshold does not merely cost
+ * damage in the 1.8 s row, it erases it — a re-arm also re-arms
+ * {@link rangingBurst}, so the soldier has to complete a whole burst before any
+ * round is allowed to land and it is back behind cover before it gets there.
+ * Second, the "armed" column shows why the short threshold is unusable even
+ * where it looks harmless: it fires on one hide length and not on the ones
+ * either side of it, because contact returns in the same frame as line of sight
+ * only while awareness is still above 0.55, and awareness decays at 0.22/s from
+ * 1.0 — a 0.55 s wide band, nothing else. The right-hand column arms once per
+ * soldier per fight at every hide length, which is what the window is for.
+ *
+ * 6 s is `ai_noPathToEnemyGiveupTime "6000"` `[stated]` §7.4 — the interval the
+ * series itself treats as "this player is gone" — and this file already uses it
+ * to send a soldier from `engage` back to `patrol`. It clears the longest hide
+ * ({@link HIDE_MAX}, 4 s) with room for the step out of cover.
+ */
+const REACQUIRE_GRACE = 6
+
+/**
  * How long an attacker token is held.
  *
  * `[estimated]`. Nothing in §7 gives a dwell time — only the clamp itself and
@@ -374,6 +415,24 @@ export class Behaviour {
   private engageable = false
   private contactTime = 0
   private lostTime = 99
+  /**
+   * Seconds since {@link hasContact} last fell — which is **not** the same as
+   * {@link lostTime}, and the difference is the whole of the bug this replaced.
+   *
+   * `lostTime` is zeroed on the first frame line of sight returns. Contact
+   * additionally needs `awareness` past 0.55, and awareness only climbs while
+   * line of sight is already clear, so the rising edge of contact always lands
+   * one or more frames *after* `lostTime` went to zero. A re-arm condition
+   * written against `lostTime` therefore reads 0 every single time and never
+   * fires: measured across fresh spawns and re-acquisitions alike, every
+   * contact edge reported `lostTime = 0.000`, the reaction window was never
+   * rolled, and enemies returned fire 0.033 s after sighting — two frames —
+   * against the 0.5-1.0 s of §7.5.
+   *
+   * This counter only advances while contact is down, so at the rising edge it
+   * is exactly how long the soldier went without the player.
+   */
+  private outOfContactFor = 99
 
   private path: THREE.Vector3[] = []
   private pathIndex = 0
@@ -484,7 +543,6 @@ export class Behaviour {
       }
     }
 
-    const lostFor = this.lostTime
     if (this.losClear) {
       this.lastKnown.copy(this.pEye)
       const dist = this.soldier.position.distanceTo(this.pEye)
@@ -516,11 +574,14 @@ export class Behaviour {
         // "the player, once they see the bot, kills it faster than the bot's
         // own reaction window" is the asymmetry that makes the player the
         // protagonist. Only a fresh sighting re-arms it — a soldier that ducks
-        // and pops back up inside a second does not get to be surprised again.
-        if (lostFor > 1.5) {
+        // and pops back up inside a second does not get to be surprised again —
+        // and the measure of "fresh" is time spent out of *contact*, not time
+        // spent without line of sight. See {@link outOfContactFor}.
+        if (this.outOfContactFor > REACQUIRE_GRACE) {
           this.reactionTimer = difficulty.sampleReactionTime(this.d.rng)
           this.rangingBurst = true
         }
+        this.outOfContactFor = 0
         // A soldier that spots the player from behind cover comes out to fight
         // rather than finishing the hide it was in the middle of; otherwise its
         // first shot lands a hide-length after its reaction window closed.
@@ -537,6 +598,7 @@ export class Behaviour {
         })
       }
     }
+    if (!this.hasContact) this.outOfContactFor += dt
   }
 
   /** Wall-clock time of the current contact, for reaction-time measurement. */
@@ -567,16 +629,25 @@ export class Behaviour {
   }
 
   /**
-   * A soldier killed while holding contact never reaches `updatePerception`
-   * again — `update` returns early once it is dead — so the falling edge has to
-   * be emitted from the outside or the event stream never closes the contact.
-   * Telemetry counts open contacts to decide whether the run is quiet, so a
-   * missing edge silently pins `idleFraction` at zero for the rest of the run.
+   * Closes this soldier's contact because it is leaving the simulation.
+   *
+   * Call this on **every** removal, not only on death: killed, despawned,
+   * culled, torn down. A soldier that stops being updated while it holds
+   * contact never reaches `updatePerception` again, so the falling edge has to
+   * be emitted from the outside or the event stream never closes it. Telemetry
+   * counts open contacts to decide whether the run is quiet, so one missing
+   * edge silently pins `idleFraction` at zero for the rest of the run, and
+   * `Difficulty` never closes the performance episode.
+   *
+   * Idempotent, so a caller that is not sure whether the edge already went out
+   * can call it anyway. {@link AiSystem} is the only caller and does so from
+   * both its retire path and its teardown.
    */
-  onKilled(): void {
+  onRemoved(): void {
     this.attacker = false
     if (!this.hasContact) return
     this.hasContact = false
+    this.outOfContactFor = 0
     this.d.ctx.events.emit('ai:lostContact', {
       id: this.soldier.id,
       heldFor: this.contactAt > 0 ? this.d.ctx.elapsed - this.contactAt : 0,
@@ -602,9 +673,17 @@ export class Behaviour {
     if (this.state === 'idle' || this.state === 'patrol') this.enter('investigate')
   }
 
-  /** Called by the firing path on the first shot of each contact. */
+  /**
+   * Called by the firing path on the first *aimed* shot of each contact.
+   *
+   * Suppressive fire is deliberately excluded. It is placed at the ground near
+   * where the player was last seen, it happens while contact is down, and its
+   * `sinceContact` would therefore be measured against a stale contact that may
+   * be seconds old. Counting it as "returned fire" reports a reaction time no
+   * soldier ever had.
+   */
   protected noteShot(distance: number): void {
-    if (this.firedSinceContact) return
+    if (!this.hasContact || this.firedSinceContact) return
     this.firedSinceContact = true
     this.d.ctx.events.emit('ai:engaged', {
       id: this.soldier.id,
@@ -1300,11 +1379,28 @@ export class Behaviour {
    * while by the time the shutter opens — and asserts exposure, because the
    * pose camera stands where a player would and these soldiers are placed in
    * the open in front of it.
+   *
+   * Contact is raised through the same edge the perception path uses, so the
+   * `ai:contact` / `ai:lostContact` pair stays balanced; consumers key the set
+   * by id and an unmatched falling edge would otherwise arrive on its own.
+   * `firedSinceContact` is asserted rather than cleared: this soldier skipped
+   * the reaction window on purpose, so its first shot is not a reaction time
+   * and must not be reported as one.
    */
   forceEngage(target: THREE.Vector3): void {
     this.alerted = true
     this.awareness = 1
-    this.hasContact = true
+    if (!this.hasContact) {
+      this.hasContact = true
+      this.outOfContactFor = 0
+      this.contactAt = this.d.ctx.elapsed
+      this.d.ctx.events.emit('ai:contact', {
+        id: this.soldier.id,
+        position: this.soldier.position.clone(),
+        distance: this.soldier.position.distanceTo(target),
+      })
+    }
+    this.firedSinceContact = true
     this.losClear = true
     this.exposed = true
     this.lastKnown.copy(target)

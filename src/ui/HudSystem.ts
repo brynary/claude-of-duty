@@ -561,6 +561,7 @@ export class HudSystem implements System, HudService {
     if (ctx.config.stats) {
       const info = ctx.renderer.info
       this.stats.update(dt, this.frameMs, info.render.calls, info.render.triangles, info.programs?.length ?? 0)
+      this.stats.setMovement(stanceLine(player, ads), keyLine(ctx.input, player))
     }
   }
 
@@ -799,6 +800,38 @@ function yawOf(camera: THREE.Object3D): number {
 function staminaOf(player: unknown): number | null {
   const s = (player as { stamina?: number } | undefined)?.stamina
   return typeof s === 'number' && isFinite(s) ? clamp(s, 0, 1) : null
+}
+
+/**
+ * The two `?stats=1` movement lines.
+ *
+ * Every state that quietly costs the player speed looks the same on screen as
+ * ordinary walking, and two of them are latches that survive until something
+ * unrelated happens to clear them: a `C` crouch stays on until `C` is pressed
+ * again, and a `ShiftLeft` dropped by a pointer-lock loss stays dropped until
+ * the key is physically released and re-pressed. `shift` here is what the game
+ * believes, not what the hand is doing, so a `0` while the key is held down is
+ * the desync itself, visible.
+ */
+function stanceLine(player: unknown, ads: number): string {
+  const p = player as {
+    velocity?: THREE.Vector3, crouchFraction?: number, isSprinting?: boolean,
+  } | undefined
+  const v = p?.velocity
+  const speed = v ? Math.hypot(v.x, v.z) : 0
+  return `${speed.toFixed(1)} m/s  crouch ${(p?.crouchFraction ?? 0).toFixed(2)}` +
+    `  ads ${ads.toFixed(2)}  sprint ${bit(p?.isSprinting)}`
+}
+
+function keyLine(input: GameContext['input'], player: unknown): string {
+  const p = player as { crouchLatched?: boolean, standBlocked?: boolean } | undefined
+  return `shift ${bit(input.isDown('ShiftLeft'))} ctrl ${bit(input.isDown('ControlLeft'))}` +
+    ` alt ${bit(input.isDown('AltLeft'))} m0 ${bit(input.mouse0)} m1 ${bit(input.mouse1)}` +
+    `  Clatch ${bit(p?.crouchLatched)} ceiling ${bit(p?.standBlocked)}`
+}
+
+function bit(on: boolean | undefined): string {
+  return on ? '1' : '0'
 }
 
 function fireModeOf(weapons: unknown): string {

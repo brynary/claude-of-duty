@@ -98,6 +98,19 @@ export class PlayerSystem implements System, PlayerService {
   get weaponLagPitch(): number { return this.rig.weaponLagPitch }
   /** 0..1 crouch blend, so the viewmodel can settle with the stance. */
   get crouchFraction(): number { return this.loco.crouchAmount }
+  /**
+   * Read by: `HudSystem`, for the `?stats=1` readout.
+   *
+   * True while `C` has latched the crouch on. The latch has no tell of its own
+   * — the low camera looks the same however the crouch was asked for — and its
+   * only automatic release is sprinting forward, which the crouch itself
+   * blocks unless `ShiftLeft` is registered. Naming it is the only way to tell
+   * a latched crouch from a held one from inside the game.
+   */
+  get crouchLatched(): boolean { return this.crouchToggle }
+  /** Read by: `HudSystem`, for the `?stats=1` readout. True while something
+   * overhead is refusing the stand-up. */
+  get standBlocked(): boolean { return this.loco.standBlocked }
 
   private readonly loco = new Locomotion()
   private readonly rig = new CameraRig()
@@ -199,7 +212,18 @@ export class PlayerSystem implements System, PlayerService {
     if (ctx.input.mouse0Pressed && !ctx.input.locked && ctx.input.enabled) ctx.input.requestLock()
 
     this.rig.look(dt, ctx, ads)
-    this.buildIntent(ctx, ads, weapons?.isFiring === true || weapons?.isReloading === true)
+    // Firing breaks a sprint. Reloading does not, and used to: §3.3 `[measured]`
+    // is that a reload is *cancelled by* sprinting — "sprint, melee or swap
+    // after `reloadAddTime` and you keep the ammo" — and MWIII Season 3 added
+    // cancelling a reload with tactical sprint outright. Feeding `isReloading`
+    // in here inverted that and pinned the player to 4.8 m/s for the whole
+    // 2.4-3.3 s animation, in the lull that is the one moment they most want to
+    // be moving. It was the first gate to refuse on 4% of frames in a synthetic
+    // run, though most of those were aiming as well, so the measured effect on
+    // total sprint time is under a point — this is a correctness fix, not a
+    // metric one. The weapon system has no sprint-cancel path of its own, so
+    // the reload simply finishes while the player runs; no ammo is lost.
+    this.buildIntent(ctx, ads, weapons?.isFiring === true)
 
     this.loco.update(dt, this.intent)
     this.clampToBounds(ctx)

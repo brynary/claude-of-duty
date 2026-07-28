@@ -369,6 +369,8 @@ export class StatsOverlay {
   private line1: TextSlot
   private line2: TextSlot
   private line3: TextSlot
+  private line4: TextSlot
+  private line5: TextSlot
   private canvas: HTMLCanvasElement
   private g: CanvasRenderingContext2D
   private history = new Float32Array(112)
@@ -383,6 +385,8 @@ export class StatsOverlay {
     this.line1 = new TextSlot(el('div', '', this.root))
     this.line2 = new TextSlot(el('div', '', this.root))
     this.line3 = new TextSlot(el('div', '', this.root))
+    this.line4 = new TextSlot(el('div', '', this.root))
+    this.line5 = new TextSlot(el('div', '', this.root))
     this.canvas = el('canvas', '', this.root)
     this.canvas.width = 224
     this.canvas.height = 52
@@ -392,6 +396,17 @@ export class StatsOverlay {
 
   setEnabled(on: boolean): void {
     this.root.style.display = on ? '' : 'none'
+  }
+
+  /**
+   * Movement and raw key state. Deliberately not throttled the way the frame
+   * counters below are: the states worth catching here are latches, and a
+   * reading that lags them by a fifth of a second is a reading that invites
+   * the player to blame the readout.
+   */
+  setMovement(stance: string, keys: string): void {
+    this.line4.set(stance)
+    this.line5.set(keys)
   }
 
   update(dt: number, ms: number, calls: number, tris: number, programs: number): void {

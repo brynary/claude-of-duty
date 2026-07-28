@@ -2,7 +2,8 @@ import * as THREE from 'three'
 import type { AiService, GameContext, LevelService } from '../core/Types'
 import { Rand } from '../core/Rand'
 import { getMatchService } from '../game/Match'
-import { footprintBase, insideAnyBuilding } from './Buildings'
+import { BUILDINGS, EXTRA_FOOTPRINTS, footprintBase, insideAnyBuilding } from './Buildings'
+import { rotRectSdf } from './Kit'
 import { groundHeight } from './Terrain'
 
 /**
@@ -62,7 +63,12 @@ export interface Post {
    * however far away he started, because the alley is 4 m wide.
    */
   sight: number
-  /** Explicit height for posts that are not on the terrain, i.e. roof decks. */
+  /**
+   * Explicit height for posts that are not on the terrain, i.e. roof decks.
+   *
+   * This also marks the post as elevated, which changes what can hide it: see
+   * {@link DECK_SUPPORT}.
+   */
   y?: number
   /** Inside a building footprint — a room or a roof. Skips the solidity check. */
   enclosed?: boolean
@@ -74,10 +80,16 @@ export interface Post {
  *
  * The 33 ground positions carried over from the original authored list are kept
  * verbatim, because they were placed against the built geometry and are known
- * to be standable. The additions are all clear of every footprint in
- * `BUILDINGS` and `EXTRA_FOOTPRINTS` by at least 0.9 m, and are re-checked
- * against `insideAnyBuilding` at init so a later change to the architecture
- * drops them rather than burying a soldier in a wall.
+ * to be standable. Every ground post clears every footprint in `BUILDINGS` and
+ * `EXTRA_FOOTPRINTS` by at least {@link POST_CLEARANCE}, and all of them are
+ * re-checked against `insideAnyBuilding` at init so a later change to the
+ * architecture drops them rather than burying a soldier in a wall.
+ *
+ * That claim used to be false and the drop used to be silent, which is a bad
+ * pair: the highway lane's `(28, 26.5)` post stood 0.80 m from the water tower
+ * legs against the 0.90 m filter, so it had never once entered the graph and
+ * nothing said so. It has been moved 0.5 m west, off the tower, and the drop
+ * now warns. Measured clearances after the move run 1.00-5.30 m.
  *
  * Sightlines, against §6.3 `[stated]` (SMG 512 u = 13.0 m, rifle 1024 u =
  * 26.0 m) and §4.6 `[stated]` for the spaces themselves (alleyway 192 u =
@@ -93,6 +105,11 @@ export interface Post {
  * | north   | 26-32 m | the open market square, the rifle distance         |
  * | roof    | 28-30 m | market hall deck, shooting down into the junction  |
  * | highway | 26-34 m | the road out of town — this map's long case        |
+ *
+ * The roof lane is two posts on one open deck, and it is the lane most easily
+ * over-used: it matches the long end of {@link SIGHT_CYCLE} and it used to read
+ * as perfect cover from everywhere on the map. See {@link DECK_SUPPORT} for why
+ * it did and what it now costs.
  */
 export const POSTS: readonly Post[] = [
   // --- The market square and its north end --------------------------------
@@ -143,7 +160,9 @@ export const POSTS: readonly Post[] = [
 
   // --- The highway out of town --------------------------------------------
   { x: 23.5, z: 33.5, lane: 'highway', sight: 28 },
-  { x: 28.0, z: 26.5, lane: 'highway', sight: 30 },
+  // Moved 0.5 m west off the water tower legs, which it cleared by 0.80 m
+  // against a 0.90 m filter. Clearance here is 1.30 m.
+  { x: 27.5, z: 26.5, lane: 'highway', sight: 30 },
   { x: 30.0, z: 32.0, lane: 'highway', sight: 34 },
   { x: 19.5, z: 37.0, lane: 'highway', sight: 30 },
   { x: 12.0, z: 40.0, lane: 'highway', sight: 26 },
@@ -233,15 +252,46 @@ const LIVE_CAP = 6
 const QUIET_BEFORE_WAVE = 4.5
 
 /**
- * Backstop: seconds of quiet after which a wave is staged at the near band
- * whatever else is going on.
+ * Seconds of quiet after which a wave is staged at the near band whatever else
+ * is going on.
  *
  * A wave staged deep behind cover can fail to find the player at all if the
  * player also stops moving — the `hold` scenario does exactly that. Longest
  * quiet stretch is a graded metric with a 60 s ceiling, so this fires well
  * inside it and guarantees a contact within a few seconds.
+ *
+ * This handles a player nobody can find. It is not a backstop on the director
+ * itself, because it reads the same accumulator as {@link QUIET_BEFORE_WAVE}:
+ * see {@link MAX_SILENCE}, which is.
  */
 const MAX_QUIET = 26
+
+/**
+ * The backstop that does not read the accumulator: seconds since the last spawn
+ * after which a spent wave is replaced regardless of what contact says.
+ *
+ * {@link MAX_QUIET} cannot do this job, because it gates on the same
+ * accumulator as {@link QUIET_BEFORE_WAVE} and that accumulator can be pinned
+ * at zero indefinitely by one enemy. `hasContact` in `src/ai` is
+ * `losClear && awareness > 0.55`; `losClear` is a throttled raycast and
+ * awareness decays at 0.22/s, so it stays over the threshold for about two
+ * seconds after the line breaks. A soldier trading sight around a corner
+ * re-acquires well inside that window every time, so `quiet` sawtooths between
+ * zero and a fraction of a second and never reaches either threshold. Down to
+ * that soldier and with him unable to close, nothing committed the next wave
+ * and nothing ever would. Driven with one enemy alive on a 0.4 s visible /
+ * 1.2 s hidden cycle, `quiet` peaked at **1.20 s** over a full minute — under
+ * 4.5 the whole time, never mind 26 — so the director committed nothing at all
+ * for the entire run. With this clock the same minute delivers waves at 26.0 s
+ * and 52.0 s.
+ *
+ * This clock is wall time since the last spawn, so no perception result can
+ * touch it. It is paired with {@link SPENT_LIVE} so it cannot fire into a
+ * healthy fight: a wave still carrying more than one soldier is not stalled,
+ * it is being fought. In ordinary pacing a wave is spent and replaced well
+ * inside this, so it never fires at all.
+ */
+const MAX_SILENCE = 26
 
 /**
  * The band the backstop stages into, metres, and the sightline it aims at.
@@ -295,6 +345,57 @@ const MARCH_SKIP = 1.6
 
 /** Ring radius used to tell deep cover from a corner, metres. */
 const EDGE_RADIUS = 4.5
+
+/**
+ * Metres a ground post must clear every building footprint by.
+ *
+ * Enough for a soldier to stand and turn without clipping the wall he spawned
+ * against: the §4.6 `[stated]` aim-assist capsule is 0.254 m in radius and a
+ * shouldered rifle reaches rather further than that.
+ */
+const POST_CLEARANCE = 0.9
+
+/**
+ * Solidity lattice cell classes, ordered so that a cell hides a post when its
+ * class is at least the class the post needs to be hidden.
+ *
+ * A cell outside every footprint stays zero and hides nothing.
+ *
+ * A line between two people standing on the ground is broken by any structure
+ * at all, so for a ground post the lattice is effectively binary. A line to
+ * somebody standing on a roof deck differs in exactly one way: the building he
+ * is standing on does not hide him — he is on top of it. Two classes are
+ * therefore enough to answer both questions, and neither of them needs a height
+ * in metres, which is what lets both be derived from the footprint data alone.
+ *
+ * Marching one class for everything is what made the roof lane the district's
+ * most popular approach. Both roof posts sit 3.5 m and 3.0 m inside the market
+ * hall footprint; {@link MARCH_SKIP} drops only 1.6 m at the target end, so
+ * every march to them ended on a solid cell. Marched from all 1,252 standable
+ * spots inside `bounds`, they read as hidden from **100%** of the ones in
+ * staging range — 640 and 716 spots respectively, no exceptions. `enclosed`
+ * then added a room's cover bonus on top and skipped the ring test. Two posts
+ * on an open deck, with a designed 28-30 m sightline and a breached parapet
+ * composed to open the district up, were scoring as the best cover on the map.
+ * Staged from every one of those spots against a uniformly random facing, they
+ * took the primary slot 36% of the time at the cycle's 26 m band, 48% at 30 m
+ * and 40% at 34 m — the top lane at every long sightline the cycle asks for.
+ * The same census now gives them 20%, 30% and 25%, behind `north` in all three,
+ * and reads them as hidden from 77% and 79% of spots rather than all of them.
+ *
+ * The two classes are an approximation with one known error each way. Every
+ * building in the district is taller than the 2.8 m deck — the shortest,
+ * `cornerShop`, is 4.35 m to its parapet — but the alley compound wall in
+ * `EXTRA_FOOTPRINTS` is 2.55 m, so it is treated as hiding a deck it would
+ * really be seen over. And a roof post placed on something much taller than the
+ * market hall would be under-reported the other way, because everything else
+ * would still outrank it. Both are wrong only for a deck; a third class, or
+ * real heights, is the fix if a second roof ever goes in.
+ */
+/** A structure that hides a post on the ground, but not one standing on it. */
+const DECK_SUPPORT = 1
+/** A structure tall enough to hide a post on a roof deck as well. */
+const FULL_HEIGHT = 2
 
 /**
  * Bounds on the fraction of the map that reads as solid to
@@ -398,10 +499,26 @@ export class EncounterDirector {
     // nothing downstream would notice: `AiSystem` re-grounds spawn points with a
     // downward ray but never tests whether the column is solid. Enclosed posts
     // are interiors and roof decks and are meant to be inside a footprint.
+    const buried: Post[] = []
     for (const p of POSTS) {
-      if (!p.enclosed && insideAnyBuilding(p.x, p.z, 0.9)) continue
+      if (!p.enclosed && insideAnyBuilding(p.x, p.z, POST_CLEARANCE)) {
+        buried.push(p)
+        continue
+      }
       this.posts.push(p)
       this.world.push(new THREE.Vector3(p.x, p.y ?? groundHeight(p.x, p.z) + 0.05, p.z))
+    }
+    // Dropping the post is the right call; doing it silently is not. A lane
+    // quietly short of one approach still stages, still scores and still looks
+    // healthy — it just pushes the traffic it should have carried onto whatever
+    // lane is next best, which is how two roof posts came to absorb half the
+    // long-range waves on this map.
+    if (buried.length > 0) {
+      console.warn(
+        `[encounter] ${buried.length} post(s) dropped for standing within ${POST_CLEARANCE} m of a ` +
+        `building: ${buried.map((p) => `${p.lane}/${p.sight}m at (${p.x}, ${p.z})`).join(', ')}. ` +
+        'Those lanes now have fewer approaches than POSTS claims; move the posts or the footprint.',
+      )
     }
     for (let i = 0; i < MAX_STAGED; i++) this.pool.push(new THREE.Vector3())
     for (let i = 0; i < this.posts.length; i++) {
@@ -451,6 +568,11 @@ export class EncounterDirector {
     let live = 0
     for (let i = 0; i < ai.enemies.length; i++) if (ai.enemies[i].alive) live++
 
+    // Nobody who is not alive is holding contact. `AiSystem` does close the
+    // contact of a soldier killed mid-sighting, so this is belt and braces —
+    // but one stale id left in this set pins `quiet` at zero for the rest of
+    // the run, and that is exactly the failure MAX_SILENCE exists to survive.
+    if (live === 0) this.contacts.clear()
     if (this.contacts.size > 0) this.quiet = 0
     else this.quiet += dt
 
@@ -460,7 +582,8 @@ export class EncounterDirector {
     // afterwards would let the backstop fire against staging computed for the
     // far band, spawn a wave the player still cannot find, and reset its own
     // clock for another {@link MAX_QUIET} seconds.
-    const forcing = this.quiet >= MAX_QUIET
+    const stalled = live <= SPENT_LIVE && ctx.elapsed - this.lastSpawnAt >= MAX_SILENCE
+    const forcing = this.quiet >= MAX_QUIET || stalled
     const spent = live <= SPENT_LIVE && this.quiet >= QUIET_BEFORE_WAVE
     const wave =
       (spent || forcing) &&
@@ -609,7 +732,8 @@ export class EncounterDirector {
       const cos = (fx * dx + fz * dz) / dist
       if (cos < REAR_COS && dist < MIN_BEHIND) continue
 
-      const hidden = this.occluded(w.x, w.z)
+      const deck = p.y !== undefined
+      const hidden = this.occluded(w.x, w.z, deck)
       if (requireHidden && !hidden) continue
 
       // A post is only useful if the soldier on it can find the player within a
@@ -617,13 +741,14 @@ export class EncounterDirector {
       // already has. What is wanted is the corner: hidden from where the player
       // stands, with a firing line a short walk away. The ring test is how that
       // is told apart — how many points a few metres off this one can see the
-      // player.
+      // player. It is a ground-plane test, so it is only asked of ground posts:
+      // the ring around a roof post is the hall below it, not the deck.
       let openNeighbours = 0
       if (!p.enclosed) {
-        if (!this.occluded(w.x + EDGE_RADIUS, w.z)) openNeighbours++
-        if (!this.occluded(w.x - EDGE_RADIUS, w.z)) openNeighbours++
-        if (!this.occluded(w.x, w.z + EDGE_RADIUS)) openNeighbours++
-        if (!this.occluded(w.x, w.z - EDGE_RADIUS)) openNeighbours++
+        if (!this.occluded(w.x + EDGE_RADIUS, w.z, false)) openNeighbours++
+        if (!this.occluded(w.x - EDGE_RADIUS, w.z, false)) openNeighbours++
+        if (!this.occluded(w.x, w.z + EDGE_RADIUS, false)) openNeighbours++
+        if (!this.occluded(w.x, w.z - EDGE_RADIUS, false)) openNeighbours++
       }
 
       let score = -Math.abs(p.sight - targetSight)
@@ -631,8 +756,15 @@ export class EncounterDirector {
       if (p.lane === this.recentLanes[0]) score -= 9
       else if (p.lane === this.recentLanes[1]) score -= 4
       if (!hidden) score -= 8
-      if (p.enclosed) score += 2
-      else if (openNeighbours === 0) score -= 3
+      if (p.enclosed) {
+        // A room is cover in its own right — walls on four sides and a doorway
+        // to come out of — and there is no ring to test because every point
+        // around it is inside the same building. A roof deck shares neither
+        // property: it is an exposed platform whose whole advantage is height,
+        // and it now earns its place from an honest occlusion test rather than
+        // from a bonus written for rooms.
+        if (!deck) score += 2
+      } else if (openNeighbours === 0) score -= 3
       else if (openNeighbours <= 3) score += 3
       score += this.rng.range(0, 1.5)
 
@@ -671,6 +803,9 @@ export class EncounterDirector {
    * so it under-reports cover. That is the safe direction: a post it calls
    * visible may in fact be hidden, and the only cost is that the post goes
    * unused.
+   *
+   * Cells are classed rather than flagged, so the same lattice answers for a
+   * post on the ground and a post on a roof; see {@link DECK_SUPPORT}.
    */
   private buildSolidGrid(bounds: THREE.Box3): void {
     this.gridMinX = bounds.min.x
@@ -679,13 +814,18 @@ export class EncounterDirector {
     this.gridH = Math.ceil((bounds.max.z - bounds.min.z) / CELL)
     this.solid = new Uint8Array(this.gridW * this.gridH)
 
+    const supports = this.deckSupports()
     let filled = 0
     for (let j = 0; j < this.gridH; j++) {
       const z = this.gridMinZ + (j + 0.5) * CELL
       for (let i = 0; i < this.gridW; i++) {
         const x = this.gridMinX + (i + 0.5) * CELL
         if (!insideAnyBuilding(x, z, 0)) continue
-        this.solid[j * this.gridW + i] = 1
+        let cls = FULL_HEIGHT
+        for (const s of supports) {
+          if (rotRectSdf(x, z, s.cx, s.cz, s.hw, s.hd, s.yaw) < 0) { cls = DECK_SUPPORT; break }
+        }
+        this.solid[j * this.gridW + i] = cls
         filled++
       }
     }
@@ -704,8 +844,33 @@ export class EncounterDirector {
     )
   }
 
-  /** True when a building stands between the player's eye and a ground point. */
-  private occluded(tx: number, tz: number): boolean {
+  /**
+   * The footprints the roof posts stand on.
+   *
+   * Looked up from the architecture rather than written down here, so that
+   * moving the market hall moves this with it. Two posts on one hall yield the
+   * same rectangle twice; that costs one extra distance evaluation per solid
+   * cell at init and is not worth de-duplicating.
+   */
+  private deckSupports(): Footprint[] {
+    const out: Footprint[] = []
+    for (const p of this.posts) {
+      if (p.y === undefined) continue
+      const s = footprintUnder(p.x, p.z)
+      if (s) out.push(s)
+    }
+    return out
+  }
+
+  /**
+   * True when something stands between the player's eye and a post.
+   *
+   * `onDeck` marks a post that is standing on a roof rather than on the ground.
+   * The building under it is then not between the two of them and does not
+   * count; everything else does.
+   */
+  private occluded(tx: number, tz: number, onDeck: boolean): boolean {
+    const hides = onDeck ? FULL_HEIGHT : DECK_SUPPORT
     const dx = tx - this.eye.x
     const dz = tz - this.eye.z
     const d = Math.hypot(dx, dz)
@@ -718,10 +883,32 @@ export class EncounterDirector {
       if (i < 0 || i >= this.gridW) continue
       const j = ((this.eye.z + uz * t - this.gridMinZ) / CELL) | 0
       if (j < 0 || j >= this.gridH) continue
-      if (this.solid[j * this.gridW + i] !== 0) return true
+      if (this.solid[j * this.gridW + i] >= hides) return true
     }
     return false
   }
+}
+
+interface Footprint {
+  cx: number
+  cz: number
+  hw: number
+  hd: number
+  yaw: number
+}
+
+/** The building footprint a point stands inside, or null if it stands outside. */
+function footprintUnder(x: number, z: number): Footprint | null {
+  for (const s of BUILDINGS) {
+    const hw = s.w / 2
+    const hd = s.d / 2
+    const yaw = s.yaw ?? 0
+    if (rotRectSdf(x, z, s.cx, s.cz, hw, hd, yaw) < 0) return { cx: s.cx, cz: s.cz, hw, hd, yaw }
+  }
+  for (const s of EXTRA_FOOTPRINTS) {
+    if (rotRectSdf(x, z, s.cx, s.cz, s.hw, s.hd, s.yaw) < 0) return s
+  }
+  return null
 }
 
 /** Absolute difference between two bearings, wrapped into [0, PI]. */
