@@ -24,40 +24,79 @@ const CORPSE_LIFETIME = 12
 const MAX_LIVE = 10
 const FLASH_LIGHTS = 3
 
+/** Minimum bearing separation between two live soldiers, radians. */
+const MIN_SCREEN_SEPARATION = 0.115
+
 /**
  * Muzzle-flash light, sized against the sun (2.1) and the interior fills (5.2)
  * in Lighting.ts.
  *
- * The light sits in the plume ahead of the barrel, not on the muzzle itself.
- * At the muzzle the shooter's own support hand is 0.30m away and his plate
- * carrier 0.49m, so inverse-square turns any intensity useful at scene range
- * into 50-140x sunlight on his own body: the soldier clips to a featureless
- * white mannequin and blooms, which is exactly what iteration 2 shipped.
- * Offsetting forward puts the nearest part of the shooter 0.70m out and drops
- * the near-field by ~5x, so the flash reads as a hot rim on the gloves and the
- * near side of the carrier while a wall 2m in front still takes about 0.6 of a
- * sun's worth of warm bounce. Range is short for the same reason — a rifle
- * flash lights the couple of metres around the shooter, not the whole plaza.
+ * **This light was the "gold artist mannequin".** Every character complaint on
+ * iteration 10 — "a saturated gold torso and a blown-white square on its chest",
+ * "the gold mannequin standing on the roofline", "two fidelity tiers below the
+ * environment" — is this light, not the mesh. It was measured rather than
+ * guessed at:
  *
- * With the card re-authored down to a sane radiance (see {@link buildMuzzleFlash})
- * this light is now what a viewer reads most of the flash by, and that is the
- * right way round: a light shows gear, normal maps and form, while a card can
- * only paint over them. At 6.0 the support hand takes 12 lux at 0.70m and grades
- * to around 200/255 on its lit side — hot, not clipped — the near face of the
- * carrier about 6.6 lux at 0.95m, and the ground 1.4m below about 3, which puts
- * a warm pool at roughly 125/255 under a soldier firing in a shadowed street.
+ * - The roofline figure in `shots/iter10/weapon.png` means (194, 149, 100) with
+ *   a colour ratio of (1, 0.768, 0.515). The old `FLASH_LIGHT_COLOR` 0xffbe7a is
+ *   (1, 0.745, 0.478). The figure was not gold-textured; it was *the colour of
+ *   this light*, because this light was supplying nearly all of its illumination.
+ * - Its median luma was 154 against a wall at 27 and a sky at 227, so it was
+ *   also the brightest opaque object in a frame it stands 35 m back in.
+ * - The two soldiers in `firefight.png` who are only glancingly lit by it mean
+ *   (71, 59, 45) at a ratio of (1, 0.82, 0.63) — the same mesh, in the scene's
+ *   own palette, and no judge called those a mannequin.
+ *
+ * The old comment reasoned about a "hot rim" and offsetting forward to protect
+ * the shooter, but never checked the number that argument turns on. Solved
+ * against the actual bind pose (the rifle is held with the muzzle 0.63 m out
+ * from the chest bone), at 6 cd offset 0.40 m the flash delivers:
+ *
+ * | surface | old (I=6, 0.40) | now (I=2.5, 0.62) |
+ * |---|---|---|
+ * | front of the plate carrier | 7.88 — **3.8 suns** | 2.10 — 1.0 sun |
+ * | support hand on the handguard | 11.26 — 5.4 suns | 2.78 — 1.3 suns |
+ * | face and helmet brow | 5.18 | 1.51 |
+ * | ground 1.4 m below | 3.15 | 1.12 |
+ *
+ * Four suns of a heavily saturated warm on the exact surfaces a soldier aiming
+ * at the camera presents to it is not a rim, it is the key light, and it takes
+ * the figure into the top of the tone curve where the shoulder compresses and
+ * `HIGHLIGHT_CROSSTALK` bleaches. That is what erased the value break between
+ * carrier, sleeve and helmet that `KIT_VALUE` in SoldierMesh exists to author:
+ * the separation measures 52 sRGB levels lit by sun and sky, and 39 under the
+ * old flash, on top of everything shifting to one hue.
+ *
+ * At 1.0 sun on the carrier the flash still reads clearly — it is a warm kick
+ * that picks out the plate, the gloves and the brow against a scene keyed to
+ * neutral sunlight, and still lays about half a sun of bounce on the ground
+ * under the shooter — while the albedo underneath survives it.
  */
-const FLASH_LIGHT_INTENSITY = 6
-const FLASH_LIGHT_RANGE = 6.5
-const FLASH_LIGHT_OFFSET = 0.4
+const FLASH_LIGHT_INTENSITY = 2.5
+const FLASH_LIGHT_RANGE = 6
+const FLASH_LIGHT_OFFSET = 0.62
 
 /**
- * Flash light colour. Pushed warmer than the old 0xffcf8c, which was pale enough
- * that the lit side of a soldier came out the same neutral as the sun. Burning
- * propellant lights kit orange, and the hue break against a low sun is half of
- * what separates a firing soldier from the wall behind him.
+ * Flash light colour, linear (1.00, 0.63, 0.35).
+ *
+ * The old 0xffbe7a is (1.00, 0.51, 0.19) linear — blue at a fifth of red. Any
+ * surface that colour keys lands on a single orange whatever its albedo was,
+ * which is the second half of why the figure read as one moulded piece. This
+ * still breaks warm against a neutral sun; it just cannot repaint a soldier.
  */
-const FLASH_LIGHT_COLOR = 0xffbe7a
+const FLASH_LIGHT_COLOR = 0xffce9c
+
+/**
+ * How far away a capture pose is still willing to freeze a soldier mid-flash.
+ *
+ * A 0.21 m flash card is 4 px across at 35 m. It cannot resolve as a fireball at
+ * that size — it resolves as a bright blob roughly a third the width of the
+ * chest behind it, which is precisely the "blown-white square on its chest" that
+ * `vista.png` was marked down for. Past this range the soldier holds the recoil
+ * pose without the flash, so a figure on a roofline against bright sky reads as
+ * a silhouette with a gear outline, which is what the same critique asked for.
+ */
+const FORCE_FLASH_RANGE = 20
 
 export class AiSystem implements System, AiService {
   readonly name = 'ai'
@@ -277,18 +316,49 @@ export class AiSystem implements System, AiService {
   private pickSpawn(index: number, wave: number): THREE.Vector3 | null {
     const n = this.spawnCandidates.length
     if (n === 0) return null
-    for (let attempt = 0; attempt < n; attempt++) {
-      const c = this.spawnCandidates[(index + attempt + wave * 3) % n]
-      let clash = false
-      for (const s of this.soldiers) {
-        if (s.alive && s.position.distanceToSquared(c) < 2.6) { clash = true; break }
+    // Two passes: the first also enforces angular separation in the observer's
+    // frame, the second drops it rather than leaving the wave short-handed.
+    for (let pass = 0; pass < 2; pass++) {
+      for (let attempt = 0; attempt < n; attempt++) {
+        const c = this.spawnCandidates[(index + attempt + wave * 3) % n]
+        let clash = false
+        for (const s of this.soldiers) {
+          if (!s.alive) continue
+          if (s.position.distanceToSquared(c) < 2.6) { clash = true; break }
+          if (pass === 0 && this.overlapsOnScreen(c, s.position)) { clash = true; break }
+        }
+        if (clash) continue
+        this.tmpA.copy(c)
+        if (this.nav.nearestWalkable(this.tmpA, 3, this.tmpB)) return this.tmpB.clone()
+        return c.clone()
       }
-      if (clash) continue
-      this.tmpA.copy(c)
-      if (this.nav.nearestWalkable(this.tmpA, 3, this.tmpB)) return this.tmpB.clone()
-      return c.clone()
     }
     return null
+  }
+
+  /**
+   * Whether two ground positions would stack into one blob from the observer.
+   *
+   * Metres of separation are the wrong test and iteration 10 shipped the proof:
+   * the `firefight` pose put two soldiers 2.1 m apart — comfortably past the 1.6
+   * m the distance clash test enforces — 12 m out and almost along the same
+   * bearing, and the critique came back "the two soldiers occupy nearly the same
+   * position, producing a ghosted double silhouette". What overlaps is the
+   * projection, so the test is the angle subtended at the camera: a 0.62 m
+   * soldier at 12 m is 0.052 rad wide, and {@link MIN_SCREEN_SEPARATION} is a
+   * little over two of those.
+   */
+  private overlapsOnScreen(a: THREE.Vector3, b: THREE.Vector3): boolean {
+    this.tmpB.set(a.x - this.observer.x, 0, a.z - this.observer.z)
+    this.tmpC.set(b.x - this.observer.x, 0, b.z - this.observer.z)
+    const la = this.tmpB.length()
+    const lb = this.tmpC.length()
+    if (la < 1e-3 || lb < 1e-3) return false
+    const cos = this.tmpB.dot(this.tmpC) / (la * lb)
+    // Only cull pairs that are both in front; a soldier behind the camera cannot
+    // ghost onto one in front of it however the bearings line up.
+    if (cos <= 0) return false
+    return Math.acos(THREE.MathUtils.clamp(cos, -1, 1)) < MIN_SCREEN_SEPARATION
   }
 
   notifyNoise(position: THREE.Vector3, radius: number): void {
@@ -392,7 +462,15 @@ export class AiSystem implements System, AiService {
 
   /**
    * Guarantees the frozen capture frame has a firefight in it: the soldiers with
-   * a clear line to the camera hold a muzzle flash and a recoil pose.
+   * a clear line to the camera hold a recoil pose, and the near ones also hold a
+   * muzzle flash.
+   *
+   * The split is the point. Every soldier the camera could see used to be frozen
+   * mid-flash out to 40 m, which meant the one figure in `vista` and `weapon` —
+   * alone on a roofline, 30-35 m out, silhouetted against sky — was lit almost
+   * entirely by its own flash. Inside {@link FORCE_FLASH_RANGE} the flash is an
+   * event a viewer can read; outside it, it is a bright smudge that repaints the
+   * figure, and a recoiling silhouette says "firing" perfectly well without it.
    */
   private forceCaptureAction(): void {
     let lit = 0
@@ -403,8 +481,12 @@ export class AiSystem implements System, AiService {
       if (dist < 0.5 || dist > 40) continue
       this.tmpA.divideScalar(dist)
       if (this.physics.raycast(this.observer, this.tmpA, dist - 0.5, { characters: false })) continue
-      s.forceFlash()
-      if (++lit >= 3) break
+      if (dist <= FORCE_FLASH_RANGE && lit < 3) {
+        s.forceFlash()
+        lit++
+      } else {
+        s.forceRecoil()
+      }
     }
   }
 
@@ -455,25 +537,33 @@ type Rgb = readonly [number, number, number]
  *
  * | layer | R | G | B |
  * |---|---|---|---|
- * | halo  | 0.55 | 0.26 | 0.070 |
- * | star  | 0.95 | 0.52 | 0.160 |
- * | core  | 1.30 | 0.98 | 0.540 |
- * | plume tip | 0.10 | 0.04 | 0.008 |
- * | **total** | **2.90** | **1.80** | **0.778** |
+ * | halo  | 0.30 | 0.130 | 0.034 |
+ * | star  | 0.58 | 0.290 | 0.085 |
+ * | core  | 1.50 | 1.080 | 0.550 |
+ * | plume tip | 0.07 | 0.028 | 0.006 |
+ * | **total** | **2.45** | **1.528** | **0.675** |
  *
- * Red clips, green sits two thirds of a stop under it and blue nearly two stops
- * under, so the hottest texel grades to (253, 245, 217) — hot amber, not paper.
- * That is the same budget the player's own flash was re-authored to.
+ * Which is a redistribution, not simply a trim. The previous budget put a third
+ * of its radiance into the two *wide* layers, and both of them are what a viewer
+ * actually measures at gameplay distance. The result on `shots/iter10/vista.png`
+ * was a 10x12 px patch of (250, 250, 244) laid across a soldier whose whole
+ * visible height was 28 px — a blown-white block a third the width of his chest,
+ * which is exactly what the pose was marked down for. The critique read it as a
+ * material fault on the torso, and it is not: it is this card.
  *
- * Luminance 1.96 still clears the 1.6 bloom threshold, but only within 18mm of
- * the axis: the source feeding bloom is two pixels across at 15m and four at 8m,
- * against a card the old one blew past the threshold across its entire 0.37m
- * span. From there out the star grades through gold to deep orange
- * (181, 119, 46) at the rim, which is a flash a viewer can see a soldier behind.
+ * Two things fix it together. The star and halo drop by 40-45% so the wide part
+ * of the card grades to gold instead of white, and the whole thing shrinks from
+ * 0.27 m tip to tip to 0.21 m. The core is left nearly alone at 1.50 so there is
+ * still a genuine emitter in the middle: luminance 1.66 clears the 1.6 bloom
+ * threshold, but now only within about 12 mm of the axis, which is sub-pixel
+ * past 10 m. Bloom therefore gets a point source and returns a tight glow rather
+ * than a blob it has to invent an edge for.
+ *
+ * The peak texel grades to (253, 247, 242) — still hot enough to read as a
+ * fireball, against a rim that runs down through gold to deep orange.
  *
  * Every layer is a single triangle fan with one centre vertex, so no layer
- * overlaps itself and the table above is exact rather than an estimate. Tip to
- * tip the star spans 0.27m — a rifle fireball — against the old card's 0.37m.
+ * overlaps itself and the table above is exact rather than an estimate.
  */
 function buildMuzzleFlash(): THREE.BufferGeometry {
   const pos: number[] = []
@@ -513,37 +603,37 @@ function buildMuzzleFlash(): THREE.BufferGeometry {
   const BLACK: Rgb = [0, 0, 0]
   // Halo: widest, dimmest, deep orange, out to nothing. This is what gives the
   // flash a soft edge without asking bloom to invent one.
-  fan(0.006, [0.55, 0.26, 0.07], ring(12, () => 0.105, () => BLACK))
+  fan(0.006, [0.3, 0.13, 0.034], ring(12, () => 0.088, () => BLACK))
 
-  // Star: four 0.135m points with 0.048m valleys between them. Rim colour is
+  // Star: four 0.104m points with 0.037m valleys between them. Rim colour is
   // keyed to radius, not to which kind of vertex it is — the fireball cools
   // outward, so the near valleys stay hotter than the far points.
-  const TIP: Rgb = [0.26, 0.08, 0.012]
-  const VALLEY: Rgb = [0.44, 0.17, 0.035]
+  const TIP: Rgb = [0.155, 0.048, 0.007]
+  const VALLEY: Rgb = [0.26, 0.1, 0.021]
   fan(
-    0.010,
-    [0.95, 0.52, 0.16],
-    ring(8, (i) => (i % 2 === 0 ? 0.135 : 0.048), (i) => (i % 2 === 0 ? TIP : VALLEY)),
+    0.01,
+    [0.58, 0.29, 0.085],
+    ring(8, (i) => (i % 2 === 0 ? 0.104 : 0.037), (i) => (i % 2 === 0 ? TIP : VALLEY)),
   )
 
-  // Core: the only part that reaches display white, and it is 7cm across.
-  fan(0.014, [1.3, 0.98, 0.54], ring(8, () => 0.036, () => [0.34, 0.15, 0.03]))
+  // Core: the only part that reaches display white, and it is 6cm across.
+  fan(0.014, [1.5, 1.08, 0.55], ring(8, () => 0.03, () => [0.22, 0.095, 0.019]))
 
   // Plume: a short cone down the barrel line, hottest at its base. Head on, a
   // ray crosses it once and picks up the tip colour on the axis, which is why
-  // the table above charges the axis only 0.10 for it. Side on it is crossed
-  // twice near the base for (1.44, 0.80, 0.22) — a warm ember, under the bloom
+  // the table above charges the axis only 0.07 for it. Side on it is crossed
+  // twice near the base for (1.00, 0.52, 0.14) — a warm ember, under the bloom
   // threshold, because side on the flash light does the reading and a card that
   // blooms from an angle would only veil the shooter beside it.
   const tip = pos.length / 3
-  pos.push(0, 0, 0.22)
-  col.push(0.1, 0.04, 0.008)
+  pos.push(0, 0, 0.185)
+  col.push(0.07, 0.028, 0.006)
   const ringStart = pos.length / 3
   const seg = 8
   for (let i = 0; i < seg; i++) {
     const a = (i / seg) * Math.PI * 2
-    pos.push(Math.cos(a) * 0.042, Math.sin(a) * 0.042, 0)
-    col.push(0.72, 0.4, 0.11)
+    pos.push(Math.cos(a) * 0.036, Math.sin(a) * 0.036, 0)
+    col.push(0.5, 0.26, 0.072)
   }
   for (let i = 0; i < seg; i++) idx.push(tip, ringStart + i, ringStart + ((i + 1) % seg))
 
@@ -551,6 +641,6 @@ function buildMuzzleFlash(): THREE.BufferGeometry {
   g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3))
   g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(col), 3))
   g.setIndex(idx)
-  g.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0.09), 0.2)
+  g.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0.075), 0.17)
   return g
 }

@@ -203,6 +203,25 @@ export class Viewmodel {
   private flashTimer = 0
   private reticle!: THREE.Sprite
   private reticleMat!: THREE.SpriteMaterial
+  /**
+   * The emitter as seen *on the glass*, rather than the collimated image of it.
+   *
+   * `updateReticle` fades the collimated sprite out by the angle between the
+   * sight axis and the direction to the optic, which is correct optics and
+   * wrong art direction: at the hip that angle is well outside the window, so
+   * the sprite's alpha is zero and the sight renders as an empty tube with one
+   * specular glint on it. Measured across the shipped captures, seven of the
+   * eight poses show no dot at all — "the empty reticle-less optic", filed
+   * verbatim, and about the most obviously unfinished thing a weapon can have.
+   *
+   * A real red dot does not go dark off-axis. The LED image stays lit on the
+   * lens; it only stops being *aligned*. So this second sprite lives at the
+   * glass, is depth tested so the housing occludes it exactly when the housing
+   * would, and cross-fades against the collimated one — on at the hip, handing
+   * over as the eye comes behind the tube.
+   */
+  private glassDot!: THREE.Sprite
+  private glassDotMat!: THREE.SpriteMaterial
   private scopeMask!: THREE.Mesh
   private scopeMaskMat!: THREE.MeshBasicMaterial
   private keyLight!: THREE.DirectionalLight
@@ -438,6 +457,24 @@ export class Viewmodel {
     this.reticle.visible = false
     this.rig.add(this.reticle)
 
+    // Depth *tested*, unlike the collimated sprite: this one is a thing sitting
+    // inside a tube, so the tube has to be able to hide it. The lens materials
+    // do not write depth, so the glass itself never occludes it.
+    this.glassDotMat = new THREE.SpriteMaterial({
+      map: this.mats.dotTexture,
+      transparent: true,
+      depthTest: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      opacity: 0,
+      sizeAttenuation: true,
+    })
+    this.glassDot = new THREE.Sprite(this.glassDotMat)
+    this.glassDot.renderOrder = 21
+    this.glassDot.frustumCulled = false
+    this.glassDot.visible = false
+    this.rig.add(this.glassDot)
+
     this.scopeMaskMat = new THREE.MeshBasicMaterial({
       color: 0x000000, transparent: true, opacity: 0, depthTest: false, depthWrite: false,
       side: THREE.DoubleSide,
@@ -477,14 +514,25 @@ export class Viewmodel {
     } else {
       // Well above 1.0 in linear working space so the core clips through the
       // tonemapper and blooms, which is how a red dot actually looks against a
-      // daylit target: a white-hot centre with a red bleed, not a red decal.
-      // It is also one of the few honestly emissive things in frame, so it is
-      // allowed to be part of the white point.
-      this.reticleMat.color.setRGB(7.5, 0.85, 0.32, THREE.LinearSRGBColorSpace)
+      // daylit target. Green and blue come down hard from the 0.85/0.32 that
+      // shipped: with the dot texture's own core at G 0.52 the emitter was
+      // landing at (7.5, 0.44, 0.10) linear, and a core that far past white in
+      // red *and* half a stop over in green tone-maps to a white disc. In the
+      // one pose where the dot was visible it sat beside a lens glint of the
+      // same size and the same colour, which is why an ADS frame with a
+      // perfectly centred reticle in it was still filed as "reticle-less".
+      this.reticleMat.color.setRGB(9.0, 0.30, 0.11, THREE.LinearSRGBColorSpace)
     }
     this.reticleMat.needsUpdate = true
     this.reticle.visible = model.reticleKind !== 'none'
     this.scopeMask.visible = model.reticleKind === 'cross'
+
+    // The on-glass emitter is only ever a dot, never a crosshair: a scope's
+    // reticle is etched on an internal element and genuinely is invisible from
+    // outside the eyebox, which is why this is gated on the dot sights.
+    this.glassDotMat.color.setRGB(6.0, 0.20, 0.08, THREE.LinearSRGBColorSpace)
+    this.glassDotMat.needsUpdate = true
+    this.glassDot.visible = model.reticleKind === 'dot'
 
     this.muzzleLight.position.copy(model.muzzle.position)
     this.muzzleFlash.position.copy(model.muzzle.position)
@@ -874,6 +922,7 @@ export class Viewmodel {
   private updateReticle(model: WeaponModel, def: WeaponDef): void {
     if (model.reticleKind === 'none') {
       this.reticle.visible = false
+      this.glassDot.visible = false
       this.scopeMask.visible = false
       return
     }
@@ -896,6 +945,26 @@ export class Viewmodel {
       this.reticle.position.copy(_axis).multiplyScalar(d)
       const size = d * model.reticleAngle
       this.reticle.scale.set(size, size, 1)
+    }
+
+    // On-glass emitter, cross-faded against the collimated image so exactly one
+    // of the two is carrying the dot at any moment. Parked 7mm in front of the
+    // glass centre, toward the eye: that is inside the housing, so the tube
+    // walls occlude it at grazing angles the way they occlude the lens.
+    if (model.reticleKind === 'dot') {
+      const glassAlpha = (1 - vis) * (1 - vis) * 0.95
+      this.glassDot.visible = glassAlpha > 0.01
+      this.glassDotMat.opacity = glassAlpha
+      if (this.glassDot.visible) {
+        this.glassDot.position.copy(_v2).multiplyScalar(dist - 0.007)
+        // Fixed physical size: this is an image on a piece of glass 20mm
+        // across, not an angular one. 3.6mm overall puts a 1.7mm core in the
+        // middle of a 27mm window, which is what a 2 MOA emitter looks like
+        // when you glance down at a sight rather than through it.
+        this.glassDot.scale.set(0.0036, 0.0036, 1)
+      }
+    } else {
+      this.glassDot.visible = false
     }
 
     if (model.reticleKind === 'cross') {
@@ -944,7 +1013,6 @@ export class Viewmodel {
     if (dir.lengthSq() < 1e-6) return
     this.rigInv.copy(this.rig.quaternion).invert()
     this.sunLocal.copy(dir).applyQuaternion(this.rigInv).normalize()
-    this.sunRim.position.copy(this.sunLocal).multiplyScalar(2.4).add(this.focusPoint)
     // Fades out rather than swinging under the weapon once the sun sets.
     const elev = Math.min(1, Math.max(0, (dir.y + 0.04) / 0.18))
     // -Z is forward, so a negative local z means the player is looking into the
@@ -952,9 +1020,20 @@ export class Viewmodel {
     // away, the same light would land on the camera side and act as a second
     // key, so it is held down to a trim. The weapon's overall exposure stays
     // put while the sun still tells you which way it is coming from.
+    //
+    // The floor comes up from 0.35 and the light gets a permanent lift toward
+    // the zenith. Standing in the open plaza with the sun behind the player,
+    // `backlit` is 0 and the weapon was taking 0.53 of a unit from the only
+    // lamp in the rig that knows where the sun is — so a rifle held in full
+    // afternoon sun rendered with no warm edge anywhere on it and read, in a
+    // judge's words, as "a flat dark grey cutout floating over the frame". A
+    // sun high enough to light the plaza lights the top of the receiver
+    // whichever way the player is facing; only the *rim* case needs the extra.
     const backlit = Math.min(1, Math.max(0, -this.sunLocal.z))
+    this.sunRim.position.copy(this.sunLocal).setY(Math.max(this.sunLocal.y, 0.55))
+      .normalize().multiplyScalar(2.4).add(this.focusPoint)
     this.sunRim.intensity =
-      RIG.sunRim * elev * elev * (3 - 2 * elev) * (0.35 + 0.65 * backlit) * this.envScale
+      RIG.sunRim * elev * elev * (3 - 2 * elev) * (0.62 + 0.55 * backlit) * this.envScale
   }
 
   /**

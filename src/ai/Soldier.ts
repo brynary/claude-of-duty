@@ -136,6 +136,7 @@ export class Soldier implements Damageable {
   private vKnee = new THREE.Vector3()
   private ikTarget = new THREE.Vector3()
   private ikPole = new THREE.Vector3()
+  private vStance = new THREE.Vector3()
   private qA = new THREE.Quaternion()
   private qB = new THREE.Quaternion()
   private eA = new THREE.Euler(0, 0, 0, 'YXZ')
@@ -384,22 +385,50 @@ export class Soldier implements Damageable {
     return i === 0 ? base : -base
   }
 
+  /**
+   * Where a *stationary* soldier's foot belongs: the bladed fighting stance.
+   *
+   * Walking keeps the narrow track {@link lateral} gives it — a 0.30 m gait is a
+   * waddle — so the blade lives here, on the two paths that plant a standing
+   * foot, rather than in the shared helper.
+   *
+   * A standing soldier used to get feet 0.22 m apart with a 0.10 m stagger, and
+   * from the front that is one leg-shaped mass: the thighs are 0.098 m in radius
+   * on hips 0.19 m apart, so their inner edges overlapped and the figure had a
+   * single unbroken 0.38 m column from belt to boot. Measured off the silhouette
+   * that column ran half a metre of height without varying by more than 8 mm,
+   * which is what "cylinder limbs" describes. Opening the track to 0.30 m and
+   * blading it puts daylight between the legs and gives the two of them
+   * different lengths on screen, which is most of what separates a person
+   * standing from a figure placed.
+   */
+  private stancePlant(i: number, out: THREE.Vector3): void {
+    const lat = (i === 0 ? 1 : -1) * (STANCE_WIDTH + this.stanceBlend * 0.05)
+    const lead = i === 0 ? STANCE_LEAD : STANCE_TRAIL
+    const c = Math.cos(this.yaw)
+    const s = Math.sin(this.yaw)
+    out.set(this.position.x + lat * c + lead * s, 0, this.position.z - lat * s + lead * c)
+  }
+
+  /**
+   * Foot heading for the bladed stance. The rear foot turns well out, the lead
+   * foot barely at all — the asymmetry between them is worth more than either.
+   */
+  private stanceYaw(i: number): number {
+    return this.yaw + (i === 0 ? STANCE_LEAD_TOE : STANCE_TRAIL_TOE)
+  }
+
   private resetFeet(): void {
     for (let i = 0; i < 2; i++) {
       const f = this.feet[i]
-      const lat = this.lateral(i)
-      const c = Math.cos(this.yaw)
-      const s = Math.sin(this.yaw)
-      const stagger = i === 0 ? 0.05 : -0.05
-      const x = this.position.x + lat * c + stagger * s
-      const z = this.position.z - lat * s + stagger * c
-      const y = this.groundAt(x, z, this.groundY)
-      f.plant.set(x, y, z)
+      this.stancePlant(i, this.vStance)
+      const y = this.groundAt(this.vStance.x, this.vStance.z, this.groundY)
+      f.plant.set(this.vStance.x, y, this.vStance.z)
       f.liftoff.copy(f.plant)
       f.next.copy(f.plant)
       f.pos.copy(f.plant)
-      f.yaw = this.yaw
-      f.nextYaw = this.yaw
+      f.yaw = this.stanceYaw(i)
+      f.nextYaw = f.yaw
       f.grounded = true
     }
     this.phase = 0
@@ -427,19 +456,20 @@ export class Soldier implements Damageable {
       this.idleTimer += dt
       for (let i = 0; i < 2; i++) {
         const f = this.feet[i]
-        const c = Math.cos(this.yaw)
-        const s = Math.sin(this.yaw)
-        const lat = this.lateral(i)
-        const ix = this.position.x + lat * c
-        const iz = this.position.z - lat * s
+        this.stancePlant(i, this.vStance)
+        const ix = this.vStance.x
+        const iz = this.vStance.z
         const off = Math.hypot(f.plant.x - ix, f.plant.z - iz)
-        if (off > 0.34 && this.idleTimer > 0.22) {
+        // The threshold is under the blade's own fore-aft span, so a soldier who
+        // walks and then stops squares up once and shuffles back into the
+        // fighting stance instead of standing in whatever the last stride left.
+        if (off > 0.2 && this.idleTimer > 0.28) {
           f.plant.set(ix, this.groundAt(ix, iz, this.groundY), iz)
-          f.yaw = this.yaw
+          f.yaw = this.stanceYaw(i)
           this.idleTimer = 0
         }
         f.pos.lerp(f.plant, 1 - Math.exp(-14 * dt))
-        f.yaw += angleDelta(f.yaw, this.yaw) * Math.min(1, dt * 6)
+        f.yaw += angleDelta(f.yaw, this.stanceYaw(i)) * Math.min(1, dt * 6)
         f.grounded = true
       }
       this.phase = 0
@@ -616,7 +646,7 @@ export class Soldier implements Damageable {
     b.pelvis.quaternion.setFromEuler(this.eA)
     b.pelvis.position.set(
       BIND.pelvis.p[0],
-      BIND.pelvis.p[1] - this.stanceBlend * 0.3 - Math.abs(Math.sin(gait)) * 0.022 * swing + breathe,
+      BIND.pelvis.p[1] - KNEE_BEND_DROP - this.stanceBlend * 0.3 - Math.abs(Math.sin(gait)) * 0.022 * swing + breathe,
       BIND.pelvis.p[2],
     )
 
@@ -855,6 +885,17 @@ export class Soldier implements Damageable {
     this.recoil = Math.max(this.recoil, 0.7)
   }
 
+  /**
+   * Holds the recoil pose without lighting the muzzle, for a soldier too far
+   * from the capture camera for a flash card to resolve as anything but a blob.
+   * The shoulders, the weapon kick and the head snap still say "firing".
+   */
+  forceRecoil(): void {
+    this.recoil = Math.max(this.recoil, 0.62)
+    this.muzzleFlashT = 0
+    this.flash.visible = false
+  }
+
   startReload(): void {
     if (this.reloadT < 0) this.reloadT = 0
   }
@@ -879,8 +920,34 @@ const RELOAD_SECONDS = 2.5
 const RIFLE_PITCH_OFFSET = -0.1772
 const RIFLE_YAW_OFFSET = -0.0691
 
+/** Half-track of the standing fighting stance, and the fore-aft blade. */
+const STANCE_WIDTH = 0.152
+const STANCE_LEAD = 0.13
+const STANCE_TRAIL = -0.09
+const STANCE_LEAD_TOE = 0.12
+const STANCE_TRAIL_TOE = -0.4
+
+/**
+ * How far the standing pelvis sits below its bind height, so the knees hold a
+ * bend.
+ *
+ * The bind rig is 5 mm from being unable to bend them at all. Hip joint 0.90,
+ * ankle 0.075, so the leg has to span 0.825 m; thigh and shin measure 0.4364 and
+ * 0.392, and `solveTwoBone` clamps reach to 0.996 of their sum, which is 0.8245.
+ * A standing soldier was therefore always against the clamp with the leg locked
+ * dead straight — two rigid tubes from hip to boot, and no amount of shading
+ * fixes a straight line. It also made the knee angle violently sensitive: a
+ * three-millimetre change in ground height swings the knee by five centimetres.
+ *
+ * 28 mm is enough to sit clear of the singularity. Combined with the width and
+ * the blade, both legs solve at 0.80-0.81 m against a 0.8245 m reach and carry
+ * roughly 90 mm of forward knee — the soft-kneed stance of someone braced behind
+ * a rifle rather than someone standing to attention.
+ */
+const KNEE_BEND_DROP = 0.028
+
 function eyeHeight(crouch: number, prone: number): number {
-  return THREE.MathUtils.lerp(THREE.MathUtils.lerp(1.62, 1.22, crouch), 0.36, prone)
+  return THREE.MathUtils.lerp(THREE.MathUtils.lerp(1.592, 1.2, crouch), 0.36, prone)
 }
 
 /** Cached bind lengths so IK does not recompute square roots every frame. */

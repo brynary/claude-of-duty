@@ -17,7 +17,9 @@ import {
   buildCollapsedBlock, buildCraterDressing, buildGroundDecals, buildPuddles,
   buildRubblePiles, buildSandDrift, buildStructures, buildWallGrime, buildWallMarks,
 } from './Debris'
-import { applyWind, buildTrees, defineFoliageKinds, scatterFoliage, type WindHandle } from './Foliage'
+import {
+  applyWind, buildTrees, defineFoliageKinds, scatterFoliage, solidifyFoliage, type WindHandle,
+} from './Foliage'
 
 /**
  * A sun-bleached Middle Eastern district, roughly 90 x 90 m of playable space.
@@ -158,6 +160,10 @@ export class LevelSystem implements System, LevelService {
     // --- Foliage -----------------------------------------------------------
     const foliageKit = new Builder()
     const rngFol = new Rand(seed ^ 0x6b2d)
+    // Every plant in the district carries its outline in geometry, so the
+    // billboard cutout baked into the foliage albedo has nothing left to cut
+    // and only ever ate holes in real leaves. See `solidifyFoliage`.
+    solidifyFoliage(mats)
     this.wind = applyWind(mats, ['foliage', 'fabricAwning', 'tarp'])
     scatterFoliage(farm, rngFol, density)
     buildTrees(foliageKit, farm, rngFol)

@@ -149,9 +149,16 @@ export const WEAPONS: readonly WeaponDef[] = [
       kickBack: 0.014, kickUp: 0.055, kickRoll: 0.030, visualSnap: 26,
     },
     // Eye relief is deliberately longer than the optic's real 60mm: it sets how
-    // much of the frame the sight housing eats at full ADS. 0.255m puts the
-    // 41mm tube at ~19% of frame height, which is the shipped-shooter read.
-    adsTime: 0.18, eyeRelief: 0.255, adsFovScale: 0.72, adsVmFov: 46,
+    // much of the frame the sight housing eats at full ADS. 0.255m put the 41mm
+    // tube at ~19% of frame height, which is the shipped-shooter read — but it
+    // also put the *rear of the buttstock* 26mm behind the camera and the cheek
+    // comb 0.5mm in front of it. Anything a centimetre from a 6mm near plane
+    // does not render, it smears, and the bottom third of every ADS capture was
+    // the comb doing exactly that. 0.295m moves the comb's rear end to 40mm,
+    // takes the tube to a still-legible 17% of frame height, and costs nothing
+    // else: the ADS transform is solved from the sight node either way, so the
+    // dot stays exactly on the bore.
+    adsTime: 0.18, eyeRelief: 0.295, adsFovScale: 0.72, adsVmFov: 46,
     reloadTime: 2.1, reloadEmptyTime: 2.6, magOutAt: 0.30, magInAt: 0.56, chargeAt: 0.80,
     drawTime: 0.5, holsterTime: 0.32, sprintOutTime: 0.16, inspectTime: 2.4,
     // Measured against a 60 degree viewmodel camera at 16:9: 28.8% of screen
