@@ -120,7 +120,7 @@ export class LightingSystem implements System, LightingService {
 
     this.environment = this.sky.generateEnvironment(ctx.renderer)
     scene.environment = this.environment
-    ctx.viewmodelScene.environment = this.environment
+    // Deliberately not applied to the viewmodel scene — see update().
     this.environmentDirty = false
 
     // Discoverable by name for systems that only see the LightingService shape.
@@ -206,7 +206,9 @@ export class LightingSystem implements System, LightingService {
       this.environmentDirty = false
       this.environment = this.sky.generateEnvironment(ctx.renderer)
       ctx.scene.environment = this.environment
-      ctx.viewmodelScene.environment = this.environment
+      // The viewmodel scene owns its own environment. Lighting the weapon with
+      // the sky probe turns anything with high metalness into a mirror of the
+      // sky, which reads as bright blue rather than gunmetal.
     }
 
     // The probe needs the level's collision, which lands during the level
