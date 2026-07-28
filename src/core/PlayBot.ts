@@ -105,6 +105,8 @@ export class PlayBotSystem implements System {
   private enabled = false
 
   private waypoint = 0
+  /** +1 forward along the route, -1 back. The route ping-pongs. */
+  private routeDir = 1
   private target: Damageable | null = null
   private targetSince = -1
   private aimYaw = 0
@@ -285,9 +287,19 @@ export class PlayBotSystem implements System {
     const dist = Math.hypot(dx, dz)
 
     if (dist < 1.6) {
-      this.waypoint++
-      if (this.waypoint >= this.scenario.route.length) {
-        this.waypoint = this.scenario.goal === 'push' ? this.scenario.route.length - 1 : 0
+      // Reaching the end of the route used to pin the bot to its last waypoint,
+      // where it then satisfied this test every frame and stood still for the
+      // rest of the run. That is why time-spent-sprinting measured near zero:
+      // the bot was not moving, so it was never rotating between fights.
+      // The route now reverses at each end and the bot keeps working the map.
+      this.waypoint += this.routeDir
+      const last = this.scenario.route.length - 1
+      if (this.waypoint > last) {
+        this.waypoint = Math.max(0, last - 1)
+        this.routeDir = -1
+      } else if (this.waypoint < 0) {
+        this.waypoint = Math.min(last, 1)
+        this.routeDir = 1
       }
       this.note(`waypoint ${this.waypoint}`)
       return

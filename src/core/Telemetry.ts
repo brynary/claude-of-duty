@@ -110,6 +110,8 @@ export interface TelemetryReport {
 interface EnemyTrack {
   id: number
   contactAt: number | null
+  /** When contact was last lost, used to end an engagement honestly. */
+  lostContactAt: number | null
   firstShotAt: number | null
   firstPlayerHitAt: number | null
   engagement: Engagement | null
@@ -216,7 +218,9 @@ export class TelemetrySystem implements System {
 
     e.on('ai:lostContact', (p) => {
       const track = this.tracks.get(p.id)
-      if (track) track.contactAt = null
+      if (!track) return
+      track.contactAt = null
+      track.lostContactAt = this.t
     })
 
     e.on('ai:engaged', (p) => {
@@ -294,12 +298,17 @@ export class TelemetrySystem implements System {
     }
 
     // Close engagements whose enemy has been out of contact for a while.
+    //
+    // The engagement ends when contact was actually lost, not when this timeout
+    // notices. Stamping the timeout instant folded the whole waiting period
+    // into the engagement, so genuine quiet between waves never appeared as
+    // downtime and the pacing metric under-reported by up to the timeout.
     for (const track of this.tracks.values()) {
       const eng = track.engagement
       if (!eng) continue
-      if (track.contactAt === null && this.t - eng.startedAt > 8) {
+      if (track.contactAt === null && this.t - (track.lostContactAt ?? eng.startedAt) > 6) {
         eng.outcome = 'disengaged'
-        eng.endedAt = this.t
+        eng.endedAt = track.lostContactAt ?? this.t
         this.closeEngagement(track)
       }
     }
@@ -314,7 +323,7 @@ export class TelemetrySystem implements System {
   private track(id: number): EnemyTrack {
     let t = this.tracks.get(id)
     if (!t) {
-      t = { id, contactAt: null, firstShotAt: null, firstPlayerHitAt: null, engagement: null }
+      t = { id, contactAt: null, lostContactAt: null, firstShotAt: null, firstPlayerHitAt: null, engagement: null }
       this.tracks.set(id, t)
     }
     return t
