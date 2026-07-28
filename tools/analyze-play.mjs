@@ -19,36 +19,39 @@ import { readdirSync, readFileSync, existsSync } from 'node:fs'
 import { join, resolve, basename } from 'node:path'
 
 /**
- * Provisional targets, pending `.ai/FEEL_TARGET.md`. Ranges are deliberately
- * wide where the genre itself varies between titles.
+ * Targets sourced from `.ai/FEEL_TARGET.md`. Each cites the section it came
+ * from and its confidence marker. Where our game differs structurally from the
+ * source — a wave-based encounter rather than 6v6 team deathmatch — the
+ * adjustment and its reasoning are stated, so nobody later mistakes a judgement
+ * call for a measurement.
  */
 const TARGETS = {
-  ttkMean: { range: [0.25, 0.65], unit: 's', label: 'Time to kill (mean)',
-    why: 'CoD TTK is famously short; assault rifles sit in the 250-500ms band at effective range.' },
-  ttkMax: { range: [0, 1.2], unit: 's', label: 'Time to kill (worst)',
-    why: 'A long tail means an enemy soaked a magazine, which reads as unresponsive weapons.' },
-  accuracy: { range: [0.18, 0.42], unit: '', label: 'Player accuracy',
-    why: 'Typical competent play. Far below suggests spread or recoil is fighting the player; far above suggests no challenge.' },
-  enemyReaction: { range: [0.35, 0.90], unit: 's', label: 'Enemy reaction time',
-    why: 'Fast enough to feel alert, slow enough that the player who sees first wins. Below ~0.3s reads as cheating.' },
-  engagementDistance: { range: [8, 28], unit: 'm', label: 'Engagement distance (mean)',
-    why: 'CoD multiplayer engagements cluster at short-to-mid range; a map that only fights at one distance is monotonous.' },
-  downtimeMean: { range: [4, 14], unit: 's', label: 'Downtime between engagements',
-    why: 'The rhythm of fight-breathe-fight. Near zero is a continuous firefight with no shape.' },
-  downtimeMax: { range: [0, 35], unit: 's', label: 'Longest quiet stretch',
-    why: 'A long gap is a dead patch in the map where the player is walking with nothing to do.' },
-  deathsPerMinute: { range: [0.3, 1.6], unit: '/min', label: 'Deaths per minute',
-    why: 'Frequent enough for stakes, rare enough that death is informative rather than noise.' },
-  killsPerMinute: { range: [3, 12], unit: '/min', label: 'Kills per minute',
-    why: 'The pace of reward. Too low reads as a slog; too high as no resistance.' },
+  ttkMean: { range: [0.20, 0.35], unit: 's', label: 'Time to kill (mean)',
+    why: 'FEEL_TARGET §1, §2.1 [measured]: MW2019 just under 200ms, BO6 ARs 260-340ms. MWIII at 300ms+ was widely disliked and is the only recent title at 150HP.' },
+  ttkMax: { range: [0, 0.60], unit: 's', label: 'Time to kill (worst)',
+    why: 'Twice the upper target. Beyond this an enemy has soaked most of a magazine, which reads as unresponsive weapons.' },
+  accuracy: { range: [0.18, 0.45], unit: '', label: 'Player accuracy',
+    why: 'FEEL_TARGET §5 [stated]: ADS spread in CoD is exactly zero on every weapon inspected. Low accuracy here means spread or recoil is fighting the player.' },
+  enemyReaction: { range: [0.50, 1.00], unit: 's', label: 'Enemy reaction time',
+    why: 'FEEL_TARGET §7.5 [stated]: Black Ops sv_bot dvars give 500-1000ms sighting to first shot. Deliberately slower than the 200-300ms TTK so the player who sees first wins.' },
+  engagementDistance: { range: [10, 30], unit: 'm', label: 'Engagement distance (mean)',
+    why: 'FEEL_TARGET §6.3 [stated]: official CoD5 level-design standards specify 13m for SMG sightlines and 26m for rifle.' },
+  downtimeMean: { range: [10, 40], unit: 's', label: 'Downtime between engagements',
+    why: 'FEEL_TARGET §6.1 [estimated] derives 25-45s from TDM score limits. Widened at the low end because a wave-based encounter clusters more tightly than 6v6 — but near zero is still one continuous firefight with no shape.' },
+  downtimeMax: { range: [0, 60], unit: 's', label: 'Longest quiet stretch',
+    why: 'A long gap is a dead patch where the player walks with nothing to do. FEEL_TARGET §6.2 puts spawn to first contact at 5-10s.' },
+  deathsPerMinute: { range: [0.3, 1.5], unit: '/min', label: 'Deaths per minute',
+    why: 'FEEL_TARGET §6.1 [estimated]: TDM maths gives 0.83 deaths/min per player, one death roughly every 72s.' },
+  killsPerMinute: { range: [3, 15], unit: '/min', label: 'Kills per minute',
+    why: 'Campaign-shaped rather than the TDM figure: a wave encounter rewards far more frequently than 6v6. Too low reads as a slog, too high as no resistance.' },
   unseenDeathFraction: { range: [0, 0.25], unit: '', label: 'Deaths from unseen attackers',
     why: 'The clearest measure of feeling cheated. A death the player could not have anticipated should be rare.' },
   fractionAds: { range: [0.12, 0.45], unit: '', label: 'Time aiming down sights',
-    why: 'ADS should be the considered option, not the only viable one.' },
+    why: 'ADS should be the considered option rather than the only viable one, given hipfire is meant to stay usable close in.' },
   fractionSprinting: { range: [0.10, 0.40], unit: '', label: 'Time sprinting',
     why: 'Rotation between fights. Near zero means fights never break; very high means the map is too empty.' },
   dryFireRate: { range: [0, 0.10], unit: '', label: 'Dry fires per reload',
-    why: 'Running the magazine dry mid-fight repeatedly means the reload cadence fights the fight rhythm.' },
+    why: 'Running dry mid-fight repeatedly means the reload cadence fights the fight rhythm.' },
 }
 
 function pick(run) {
