@@ -530,7 +530,7 @@ export function discGeom(radius: number, segments = 32): THREE.BufferGeometry {
 export type WeaponMatKey =
   | 'gunmetal' | 'phosphate' | 'steel' | 'polymer' | 'polymerTan' | 'rubber'
   | 'glass' | 'glassFront' | 'glove' | 'sleeve' | 'brass' | 'dark' | 'anodised'
-  | 'rail' | 'magPolymer' | 'bore'
+  | 'rail' | 'magPolymer' | 'bore' | 'stock'
 
 interface WearParams {
   color: number
@@ -1030,17 +1030,52 @@ export class WeaponMaterials {
           envIntensity: 0.38, normalScale: 1.0,
         }, { roughnessMap: this.polymerRough, normalMap: this.gloveNormal })
         break
-      // The sleeve is the largest near-field surface on screen and measured as
-      // the brightest object in the lower third of every capture -- a camo
-      // pipe lit hotter than the sunlit plaza behind it. Dropping the albedo
-      // multiplier puts the fabric under the weapon it is holding, which is
-      // where a sleeve in the shadow of its own arm belongs.
+      // `color` here is a multiplier over the camo map, and it used to be a
+      // pale 0x8a8a8a. That is a trap: the base colour is what the surface
+      // becomes if the map ever fails to bind, and a 54% grey with a fabric
+      // normal on it reads as bare unpainted cloth brighter than the sunlit
+      // plaza behind it. A faded olive-drab multiplies the camo the same way,
+      // deepens its greens instead of neutralising them, and degrades to a
+      // plausible sleeve rather than to a light-grey slab.
+      //
+      // The value is set against the weapon rather than against the frame: at
+      // 0x8a8a8a the shipped sleeve measured luma 72 while the receiver was 54
+      // and the magazine 63, so the cloth was the brightest thing in the lower
+      // third. Fabric in the shadow of its own arm belongs under every part of
+      // the rifle it is holding. `wearColor` comes down for the same reason --
+      // the cone's rim bands sit at full wear, so a 19%-reflectance wear tint
+      // put a pale ring on both ends of every sleeve.
       case 'sleeve':
         mat = this.wearMaterial(key, {
-          color: 0x8a8a8a, roughness: 0.96, metalness: 0.0,
-          wearColor: 0x7a7565, wearAlbedo: 0.22, wearRough: 0.90, wearMetal: 0,
-          envIntensity: 0.30, normalScale: 0.80,
+          color: 0x6f6c5a, roughness: 0.96, metalness: 0.0,
+          wearColor: 0x5b5748, wearAlbedo: 0.22, wearRough: 0.90, wearMetal: 0,
+          envIntensity: 0.26, normalScale: 0.80,
         }, { map: this.camoAlbedo, roughnessMap: this.polymerRough, normalMap: this.fabricNormal })
+        break
+      // Moulded stock furniture, and the darkest large surface on the weapon.
+      //
+      // It is its own key rather than `polymer` because the two parts share
+      // nothing but a moulding process. A pistol grip is small, near vertical
+      // and polished by a hand; the stock is a 46x62x115mm block whose flanks
+      // and comb sit square to the key light and whose comb passes 26mm from
+      // the eye at full ADS. On `polymer` (4.7% reflectance, probe weight 0.36)
+      // that block measured luma 130-195 at the hip and 165-183 across a fifth
+      // of the ADS frame, against a frame mean of 61 -- the "flat pale-grey
+      // mass" filed this round. Matte glass-filled nylon in a shoulder pocket
+      // is genuinely near the bottom of the weapon's value ladder, beside the
+      // rubber buttpad it bolts to, so the correction is 1.5% reflectance and
+      // half the probe weight.
+      case 'stock':
+        mat = this.wearMaterial(key, {
+          color: 0x1e2124, roughness: 0.95, metalness: 0.02,
+          wearColor: 0x4a4e52, wearAlbedo: 0.22, wearRough: 0.74, wearMetal: 0.04,
+          // The relief on this part is geometry now, not a bump map. A comb
+          // 26mm from the eye magnifies its normal map by a factor no strength
+          // survives -- that magnification is the "coarse granular texture"
+          // filed against the mass -- so the map is held down and the texel
+          // density doubled at the call sites instead.
+          envIntensity: 0.18, normalScale: 0.80,
+        }, { roughnessMap: this.polymerRough, normalMap: this.polymerNormal })
         break
       case 'glass':
       case 'glassFront': {
@@ -1858,6 +1893,13 @@ interface HandOpts {
   thumbOver?: boolean
   /** Lays the index finger straight along the receiver, off the trigger. */
   indexFinger?: boolean
+  /**
+   * Where the sleeve stops, as a fraction of the wrist-to-elbow span. It only
+   * has to run far enough to cross the bottom edge of the frame; past that it
+   * is geometry nobody sees, and it is measured per hand because the two arms
+   * leave frame at completely different points.
+   */
+  sleeveEnd: number
 }
 
 function addHand(b: PartBuilder, o: HandOpts): void {
@@ -1942,16 +1984,26 @@ function addHand(b: PartBuilder, o: HandOpts): void {
   ], [
     w[0] + (e[0] - w[0]) * 0.26, w[1] + (e[1] - w[1]) * 0.26, w[2] + (e[2] - w[2]) * 0.26,
   ], 12, 0.3, 40)
-  // Overshoot the elbow so the sleeve runs out of frame rather than stopping in
-  // mid air at a visible cap. Keep the overshoot small: elbow directions point
-  // down and out, and anything that swings rearward lands on the near plane as
-  // a smeared blob. The flare is held to 45mm — at 56mm the forearm was the
-  // largest and nearest object in frame, and a camo tube that size dominates
-  // the lower third of every capture.
-  tubeBetween(b, 'sleeve', 0.031, 0.045, [
+  // The sleeve only exists to carry the arm off the bottom edge of the frame.
+  // Running it all the way to the elbow, as both arms used to, put 26cm of cone
+  // below the frame on the right hand: geometry no pose can see, but whose
+  // axis-aligned bounding box projects across a third of the screen and reads
+  // to any mesh-level measurement as the largest object in the capture.
+  //
+  // Where each arm crosses the bottom edge is a property of that arm. Measured
+  // over the hip, low-ready, ADS and sprint poses, the right sleeve is fully
+  // below the frame by 22% of the way to the elbow and the left not until 76%,
+  // because the right forearm drops almost straight down out of shot while the
+  // left runs across the frame under the handguard. One shared overshoot cannot
+  // serve both, so each hand carries its own, set past its own measured exit.
+  const tEnd = o.sleeveEnd
+  // Same taper on both arms: the flare is a rate, not an endpoint, so a short
+  // sleeve does not become a stub cone with a fat cap on it.
+  const rEnd = 0.031 + (0.045 - 0.031) * Math.min(1, (tEnd - 0.24) / 0.76)
+  tubeBetween(b, 'sleeve', 0.031, rEnd, [
     w[0] + (e[0] - w[0]) * 0.24, w[1] + (e[1] - w[1]) * 0.24, w[2] + (e[2] - w[2]) * 0.24,
   ], [
-    w[0] + (e[0] - w[0]) * 1.00, w[1] + (e[1] - w[1]) * 1.00, w[2] + (e[2] - w[2]) * 1.00,
+    w[0] + (e[0] - w[0]) * tEnd, w[1] + (e[1] - w[1]) * tEnd, w[2] + (e[2] - w[2]) * tEnd,
   ], 14, 0.05, 12)
 }
 
@@ -2102,29 +2154,101 @@ function addFoldedSights(b: PartBuilder, railTop: number, zFront: number, zRear:
   b.box('anodised', [0.017, 0.005, 0.018], [0, railTop + 0.011, zRear + 0.002], { rot: [-0.14, 0, 0], c: 0.0011, uv: 40, wear: 0.6 })
 }
 
-/** Collapsible carbine stock riding a buffer tube. */
+/**
+ * Collapsible carbine stock riding a buffer tube.
+ *
+ * The stock is the closest and largest thing the camera ever sees. At the hip
+ * it lands 30cm from the eye and covers about 5% of frame; at full ADS the
+ * solved pose puts the eye on the sight axis 25.5cm behind the optic, which is
+ * 2.6cm behind the comb and *inside* the buttpad, so the comb alone fills the
+ * lower fifth of the frame. Nothing about that framing is avoidable -- a real
+ * cheek weld puts the comb right under the eye -- which makes the stock the
+ * one subassembly whose value and surface detail have to be right or the whole
+ * capture reads as a pale slab with a gun behind it.
+ *
+ * Three things were wrong and all three are geometry or finish, not exposure:
+ *
+ * 1. It shared `polymer` with the pistol grip, four times too bright for a
+ *    matte moulded block. It has its own `stock` key now.
+ * 2. `wear` was a flat 0.15-0.4 on the four biggest faces on the weapon. Chunk
+ *    wear adds uniformly, including to face interiors, so it was an albedo
+ *    lift and a roughness drop across the slab rather than an edge treatment.
+ *    The chamfer bevels already carry aWear 1; the faces are back near zero.
+ *    The comb's 5mm chamfer also clamped against its 16mm height to 3.9mm, so
+ *    31% of that part's surface was bevel sitting at full wear.
+ * 3. Every face was flat. The recessed flank pockets, the channelled comb and
+ *    the buttpad grooves below are the relief a moulded stock actually has,
+ *    and the occlusion bake darkens their floors against their own rails --
+ *    local contrast from geometry, which is the only kind that survives.
+ */
 function addCarbineStock(b: PartBuilder, zTube0: number, zTube1: number, y: number): void {
   const len = zTube1 - zTube0
-  b.tube('anodised', 0.0155, 0.0155, len, [0, y, (zTube0 + zTube1) * 0.5], { seg: 16, faceted: true, caps: false, uv: 30, wear: 0.1 })
+  // Receiver extension. `anodised` is the glassy Type III finish the charging
+  // handle wears; on a horizontal tube it mirrors the probe's bright zenith
+  // and was the hottest strip on the weapon at every hip pose. A mil-spec
+  // buffer tube is a matte conversion coating, so it takes `phosphate`.
+  b.tube('phosphate', 0.0155, 0.0155, len, [0, y, (zTube0 + zTube1) * 0.5], { seg: 16, faceted: true, caps: false, uv: 34, wear: 0.08 })
   // Adjustment detent notches along the underside of the tube.
   for (let i = 0; i < 6; i++) {
     const z = zTube0 + 0.035 + i * 0.024
     if (z > zTube1 - 0.01) break
     b.box('dark', [0.010, 0.005, 0.008], [0, y - 0.0155, z], { c: 0.0012, uv: 40, wear: 0.4 })
   }
+
   const zBody = zTube1 - 0.075
-  b.box('polymer', [0.046, 0.062, 0.115], [0, y + 0.004, zBody], { c: 0.007, uv: 26, wear: 0.15 })
-  // Cheek weld ridge and the sloped comb.
-  b.box('polymer', [0.030, 0.016, 0.115], [0, y + 0.036, zBody + 0.004], { rot: [0.05, 0, 0], c: 0.005, uv: 26, wear: 0.4 })
-  // Toe of the stock, angled.
-  b.box('polymer', [0.040, 0.030, 0.055], [0, y - 0.030, zBody + 0.020], { rot: [-0.25, 0, 0], c: 0.005, uv: 26, wear: 0.25 })
-  // Release lever underneath.
-  b.box('polymer', [0.022, 0.014, 0.040], [0, y - 0.036, zBody - 0.020], { rot: [0.1, 0, 0], c: 0.003, uv: 34, wear: 0.5 })
+  const yBody = y + 0.004
+  // Body core, 8mm narrower than the finished 46mm so the flank frame below
+  // stands 4mm proud of it and the pockets between are real cavities.
+  b.box('stock', [0.038, 0.062, 0.115], [0, yBody, zBody], { c: 0.005, uv: 40, wear: 0.05 })
+  for (const sx of [-1, 1]) {
+    const x = sx * 0.0205
+    // Frame rails around each flank: top, bottom, front post, rear post and a
+    // centre web. Two pockets per side, 4mm deep.
+    b.box('stock', [0.005, 0.011, 0.115], [x, yBody + 0.0255, zBody], { c: 0.0014, uv: 44, wear: 0.14 })
+    b.box('stock', [0.005, 0.011, 0.115], [x, yBody - 0.0255, zBody], { c: 0.0014, uv: 44, wear: 0.14 })
+    b.box('stock', [0.005, 0.062, 0.011], [x, yBody, zBody - 0.052], { c: 0.0014, uv: 44, wear: 0.14 })
+    b.box('stock', [0.005, 0.062, 0.011], [x, yBody, zBody + 0.052], { c: 0.0014, uv: 44, wear: 0.14 })
+    b.box('stock', [0.005, 0.048, 0.010], [x, yBody, zBody + 0.008], { c: 0.0014, uv: 44, wear: 0.10 })
+    // Moulded sling slot through the forward pocket floor.
+    b.box('dark', [0.004, 0.010, 0.026], [sx * 0.0175, yBody + 0.002, zBody - 0.026], { c: 0.0008, uv: 46 })
+  }
+
+  // Cheek comb: two rails with a channel between them rather than one slab.
+  // This is the surface that fills the bottom of every ADS frame, so it is the
+  // one place on the weapon where a flat face is most expensive.
+  const zComb = zBody + 0.004
+  b.box('stock', [0.030, 0.009, 0.115], [0, y + 0.0325, zComb], { rot: [0.05, 0, 0], c: 0.002, uv: 46, wear: 0.06 })
+  for (const sx of [-1, 1]) {
+    b.box('stock', [0.0075, 0.013, 0.115], [sx * 0.0112, y + 0.0375, zComb], { rot: [0.05, 0, 0], c: 0.0016, uv: 46, wear: 0.20 })
+  }
+  for (const dz of [-0.038, -0.013, 0.012, 0.037]) {
+    b.box('stock', [0.015, 0.005, 0.009], [0, y + 0.0385, zComb + dz], { rot: [0.05, 0, 0], c: 0.001, uv: 48, wear: 0.16 })
+  }
+
+  // Toe of the stock, angled, with the moulding ribs down each side.
+  b.box('stock', [0.036, 0.030, 0.055], [0, y - 0.030, zBody + 0.020], { rot: [-0.25, 0, 0], c: 0.004, uv: 40, wear: 0.06 })
+  for (const sx of [-1, 1]) {
+    for (const dz of [-0.015, 0.013]) {
+      b.box('stock', [0.004, 0.026, 0.010], [sx * 0.019, y - 0.030, zBody + 0.020 + dz], { rot: [-0.25, 0, 0], c: 0.001, uv: 46, wear: 0.22 })
+    }
+  }
+
+  // Release lever underneath, serrated.
+  b.box('stock', [0.022, 0.014, 0.040], [0, y - 0.036, zBody - 0.020], { rot: [0.1, 0, 0], c: 0.002, uv: 44, wear: 0.20 })
+  for (const dz of [-0.012, -0.004, 0.004, 0.012]) {
+    b.box('stock', [0.018, 0.004, 0.004], [0, y - 0.043, zBody - 0.020 + dz], { rot: [0.1, 0, 0], c: 0.0008, uv: 48, wear: 0.35 })
+  }
+
   // QD sling socket.
   b.tube('steel', 0.007, 0.007, 0.008, [0.023, y + 0.006, zBody - 0.030], { axis: 'x', seg: 12, uv: 40, wear: 0.7 })
   b.tube('dark', 0.0042, 0.0042, 0.010, [0.023, y + 0.006, zBody - 0.030], { axis: 'x', seg: 10, uv: 40, wear: 0.2 })
-  // Rubber buttpad.
-  b.box('rubber', [0.044, 0.078, 0.016], [0, y + 0.002, zTube1 + 0.006], { rot: [-0.08, 0, 0], c: 0.004, uv: 30, wear: 0.35 })
+
+  // Rubber buttpad, grooved. Rubber does not polish, so the wear term that had
+  // it at 0.35 was putting a sheen on the one part guaranteed to be matte.
+  b.box('rubber', [0.044, 0.078, 0.016], [0, y + 0.002, zTube1 + 0.006], { rot: [-0.08, 0, 0], c: 0.004, uv: 40, wear: 0.12 })
+  for (const dy of [-0.024, -0.008, 0.008, 0.024]) {
+    b.box('dark', [0.040, 0.005, 0.004], [0, y + 0.002 + dy, zTube1 + 0.0135], { rot: [-0.08, 0, 0], c: 0.001, uv: 48 })
+  }
 }
 
 export type WeaponKind = 'rifle' | 'smg' | 'sniper' | 'pistol'
@@ -2322,6 +2446,11 @@ function buildRifle(mats: WeaponMaterials): WeaponModel {
     elbow: [0.185, -0.430, 0.150],
     curl: 1,
     indexFinger: true,
+    // Fully below the bottom edge by 0.21 of the way to the elbow in every
+    // pose. 0.50 leaves the cut end 119px clear of the edge at the worst
+    // base-pose-plus-animation-keyframe combination, and drops the projected
+    // bounding box from 36% of screen to 7%.
+    sleeveEnd: 0.50,
   })
   b.into(s.lh)
   addHand(b, {
@@ -2332,6 +2461,14 @@ function buildRifle(mats: WeaponMaterials): WeaponModel {
     elbow: [-0.200, -0.290, -0.040],
     curl: 0.92,
     thumbOver: true,
+    // The left arm runs across the frame under the handguard instead of
+    // dropping out of it, and does not clear the bottom edge until 0.76. It is
+    // also the sleeve that is actually on screen and reads correctly, so it
+    // keeps its full run: measured against the inspect and reload tracks,
+    // every value short of 1.25 can swing the cut end into frame, and trading
+    // that for a smaller bounding box on a mesh nobody complained about is not
+    // a trade worth making.
+    sleeveEnd: 1.00,
   })
   b.into(root)
   b.build()
@@ -2444,6 +2581,7 @@ function buildSmg(mats: WeaponMaterials): WeaponModel {
     elbow: [0.180, -0.420, 0.145],
     curl: 1,
     indexFinger: true,
+    sleeveEnd: 0.50,
   })
   b.into(s.lh)
   addHand(b, {
@@ -2453,6 +2591,7 @@ function buildSmg(mats: WeaponMaterials): WeaponModel {
     wrist: [-0.036, -0.104, -0.184],
     elbow: [-0.195, -0.320, -0.020],
     curl: 1,
+    sleeveEnd: 1.00,
   })
   b.into(root)
   b.build()
@@ -2570,6 +2709,7 @@ function buildSniper(mats: WeaponMaterials): WeaponModel {
     elbow: [0.185, -0.430, 0.165],
     curl: 1,
     indexFinger: true,
+    sleeveEnd: 0.50,
   })
   b.into(s.lh)
   addHand(b, {
@@ -2580,6 +2720,7 @@ function buildSniper(mats: WeaponMaterials): WeaponModel {
     elbow: [-0.205, -0.300, -0.030],
     curl: 0.9,
     thumbOver: true,
+    sleeveEnd: 1.00,
   })
   b.into(root)
   b.build()
@@ -2684,6 +2825,7 @@ function buildPistol(mats: WeaponMaterials): WeaponModel {
     elbow: [0.170, -0.420, 0.150],
     curl: 1,
     indexFinger: true,
+    sleeveEnd: 0.50,
   })
   b.into(s.lh)
   addHand(b, {
@@ -2694,6 +2836,7 @@ function buildPistol(mats: WeaponMaterials): WeaponModel {
     elbow: [-0.180, -0.410, 0.150],
     curl: 0.75,
     thumbOver: true,
+    sleeveEnd: 1.00,
   })
   b.into(root)
   b.build()

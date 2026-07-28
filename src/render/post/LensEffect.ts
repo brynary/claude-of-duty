@@ -22,6 +22,7 @@ uniform float vignetteOffset;
 uniform float grainAmount;
 uniform float grainTime;
 uniform float sharpenPeak;
+uniform float sharpenFloor;
 uniform float sharpenOvershoot;
 uniform float damageFlash;
 uniform vec3 damageTint;
@@ -53,11 +54,8 @@ vec3 lensToLinear(const in vec3 c) {
 }
 
 /**
- * Contrast-adaptive sharpening: a cross-shaped negative lobe whose weight falls
- * away as the neighbourhood's own contrast rises. That is the whole point of
- * it — a flat plaster wall or a cobble field, where the render has micro-detail
- * that the temporal jitter has softened, gets the full lobe; a roofline against
- * the sky, where an unsharp mask would ring, gets almost none.
+ * Contrast-adaptive sharpening: a cross-shaped negative lobe, one texel out, on
+ * the converged frame.
  *
  * This replaces a plain unsharp mask that was clamped to the exact min and max
  * of its own four neighbours. That clamp made it very nearly a no-op: measured
@@ -67,14 +65,37 @@ vec3 lensToLinear(const in vec3 c) {
  * sharpenOvershoot reintroduces a *bounded* overshoot, as a fraction of the
  * local range, because zero overshoot is what made the old filter inert: an
  * edge that may never exceed its own neighbours can never actually gain
- * acutance. A fraction of a half of the local range is well short of a visible
- * halo, which needs the ring to be both wide and bright.
+ * acutance. This, and not the amplitude term, is what stops the filter ringing:
+ * a halo has to be both wide and bright, and the ring here can never leave the
+ * one-texel lobe nor exceed a fixed fraction of what the neighbourhood already
+ * spans.
+ *
+ * ## Why the amplitude term has a floor
+ *
+ * AMD's CAS scales the lobe by sqrt(min(mn, 2 - mx) / mx), which backs off as
+ * the neighbourhood approaches either rail. In a mid-key frame that costs
+ * nothing. This frame set is not mid-key: it averages sRGB 61 out of 255, and in
+ * shadow the term collapses — a neighbourhood spanning 0.02 to 0.20 scores 0.32,
+ * so it received barely a third of the configured lobe. Round 4 shipped local
+ * contrast at 0.028 against a 0.030 floor with most of the frame sharpened at
+ * that third.
+ *
+ * The floor keeps the term's shape while bounding how far it can retreat. It is
+ * safe to do that here specifically because the overshoot clamp above is already
+ * the guard against the excursion CAS's amplitude was protecting against, and it
+ * is expressed relative to the local range rather than to the rails.
+ *
+ * Note the pole: the kernel normalises by (1 + 4w), so it inverts at
+ * w = -0.25. sharpenPeak() clamps short of that. Where the lobe is strongest the
+ * clamp above is doing most of the work — which is the intended behaviour, not a
+ * symptom: in a flat neighbourhood the local range is small, so the clamp holds
+ * the excursion to a fraction of it however high the raw gain goes.
  */
 vec3 lensSharpen(const in vec3 e, const in vec3 b, const in vec3 d, const in vec3 f, const in vec3 h) {
   vec3 mn = min(min(min(b, d), min(f, h)), e);
   vec3 mx = max(max(max(b, d), max(f, h)), e);
   vec3 amp = sqrt(clamp(min(mn, 2.0 - mx) / max(mx, 0.0001), 0.0, 1.0));
-  vec3 w = amp * sharpenPeak;
+  vec3 w = mix(vec3(sharpenFloor), vec3(1.0), amp) * sharpenPeak;
   vec3 sharp = ((b + d + f + h) * w + e) / (1.0 + 4.0 * w);
   vec3 slack = (mx - mn) * sharpenOvershoot;
   return clamp(sharp, mn - slack, mx + slack);
@@ -134,23 +155,41 @@ export interface LensEffectOptions {
   vignetteDarkness?: number
   vignetteOffset?: number
   grainAmount?: number
-  /** 0 leaves the frame alone, 1 is the strongest lobe the kernel allows. */
+  /** 0 leaves the frame alone, 1 is AMD's strongest lobe. See {@link sharpenPeak}. */
   sharpness?: number
+  /**
+   * Smallest fraction of the lobe the contrast-adaptive amplitude may leave in
+   * place. 0 is stock CAS; 1 removes the adaptation entirely.
+   */
+  sharpenFloor?: number
   /** Permitted overshoot past the local neighbourhood, as a fraction of its range. */
   sharpenOvershoot?: number
 }
 
 /**
- * AMD's lobe weight for a given sharpness: -1/8 at the gentle end, -1/5 at the
- * strong end. That mapping has no "off" in it, so zero is special-cased to a
- * weight of exactly zero — which makes the kernel `e / 1.0`, an exact identity,
- * and lets the quality tier switch sharpening off without a branch in the
- * shader.
+ * The kernel divides by `1 + 4w`. At `w = -0.25` that denominator is zero, and
+ * past it the sign flips: the filter silently becomes a blur-and-invert. This is
+ * the hard ceiling on lobe weight for a five-tap cross, whatever mapping feeds
+ * it, so it is clamped here rather than trusted to the caller. -0.235 leaves
+ * `1 + 4w` at 0.06 — the strongest well-posed lobe the kernel has.
+ */
+const SHARPEN_PEAK_LIMIT = -0.235
+
+/**
+ * AMD's lobe weight for a given sharpness: -1/8 at the gentle end, -1/5 at 1.0.
+ * That mapping has no "off" in it, so zero is special-cased to a weight of
+ * exactly zero — which makes the kernel `e / 1.0`, an exact identity, and lets
+ * the quality tier switch sharpening off without a branch in the shader.
+ *
+ * Values above 1.0 are permitted and are past AMD's calibrated range on
+ * purpose. That range assumes a natively rasterised frame; this one has been
+ * box-filtered over a one-pixel jitter footprint by the accumulation pass before
+ * the filter ever sees it, so what is being restored is acutance a supersampled
+ * frame genuinely had. {@link SHARPEN_PEAK_LIMIT} is the real bound.
  */
 function sharpenPeak(sharpness: number): number {
   if (sharpness <= 0) return 0
-  const s = sharpness > 1 ? 1 : sharpness
-  return -1 / (8 + (5 - 8) * s)
+  return Math.max(-1 / (8 + (5 - 8) * sharpness), SHARPEN_PEAK_LIMIT)
 }
 
 export class LensEffect extends Effect {
@@ -164,8 +203,9 @@ export class LensEffect extends Effect {
     vignetteDarkness = 0.10,
     vignetteOffset = 0.44,
     grainAmount = 0.015,
-    sharpness = 0.75,
-    sharpenOvershoot = 0.5,
+    sharpness = 1.22,
+    sharpenFloor = 0.85,
+    sharpenOvershoot = 0.62,
   }: LensEffectOptions = {}) {
     const uniforms = new Map<string, THREE.Uniform>([
       ['aberration', new THREE.Uniform(aberration)],
@@ -174,6 +214,7 @@ export class LensEffect extends Effect {
       ['grainAmount', new THREE.Uniform(grainAmount)],
       ['grainTime', new THREE.Uniform(0)],
       ['sharpenPeak', new THREE.Uniform(sharpenPeak(sharpness))],
+      ['sharpenFloor', new THREE.Uniform(sharpenFloor)],
       ['sharpenOvershoot', new THREE.Uniform(sharpenOvershoot)],
       ['damageFlash', new THREE.Uniform(0)],
       ['damageTint', new THREE.Uniform(new THREE.Vector3(1.0, 0.3, 0.24))],

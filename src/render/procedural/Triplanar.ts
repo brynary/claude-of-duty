@@ -69,7 +69,14 @@ export interface TriplanarOptions {
    * A normal map modulates the key light, so it contributes exactly nothing on
    * a surface that has no key — and roughly half of any first-person frame is
    * in shadow. Shading the albedo with the same height field is what makes the
-   * micro-detail survive there.
+   * micro-detail survive there. It is also the one micro term that cannot
+   * sparkle: value has no specular lobe, so it stays honest at any strength the
+   * material can justify.
+   *
+   * The default suits mineral surfaces — masonry, render, paving, aggregate —
+   * which are most of what this projection is used on and which really do vary
+   * in value at millimetre scale. Coated and glazed surfaces are smoother than
+   * that and turn it down.
    */
   detailAlbedo?: number
   /** Roughness swing contributed by the micro-detail, absolute. */
@@ -417,7 +424,7 @@ export function applyTriplanar(
     uDustRough: { value: options.dustRough ?? 0.94 },
     uDetailFreq: { value: options.detailFreq ?? 1.6 },
     uDetailNormal: { value: options.detailNormal ?? 0 },
-    uDetailAlbedo: { value: options.detailAlbedo ?? 0.3 },
+    uDetailAlbedo: { value: options.detailAlbedo ?? 0.44 },
     uDetailRough: { value: options.detailRough ?? 0.22 },
     uDetailCavity: { value: options.detailCavity ?? 0.5 },
     uParallax: { value: options.parallax ?? 0 },

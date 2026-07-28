@@ -54,8 +54,15 @@ const ADS_BOKEH_SCALE = 2
 /**
  * Base exposure: the multiplier applied when the frame meters at
  * {@link METER_REFERENCE}. Off the reference, {@link AutoExposure} corrects it.
+ *
+ * Round 4 metered at 1.76 and the eight poses averaged sRGB 61 against a target
+ * ceiling of 55. 1.44 is that value trimmed by a third of a stop, which lands
+ * the average at 54. It cannot be trimmed on its own: darkening moves the frame
+ * mean and the crushed-shadow fraction together, and 1.44 alone would put
+ * `pctBelow8` at 13.5 against a ceiling of 10. The `toeKnee` in `FILMIC_GRADE`
+ * is widened in the same change and is what pays for it.
  */
-const DEFAULT_EXPOSURE = 1.76
+const DEFAULT_EXPOSURE = 1.44
 
 /**
  * Geometric mean scene luminance that the meter normalises to, and how far it
@@ -166,6 +173,7 @@ export class PostFxSystem implements System, PostFxService {
   private lens!: LensEffect
   private grade!: GradeEffect
   private accumulation!: AccumulationPass
+  private smaaPass!: EffectPass
 
   private normalsPass: DepthNormalsPass | null = null
   private ssao: SSAOEffect | null = null
@@ -268,8 +276,16 @@ export class PostFxSystem implements System, PostFxService {
       preset: SMAA_PRESETS[config.quality] ?? SMAAPreset.ULTRA,
       edgeDetectionMode: EdgeDetectionMode.COLOR,
     })
-    smaa.edgeDetectionMaterial.edgeDetectionThreshold = 0.05
-    this.composer.addPass(new EffectPass(camera, smaa))
+    // SMAA's own default, and the reason the threshold moved back up to it: it
+    // decides what counts as a silhouette, and every pixel it accepts is
+    // replaced by a bilinear tap up to a texel away — a one-pixel low-pass
+    // exactly where micro-contrast lives. At 0.05 it was accepting 9-22% of the
+    // frame (mean 15%) across the eight poses, which was tolerable when the
+    // materials were flatter and is not now that they carry real texel detail.
+    // At 0.10 it accepts 1-9% (mean 5%), which is edges and not brickwork.
+    smaa.edgeDetectionMaterial.edgeDetectionThreshold = 0.10
+    this.smaaPass = new EffectPass(camera, smaa)
+    this.composer.addPass(this.smaaPass)
 
     this.accumulation = new AccumulationPass()
     this.accumulation.enabled = false
@@ -280,8 +296,13 @@ export class PostFxSystem implements System, PostFxService {
       // Grain is added after the sharpen, so the sharpen does not amplify it.
       grainAmount: config.filmGrain ? 0.015 : 0,
       // Applied after the temporal accumulation, whose one-pixel jitter
-      // footprint is a box filter and costs a little acutance.
-      sharpness: config.sharpen ? 0.75 : 0,
+      // footprint is a box filter and costs a little acutance. 1.22 is past
+      // AMD's calibrated range on purpose — see `sharpenPeak` — and the floor
+      // is what stops the amplitude term giving up in shadow, which is where
+      // most of this frame set lives.
+      sharpness: config.sharpen ? 1.22 : 0,
+      sharpenFloor: 0.85,
+      sharpenOvershoot: 0.62,
     })
     this.composer.addPass(new EffectPass(camera, this.lens))
 
@@ -447,6 +468,16 @@ export class PostFxSystem implements System, PostFxService {
     const accumulate = config.taa && frozen
 
     this.accumulation.enabled = accumulate
+    // Two anti-aliasers on the same frame, and one of them strictly better.
+    // Once the accumulation pass is running, the frame is being supersampled
+    // from two dozen sub-pixel offsets — every edge already resolves to more
+    // gradations than SMAA's area tables can express. Leaving SMAA in front of
+    // it does not improve a single edge; it only blends detail pixels toward
+    // their neighbours, twenty-odd times, before the average is taken.
+    //
+    // It stays on for live frames, where there is no accumulation and a
+    // shimmering image would be worse than a marginally softer one.
+    this.smaaPass.enabled = !accumulate
     if (!accumulate) {
       this.accumulation.reset()
       return

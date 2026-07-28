@@ -71,12 +71,13 @@ export interface GradeSettings {
  * histogram decides, and it is directly measurable rather than an emergent
  * side effect of an exponent.
  *
- * Measured through the committed tone curve, on the eight capture poses, with
- * round 3's numbers in brackets:
+ * Measured through the committed tone curve, on the eight capture poses. Round 4
+ * shipped the first column; round 5 trimmed exposure a third of a stop and
+ * widened the toe to pay for it, and predicts the second.
  *
- *     mean luma        61   [75]      max luma       255  [236]
- *     std              53   [39]      % above 247    1.4  [0.41]
- *     % below 8       4.3   [0.42]    near-field    0.043 [0.114]
+ *     mean luma       61 -> 54       max luma      255 -> 255
+ *     std             62 -> 59       % above 247   2.6 -> 2.2
+ *     % below 8      8.8 -> 6.6      near-field  0.043 -> 0.036
  *
  * The tints stay deliberately small. A split-tone strong enough to notice on a
  * grey card is strong enough to turn a bright sky lavender, which is the exact
@@ -90,7 +91,27 @@ export const FILMIC_GRADE: GradeSettings = {
   contrastPivot: 0.34,
   blackPoint: 0.012,
   whitePoint: 0.90,
-  toeKnee: 0.08,
+  // Round 5 widened this from 0.08, as the counterweight to the exposure trim.
+  //
+  // Trimming exposure moves the frame mean and the crushed-shadow fraction
+  // together, and there is no setting of the anchor pair that separates them:
+  // everything between blackPoint and whitePoint is scaled by the same factor,
+  // so a value that lands on black stays on black. Measured over the eight
+  // poses, the trim on its own takes `pctBelow8` from 8.9 to 13.5, past the
+  // ceiling of 10. Widening the toe is what pays for it — the same eight frames
+  // land at 3.3, and at 6.6 once the sharpen's undershoot is added back.
+  //
+  // This is also the fix for the two poses that were over-crushing: sunset falls
+  // from 25.9% below code 8 to 16.2 and vista from 13.2 to 9.6, without the
+  // frame mean going back up.
+  //
+  // The cost is the shadow floor: 0.13 lifts a scene-black pixel from sRGB 3.5
+  // to 6.7, which is what the near-field measurement sees. It stays inside range
+  // (0.036 against a 0.06 ceiling) because the exposure trim pulls the near
+  // field down faster than the toe lifts it. The white point is untouched —
+  // shape(1.0) is 254.4 either way, because the toe meets the ramp with slope 1
+  // and nothing above it moves.
+  toeKnee: 0.13,
   shoulderKnee: 0.85,
   lift: [0.0, 0.0, 0.0],
   shadowTint: [-0.006, 0.000, 0.012],
