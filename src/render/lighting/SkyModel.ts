@@ -372,9 +372,18 @@ const float SKY_SHOULDER_WIDTH = ${SKY_SHOULDER_WIDTH.toFixed(4)};
 // 1 and the call is defined for every fragment; adding the compressed part to
 // min( c, knee ) rather than selecting between two branches is what makes the
 // two halves meet exactly, and with slope 1, at the knee.
+float skyShoulder( float c ) {
+  float over = max( c - SKY_KNEE, 0.0 );
+  return min( c, SKY_KNEE ) + SKY_SHOULDER_WIDTH * log( 1.0 + over / SKY_SHOULDER_WIDTH );
+}
+
+// Per channel. Correct for the dome, which is *emitting* these values and whose
+// channels are read independently; wrong for anything that has to preserve the
+// sample's hue, because compressing each channel separately pulls the bright
+// one down hardest and desaturates. Callers that need the hue should compress
+// the scalar overload above on luminance and rescale — see AerialPerspective.
 vec3 skyShoulder( vec3 c ) {
-  vec3 over = max( c - vec3( SKY_KNEE ), vec3( 0.0 ) );
-  return min( c, vec3( SKY_KNEE ) ) + SKY_SHOULDER_WIDTH * log( 1.0 + over / SKY_SHOULDER_WIDTH );
+  return vec3( skyShoulder( c.r ), skyShoulder( c.g ), skyShoulder( c.b ) );
 }
 
 uniform vec3 uBetaR;

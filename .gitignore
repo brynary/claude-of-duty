@@ -3,3 +3,5 @@ dist/
 shots/
 *.log
 .DS_Store
+
+.chrome-profile/

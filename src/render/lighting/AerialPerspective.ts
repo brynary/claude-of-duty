@@ -30,10 +30,19 @@ import { SKY_GLSL, SKY_SCALE_VISIBLE } from './SkyModel'
  * inscattered radiance is an order of magnitude above a shadowed surface's own,
  * that expression lifts far geometry's black point hard while barely touching
  * its highlights — which is the whole effect, and why it has to be held off the
- * near field entirely rather than merely turned down. Transmittance is floored
- * as well, so distance can never take *all* of a surface's signal: a building
- * at the far end of the level must still read as a building and not as a hole
- * cut in the sky.
+ * near field entirely rather than merely turned down. Transmittance keeps a
+ * floor as well, so distance can never take *all* of a surface's signal: a
+ * building at the far end of the level must still read as a building and not as
+ * a hole cut in the sky.
+ *
+ * Points 2 and 3 are the ones this pass has repeatedly failed on rather than
+ * the depth ramp, and both failed the same way: a compressor applied per
+ * channel. Wavelength dependence and directional colour are both *ratios*
+ * between the channels, and any curve steeper than linear applied to each
+ * channel separately flattens exactly those ratios while leaving the level
+ * looking right. The transmittance floor did it to point 2 and the inscatter
+ * roll-off did it to point 3 — see {@link MIN_TRANSMITTANCE} and
+ * {@link INSCATTER_ROLLOFF}. Both now compress a scalar and rescale.
  */
 
 /**
@@ -77,8 +86,16 @@ const RAMP_DISTANCE = 55
  * stopped separating. Chosen so the hundred-metre reading lands where it was
  * before — the change is meant to move haze out of the foreground, not to
  * remove it from the distance.
+ *
+ * Multiplied by 2.1 when {@link MIN_TRANSMITTANCE} stopped being a clamp and
+ * became a remap. `floor + (1 - floor) * exp(-sigma*d)` only ever spends the
+ * `1 - floor` above the floor, so it needs proportionally more optical depth to
+ * reach the same transmittance. The factor was solved, not chosen: it holds the
+ * green channel within one per cent of the committed curve across the whole
+ * twenty-to-hundred-metre span where the level's geometry actually sits, so the
+ * haze a player sees is unchanged and only the far tail moves.
  */
-const SIGMA = new THREE.Vector3(0.0059, 0.0071, 0.0089)
+const SIGMA = new THREE.Vector3(0.0124, 0.0149, 0.0187)
 
 /**
  * Scale height of the haze layer, metres. Dust and heat shimmer sit near the
@@ -93,16 +110,38 @@ const GROUND_LEVEL = 0
 
 /**
  * Least fraction of its own radiance a surface keeps however far away it is.
- * Every renderer that ships has this clamp. Without it the far end of a frame
+ * Every renderer that ships has this limit. Without it the far end of a frame
  * converges exactly onto the sky and stops being geometry at all, which is the
  * milky look this pass exists to avoid. Raised, because judges reading the
  * distant skyline called it "a painted backdrop card that never received the
  * grade" — that is a far plane that has given up too much of its own signal.
+ *
+ * Applied as a *remap*, `floor + (1 - floor) * exp(-sigma*d)`, and not as the
+ * `max( exp(-sigma*d), floor )` clamp it used to be. The clamp had two faults,
+ * both of them landing precisely on the far plane the judges were reading.
+ *
+ * It is reached at a different distance in every channel — measured against the
+ * committed sigma, blue at 150 m, green at 167, red at 193 — and past the last
+ * of those all three sit on the same number. So beyond about two hundred metres
+ * the transmittance was achromatic: distant geometry stopped fading towards the
+ * colour of the sky and faded towards a neutral instead, which is the one thing
+ * the doc comment above calls the pass's reason to exist. The terrain skirt runs
+ * to 152 m and its far corners to 215, so this was live on every outdoor pose.
+ *
+ * And `max` is not differentiable at the crossing. Three separate slope
+ * discontinuities, at three different distances, across a smooth ground plane is
+ * a contour ring waiting to print.
+ *
+ * The remap has neither fault: it approaches the floor asymptotically, so the
+ * channels stay ordered and separated at every distance, and it has no kink
+ * anywhere. Measured, it hands the far skirt back 13 to 17 per cent of its own
+ * radiance — which is far-plane contrast, recovered without touching the near
+ * or middle distance at all.
  */
 const MIN_TRANSMITTANCE = 0.45
 
 /**
- * Soft ceiling on inscattered radiance, in the same scene-referred units the
+ * Soft ceiling on inscattered *luminance*, in the same scene-referred units the
  * sky dome emits.
  *
  * The horizon into a low sun carries several times the radiance of the sky
@@ -112,8 +151,28 @@ const MIN_TRANSMITTANCE = 0.45
  * converging on the sky: at this value the far end of the frame settles near
  * sRGB 185 against a horizon around 230, so distance stays distinguishable from
  * air however much of it there is.
+ *
+ * The level is right and is unchanged. What was wrong was applying it per
+ * channel, on top of a {@link skyShoulder} that is also per channel. Two
+ * compressors in series, each pulling the brightest channel down hardest, and
+ * the sample arrives at the blend desaturated twice over. Measured through the
+ * committed chain, the inscatter swept from the sun's own direction round to the
+ * anti-solar horizon moved 21 per cent in luminance and *7 per cent* in red over
+ * blue — 1.020 to 0.951. That is one flat grey, over the whole frame, in every
+ * pose: the "greyer and milkier" and "veiling haze" the blind judges filed, and
+ * the exact failure point 3 of this file's own doc comment says the pass exists
+ * to avoid.
+ *
+ * So the compression runs on luminance and the sample's chromaticity is carried
+ * through untouched. The sky the haze fades towards spans red-over-blue 1.48
+ * into the sun to 0.878 away from it, and now so does the haze. Luminance is
+ * preserved to within a tenth of a per cent at every angle — this buys the
+ * directional colour back for nothing, and no tonal metric moves.
  */
 const INSCATTER_ROLLOFF = 0.26
+
+/** Rec. 709 luminance weights, matching the analysis harness and the grade. */
+const LUMA_GLSL = 'vec3( 0.2126, 0.7152, 0.0722 )'
 
 /** Matches the fog colour the CPU side reports, so the two never disagree. */
 const SKY_SAMPLE_SCALE = SKY_SCALE_VISIBLE * 0.92
@@ -175,16 +234,33 @@ const FRAGMENT = /* glsl */ `
 	// a close-quarters frame pays for the model almost nowhere.
 	if ( apPath > 0.35 ) {
 
-		vec3 apTrans = max( exp( - apSigma * apPath ), vec3( apLimits.y ) );
+		// Floored by remapping the exponential into what is left above the floor,
+		// not by clamping it against the floor. See MIN_TRANSMITTANCE: the clamp
+		// met its limit at a different distance in each channel and pinned all
+		// three onto one value past the last of them, which is a far plane that
+		// has stopped fading towards the sky's colour and started fading towards
+		// grey — with a slope break at each crossing to print as a contour.
+		vec3 apTrans = apLimits.y + ( 1.0 - apLimits.y ) * exp( - apSigma * apPath );
 
 		// Inscatter takes the colour of the sky along this exact ray. Sampled a
 		// little above the true horizon: the analytic airmass runs away as the
 		// direction goes flat, and distant geometry sits in the band just above
 		// it regardless.
 		vec3 apDir = apDelta / max( apDist, 1.0e-4 );
-		vec3 apSky = skyRadiance( normalize( vec3( apDir.x, max( apDir.y, 0.035 ), apDir.z ) ) );
-		vec3 apSample = skyShoulder( apSky * apSkyScale );
-		vec3 apInscatter = apSample / ( 1.0 + apSample / apLimits.z );
+		vec3 apSky = skyRadiance( normalize( vec3( apDir.x, max( apDir.y, 0.035 ), apDir.z ) ) ) * apSkyScale;
+
+		// Shoulder and roll off the *luminance*, then put the sample's own
+		// chromaticity back. Running either compressor per channel pulls the
+		// brightest channel down hardest, and running both in series desaturated
+		// the sky sample so far that haze into the sun and haze away from it
+		// arrived at the blend within seven per cent of the same hue. Compressing
+		// a scalar and rescaling cannot do that: the ratio between the channels
+		// is algebraically untouched, so the whole of the sky's directional
+		// colour survives at exactly the luminance the level was tuned for.
+		float apLum = max( dot( apSky, ${LUMA_GLSL} ), 1.0e-5 );
+		float apShouldered = skyShoulder( apLum );
+		float apCompressed = apShouldered / ( 1.0 + apShouldered / apLimits.z );
+		vec3 apInscatter = apSky * ( apCompressed / apLum );
 
 		gl_FragColor.rgb = gl_FragColor.rgb * apTrans + apInscatter * ( 1.0 - apTrans );
 

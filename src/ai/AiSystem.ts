@@ -38,10 +38,26 @@ const FLASH_LIGHTS = 3
  * near side of the carrier while a wall 2m in front still takes about 0.6 of a
  * sun's worth of warm bounce. Range is short for the same reason — a rifle
  * flash lights the couple of metres around the shooter, not the whole plaza.
+ *
+ * With the card re-authored down to a sane radiance (see {@link buildMuzzleFlash})
+ * this light is now what a viewer reads most of the flash by, and that is the
+ * right way round: a light shows gear, normal maps and form, while a card can
+ * only paint over them. At 6.0 the support hand takes 12 lux at 0.70m and grades
+ * to around 200/255 on its lit side — hot, not clipped — the near face of the
+ * carrier about 6.6 lux at 0.95m, and the ground 1.4m below about 3, which puts
+ * a warm pool at roughly 125/255 under a soldier firing in a shadowed street.
  */
-const FLASH_LIGHT_INTENSITY = 5
+const FLASH_LIGHT_INTENSITY = 6
 const FLASH_LIGHT_RANGE = 6.5
 const FLASH_LIGHT_OFFSET = 0.4
+
+/**
+ * Flash light colour. Pushed warmer than the old 0xffcf8c, which was pale enough
+ * that the lit side of a soldier came out the same neutral as the sun. Burning
+ * propellant lights kit orange, and the hue break against a low sun is half of
+ * what separates a firing soldier from the wall behind him.
+ */
+const FLASH_LIGHT_COLOR = 0xffbe7a
 
 export class AiSystem implements System, AiService {
   readonly name = 'ai'
@@ -103,7 +119,7 @@ export class AiSystem implements System, AiService {
     // Lights are created up front and only ever change intensity: adding or
     // removing one at runtime forces every material in the scene to recompile.
     for (let i = 0; i < FLASH_LIGHTS; i++) {
-      const l = new THREE.PointLight(0xffcf8c, 0, FLASH_LIGHT_RANGE, 2)
+      const l = new THREE.PointLight(FLASH_LIGHT_COLOR, 0, FLASH_LIGHT_RANGE, 2)
       l.castShadow = false
       ctx.scene.add(l)
       this.lights.push(l)
@@ -409,61 +425,132 @@ export class AiSystem implements System, AiService {
   }
 }
 
+/** Linear RGB, scene-referred — not an sRGB colour. */
+type Rgb = readonly [number, number, number]
+
 /**
- * Muzzle flash card: a four-point star of crossed quads plus a short cone, with
- * a white-hot core fading to orange. Vertex colours carry the gradient so a
- * single additive material serves every soldier.
+ * Muzzle flash card: a warm four-point star with a small hot core, a soft halo
+ * behind it and a short plume down the barrel line. Vertex colours carry the
+ * gradient so a single additive material serves every soldier.
+ *
+ * **Additive layers sum, and the sum is the only number that matters.** The old
+ * card ignored that. It stacked three overlapping quads and a cone, each with
+ * the same near-white (1.00, 0.96, 0.82) centre vertex, so the axis carried
+ * (4.00, 3.84, 3.28) linear head on. Display white is 3.5 scene-linear here —
+ * PostFX grades 5.0 to white after a base exposure of 1.44 — so all three
+ * channels cleared it together and no amount of roll-off in the curve could
+ * pull a colour back out of them: predicted (255, 255, 254), and measured
+ * (255, 255, 251) on `shots/iter7/plaza.png` over a blob wider than the
+ * shooter's chest. Stacking one hue four times only ever gets brighter, never
+ * warmer, and a white disc is what "consumed by a clipped bloom halo" looks
+ * like from the outside.
+ *
+ * It lands on the chest because it has to: a soldier aiming at the camera has
+ * his barrel fully foreshortened, so the card is drawn square on his plate
+ * carrier with nothing to hide behind. Every capture pose is that case. So the
+ * card has to be readable *as a flash sitting on a soldier*, which means the
+ * peak has to be budgeted rather than tuned layer by layer.
+ *
+ * Layer totals on the axis, viewed head on:
+ *
+ * | layer | R | G | B |
+ * |---|---|---|---|
+ * | halo  | 0.55 | 0.26 | 0.070 |
+ * | star  | 0.95 | 0.52 | 0.160 |
+ * | core  | 1.30 | 0.98 | 0.540 |
+ * | plume tip | 0.10 | 0.04 | 0.008 |
+ * | **total** | **2.90** | **1.80** | **0.778** |
+ *
+ * Red clips, green sits two thirds of a stop under it and blue nearly two stops
+ * under, so the hottest texel grades to (253, 245, 217) — hot amber, not paper.
+ * That is the same budget the player's own flash was re-authored to.
+ *
+ * Luminance 1.96 still clears the 1.6 bloom threshold, but only within 18mm of
+ * the axis: the source feeding bloom is two pixels across at 15m and four at 8m,
+ * against a card the old one blew past the threshold across its entire 0.37m
+ * span. From there out the star grades through gold to deep orange
+ * (181, 119, 46) at the rim, which is a flash a viewer can see a soldier behind.
+ *
+ * Every layer is a single triangle fan with one centre vertex, so no layer
+ * overlaps itself and the table above is exact rather than an estimate. Tip to
+ * tip the star spans 0.27m — a rifle fireball — against the old card's 0.37m.
  */
 function buildMuzzleFlash(): THREE.BufferGeometry {
   const pos: number[] = []
   const col: number[] = []
   const idx: number[] = []
 
-  const core = [1.0, 0.96, 0.82]
-  const mid = [1.0, 0.62, 0.18]
-  const edge = [0.55, 0.15, 0.02]
-
-  const quad = (w: number, h: number, roll: number, z: number) => {
-    const base = pos.length / 3
-    const c = Math.cos(roll)
-    const s = Math.sin(roll)
-    const pts: [number, number][] = [[-w, -h], [w, -h], [w, h], [-w, h]]
-    for (const [u, v] of pts) {
-      pos.push(u * c - v * s, u * s + v * c, z)
-      col.push(edge[0], edge[1], edge[2])
+  /**
+   * Rim ring for {@link fan}: `n` vertices as x, y, r, g, b, at a radius and
+   * colour that may alternate to cut a star out of the ring.
+   */
+  const ring = (n: number, radius: (i: number) => number, colour: (i: number) => Rgb): number[] => {
+    const out: number[] = []
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2
+      const r = radius(i)
+      const c = colour(i)
+      out.push(Math.cos(a) * r, Math.sin(a) * r, c[0], c[1], c[2])
     }
-    // Bright centre vertex.
-    const centre = pos.length / 3
-    pos.push(0, 0, z)
-    col.push(core[0], core[1], core[2])
-    for (let i = 0; i < 4; i++) {
-      idx.push(centre, base + i, base + ((i + 1) % 4))
-    }
+    return out
   }
 
-  quad(0.055, 0.16, 0, 0.01)
-  quad(0.16, 0.055, 0, 0.012)
-  quad(0.13, 0.13, Math.PI / 4, 0.008)
+  /** Centre-bright triangle fan lying flat in the plane z, facing the barrel. */
+  const fan = (z: number, centre: Rgb, rim: readonly number[]) => {
+    const c = pos.length / 3
+    pos.push(0, 0, z)
+    col.push(centre[0], centre[1], centre[2])
+    const base = pos.length / 3
+    const n = rim.length / 5
+    for (let i = 0; i < n; i++) {
+      const o = i * 5
+      pos.push(rim[o], rim[o + 1], z)
+      col.push(rim[o + 2], rim[o + 3], rim[o + 4])
+    }
+    for (let i = 0; i < n; i++) idx.push(c, base + i, base + ((i + 1) % n))
+  }
 
-  // Forward cone: the plume down the barrel line.
+  const BLACK: Rgb = [0, 0, 0]
+  // Halo: widest, dimmest, deep orange, out to nothing. This is what gives the
+  // flash a soft edge without asking bloom to invent one.
+  fan(0.006, [0.55, 0.26, 0.07], ring(12, () => 0.105, () => BLACK))
+
+  // Star: four 0.135m points with 0.048m valleys between them. Rim colour is
+  // keyed to radius, not to which kind of vertex it is — the fireball cools
+  // outward, so the near valleys stay hotter than the far points.
+  const TIP: Rgb = [0.26, 0.08, 0.012]
+  const VALLEY: Rgb = [0.44, 0.17, 0.035]
+  fan(
+    0.010,
+    [0.95, 0.52, 0.16],
+    ring(8, (i) => (i % 2 === 0 ? 0.135 : 0.048), (i) => (i % 2 === 0 ? TIP : VALLEY)),
+  )
+
+  // Core: the only part that reaches display white, and it is 7cm across.
+  fan(0.014, [1.3, 0.98, 0.54], ring(8, () => 0.036, () => [0.34, 0.15, 0.03]))
+
+  // Plume: a short cone down the barrel line, hottest at its base. Head on, a
+  // ray crosses it once and picks up the tip colour on the axis, which is why
+  // the table above charges the axis only 0.10 for it. Side on it is crossed
+  // twice near the base for (1.44, 0.80, 0.22) — a warm ember, under the bloom
+  // threshold, because side on the flash light does the reading and a card that
+  // blooms from an angle would only veil the shooter beside it.
   const tip = pos.length / 3
-  pos.push(0, 0, 0.26)
-  col.push(mid[0], mid[1], mid[2])
+  pos.push(0, 0, 0.22)
+  col.push(0.1, 0.04, 0.008)
   const ringStart = pos.length / 3
-  const seg = 7
+  const seg = 8
   for (let i = 0; i < seg; i++) {
     const a = (i / seg) * Math.PI * 2
-    pos.push(Math.cos(a) * 0.05, Math.sin(a) * 0.05, 0.0)
-    col.push(core[0], core[1], core[2])
+    pos.push(Math.cos(a) * 0.042, Math.sin(a) * 0.042, 0)
+    col.push(0.72, 0.4, 0.11)
   }
-  for (let i = 0; i < seg; i++) {
-    idx.push(tip, ringStart + i, ringStart + ((i + 1) % seg))
-  }
+  for (let i = 0; i < seg; i++) idx.push(tip, ringStart + i, ringStart + ((i + 1) % seg))
 
   const g = new THREE.BufferGeometry()
   g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3))
   g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(col), 3))
   g.setIndex(idx)
-  g.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0.1), 0.4)
+  g.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0.09), 0.2)
   return g
 }

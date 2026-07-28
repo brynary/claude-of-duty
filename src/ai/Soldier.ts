@@ -846,6 +846,12 @@ export class Soldier implements Damageable {
   forceFlash(): void {
     this.muzzleFlashT = 1
     this.flash.visible = true
+    // A soldier who has not fired yet still carries the identity transform, so
+    // without this every flash in a capture is the same star at the same roll
+    // and reads as a stamp. Derive both from the id rather than the shot count:
+    // the frozen frame has to look like three separate weapons firing.
+    this.flash.rotation.z = ((this.id * 0.79) % 1) * Math.PI
+    this.flash.scale.setScalar(0.88 + ((this.id * 37) % 27) / 100)
     this.recoil = Math.max(this.recoil, 0.7)
   }
 

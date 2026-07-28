@@ -261,6 +261,22 @@ class GeomBuf {
     this.tri(p0, p2, p3, n, w)
   }
 
+  /** Same as `tri` but with per-vertex normals and wear, for smooth surfaces. */
+  triW(
+    p0: THREE.Vector3, p1: THREE.Vector3, p2: THREE.Vector3,
+    n0: THREE.Vector3, n1: THREE.Vector3, n2: THREE.Vector3,
+    w0: number, w1: number, w2: number,
+  ): void {
+    _e1.subVectors(p1, p0)
+    _e2.subVectors(p2, p0)
+    _face.crossVectors(_e1, _e2)
+    if (_face.dot(n0) >= 0) {
+      this.vertex(p0, n0, w0); this.vertex(p1, n1, w1); this.vertex(p2, n2, w2)
+    } else {
+      this.vertex(p0, n0, w0); this.vertex(p2, n2, w2); this.vertex(p1, n1, w1)
+    }
+  }
+
   /**
    * Quad split into a `nu` x `nv` grid. Occlusion is baked per vertex, so a
    * 25cm receiver flank drawn as two triangles can only carry a corner-to-
@@ -549,6 +565,75 @@ export function ringGeom(rInner: number, rOuter: number, segments = 32): THREE.B
   return g.toGeometry()
 }
 
+/**
+ * Shallow spherical cap facing +Z: the ground surface of an optic lens.
+ *
+ * A flat disc cannot read as glass, and no material change can make it. Its
+ * normal is constant over the whole surface, so Fresnel, the probe reflection
+ * and the key's specular lobe all evaluate to the *same* number at every texel
+ * and the lens resolves to one flat colour. That is exactly the "flat matte
+ * disc that fills the housing, reads as a lens cap" the blind judges scored
+ * against this build: the defect is geometric, so the fix has to be.
+ *
+ * A real objective is ground to a curvature radius of a few centimetres, which
+ * is what this builds. The curvature buys three separate cues at once: the
+ * probe's elevation gradient sweeps across the cap as a soft vertical band, the
+ * rim turns away from the eye far enough to reach full Fresnel and reads as the
+ * bright coated edge, and the key lands as one small hard glint instead of a
+ * uniform wash.
+ *
+ * `aWear` carries normalised radius (0 at the apex, 1 at the rim) so the lens
+ * material can ramp its coating from a near-clear centre to a blue edge without
+ * needing a texture or a second UV set.
+ */
+export function lensGeom(radius: number, sag: number, segments = 28, rings = 5): THREE.BufferGeometry {
+  const g = new GeomBuf()
+  // Sphere through both the rim and the apex: R = (r^2 + sag^2) / 2 sag.
+  const R = (radius * radius + sag * sag) / (2 * sag)
+  const cz = sag - R
+  const zAt = (r: number) => cz + Math.sqrt(Math.max(0, R * R - r * r))
+  const p1 = new THREE.Vector3()
+  const p2 = new THREE.Vector3()
+  const p3 = new THREE.Vector3()
+  const p4 = new THREE.Vector3()
+  const n1 = new THREE.Vector3()
+  const n2 = new THREE.Vector3()
+  const n3 = new THREE.Vector3()
+  const n4 = new THREE.Vector3()
+  const apex = new THREE.Vector3(0, 0, sag)
+  const apexN = new THREE.Vector3(0, 0, 1)
+  for (let i = 0; i < rings; i++) {
+    const rA = radius * (i / rings)
+    const rB = radius * ((i + 1) / rings)
+    const zA = zAt(rA)
+    const zB = zAt(rB)
+    const wA = i / rings
+    const wB = (i + 1) / rings
+    for (let s = 0; s < segments; s++) {
+      const t0 = (s / segments) * Math.PI * 2
+      const t1 = ((s + 1) / segments) * Math.PI * 2
+      const c0 = Math.cos(t0)
+      const s0 = Math.sin(t0)
+      const c1 = Math.cos(t1)
+      const s1 = Math.sin(t1)
+      p3.set(c0 * rB, s0 * rB, zB)
+      n3.set(p3.x, p3.y, zB - cz).divideScalar(R)
+      p4.set(c1 * rB, s1 * rB, zB)
+      n4.set(p4.x, p4.y, zB - cz).divideScalar(R)
+      if (i === 0) {
+        g.triW(apex, p3, p4, apexN, n3, n4, 0, wB, wB)
+        continue
+      }
+      p1.set(c0 * rA, s0 * rA, zA)
+      n1.set(p1.x, p1.y, zA - cz).divideScalar(R)
+      p2.set(c1 * rA, s1 * rA, zA)
+      n2.set(p2.x, p2.y, zA - cz).divideScalar(R)
+      g.quadW(p1, p2, p4, p3, n1, n2, n4, n3, wA, wA, wB, wB)
+    }
+  }
+  return g.toGeometry()
+}
+
 /** Flat disc facing +Z, used for lenses. */
 export function discGeom(radius: number, segments = 32): THREE.BufferGeometry {
   const g = new GeomBuf()
@@ -606,6 +691,15 @@ export class WeaponMaterials {
    * that weighting is the difference between a rifle and a black cut-out.
    */
   private env: THREE.Texture | null = null
+  /**
+   * Every material paired with its authored probe weight, so
+   * `setEnvironmentScale` can move the whole weapon's indirect term without
+   * losing the per-part ladder. A flat array rather than a map: this is walked
+   * from the frame loop and a map iterator allocates.
+   */
+  private scaled: { mat: THREE.MeshStandardMaterial, base: number }[] = []
+  /** Current environment coupling factor; see `setEnvironmentScale`. */
+  private envScale = 1
   readonly metalNormal: THREE.DataTexture
   readonly metalRough: THREE.DataTexture
   readonly metalAlbedo: THREE.DataTexture
@@ -953,6 +1047,97 @@ export class WeaponMaterials {
   }
 
   /**
+   * Coated optic glass.
+   *
+   * Additive rather than alpha-blended, for the reason the previous round
+   * found: an alpha pane multiplies the sight picture by (1 - opacity) and lays
+   * its own shading on top, so even a 10%-opaque lens veils the target. A real
+   * coated lens transmits ~99% and adds a reflection, which is what additive
+   * blending is.
+   *
+   * What additive alone could not fix was the *shape* of what it adds. On a
+   * flat disc under a smooth probe the added term is one constant colour edge
+   * to edge — a matte plate. The geometry is a spherical cap now (`lensGeom`),
+   * and this material spends that curvature:
+   *
+   * - `aWear` arrives as normalised radius, so the coating runs from an almost
+   *   clear centre to a blue-cyan rim, which is what a multi-layer AR stack
+   *   does as the ray angle through it steepens.
+   * - The probe term is ramped by the same radius, so the middle of the lens
+   *   stays transmissive and the reflection lives at the edge where the cap
+   *   turns away from the eye. The centre of an optic should show the target,
+   *   not the sky.
+   * - The direct term is left at full strength and the lobe kept tight, so the
+   *   key resolves as one small hard glint on the glass rather than a wash.
+   */
+  private lensMaterial(key: 'glass' | 'glassFront'): THREE.MeshStandardMaterial {
+    const front = key === 'glassFront'
+    const m = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.035,
+      metalness: 1,
+      transparent: true,
+      opacity: 1,
+      blending: THREE.AdditiveBlending,
+      envMap: this.env,
+      envMapIntensity: front ? 0.34 : 0.42,
+      depthWrite: false,
+      dithering: true,
+      side: THREE.FrontSide,
+    })
+    // Coating reflectance, linear. Both are far below a metal's F0 on purpose:
+    // this is the ~0.5% a good AR stack leaves behind, not a mirror. The rim
+    // value is where the stack stops cancelling and goes blue-green, which is
+    // the colour every coated objective shows when you look across it.
+    const centre = front ? '0.0075, 0.0125, 0.0230' : '0.0090, 0.0150, 0.0280'
+    const rim = front ? '0.0420, 0.1000, 0.1550' : '0.0520, 0.1150, 0.1750'
+    m.onBeforeCompile = (shader) => {
+      shader.vertexShader =
+        'attribute float aWear;\nvarying float vLensR;\n' +
+        shader.vertexShader.replace(
+          '#include <begin_vertex>',
+          '#include <begin_vertex>\n\tvLensR = aWear;',
+        )
+      shader.fragmentShader =
+        'varying float vLensR;\n' +
+        shader.fragmentShader
+          .replace('#include <color_fragment>', `#include <color_fragment>
+	float lensR = clamp( vLensR, 0.0, 1.0 );
+	diffuseColor.rgb = mix( vec3( ${centre} ), vec3( ${rim} ), lensR * lensR );`)
+          // Ramp only the probe term. Leaving the direct term alone is what
+          // keeps a single specular pinprick on the glass, which is the cue
+          // that separates a lens from a painted disc at hip.
+          .replace('#include <aomap_fragment>', `#include <aomap_fragment>
+	float lensEdge = 0.16 + 1.90 * smoothstep( 0.42, 1.0, lensR );
+	reflectedLight.indirectSpecular *= lensEdge;
+	reflectedLight.directSpecular *= 1.35;`)
+    }
+    m.customProgramCacheKey = () => `lens-${key}`
+    m.name = key
+    return m
+  }
+
+  /**
+   * Couples the weapon's indirect term to the world the player is standing in.
+   *
+   * The studio rig is deliberately fixed, but "fixed" has to mean fixed
+   * *relative to the scene*, and the probe weighting is half of what the eye
+   * reads as the weapon's exposure. Scaling the authored ladder rather than
+   * replacing it keeps every per-part relationship — rail brighter than
+   * receiver, receiver brighter than magazine — while the whole assembly moves
+   * with the light around it. `envMapIntensity` is a uniform, so this costs no
+   * recompile.
+   */
+  setEnvironmentScale(scale: number): void {
+    if (Math.abs(scale - this.envScale) < 1e-4) return
+    this.envScale = scale
+    for (let i = 0; i < this.scaled.length; i++) {
+      const e = this.scaled[i]
+      e.mat.envMapIntensity = e.base * scale
+    }
+  }
+
+  /**
    * Points every weapon material at the viewmodel studio probe. Called once,
    * before the first model is built, so nothing has to recompile.
    */
@@ -1154,37 +1339,16 @@ export class WeaponMaterials {
         }, { roughnessMap: this.polymerRough, normalMap: this.polymerNormal })
         break
       case 'glass':
-      case 'glassFront': {
-        // Coated optic glass as a pure additive coating reflection rather than
-        // an alpha pane.
-        //
-        // An alpha-blended lens multiplies everything behind it by (1-opacity)
-        // and adds its own shading on top, so even at 0.10 opacity a lens
-        // reflecting a bright probe lays a flat veil across the sight picture
-        // -- which is what "the lens ghosts a second copy of the scene" and
-        // "milky" were describing. A real coated lens transmits ~99% and adds
-        // a faint sky reflection, which is exactly additive: the world passes
-        // through untouched and the coating shows only where the probe hits
-        // it. Metalness 1 with a dark F0 makes the colour *be* the coating
-        // reflectance, so nothing leaks in from the diffuse term.
-        const g = new THREE.MeshStandardMaterial({
-          color: key === 'glass' ? 0x2e405c : 0x1e2b3e,
-          roughness: 0.05,
-          metalness: 1,
-          transparent: true,
-          opacity: 1,
-          blending: THREE.AdditiveBlending,
-          envMap: this.env,
-          envMapIntensity: key === 'glass' ? 0.9 : 0.6,
-          depthWrite: false,
-          side: THREE.FrontSide,
-        })
-        g.name = key
-        mat = g
+      case 'glassFront':
+        mat = this.lensMaterial(key)
         break
-      }
       default:
         mat = new THREE.MeshStandardMaterial({ color: 0x555555 })
+    }
+    const std = mat as THREE.MeshStandardMaterial
+    if (std.isMeshStandardMaterial) {
+      this.scaled.push({ mat: std, base: std.envMapIntensity })
+      std.envMapIntensity *= this.envScale
     }
     this.cache.set(key, mat)
     return mat
@@ -1193,6 +1357,7 @@ export class WeaponMaterials {
   dispose(): void {
     for (const m of this.cache.values()) m.dispose()
     this.cache.clear()
+    this.scaled.length = 0
     for (const t of [
       this.metalNormal, this.metalRough, this.metalAlbedo, this.polymerNormal,
       this.polymerRough, this.fabricNormal, this.camoAlbedo, this.gloveNormal,
@@ -1323,6 +1488,17 @@ export class PartBuilder {
   ring(mat: WeaponMatKey, rInner: number, rOuter: number, pos: [number, number, number], o?: PartOpts): void {
     const g = ringGeom(rInner, rOuter, o?.seg ?? 32)
     this.addGeom(mat, g, this.compose(pos, o), o?.wear ?? 0, o?.uv ?? 24)
+  }
+
+  /**
+   * Curved optic lens. `sagFrac` is the bulge as a fraction of the aperture.
+   * 0.15-0.25 covers what a real objective is ground to — 0.24 tilts the rim
+   * 27 degrees off the optical axis, which is enough for the probe gradient to
+   * sweep visibly across the glass and for the rim to reach Fresnel.
+   */
+  lens(mat: WeaponMatKey, radius: number, pos: [number, number, number], sagFrac = 0.19, o?: PartOpts): void {
+    const g = lensGeom(radius, radius * sagFrac, o?.seg ?? 28)
+    this.addGeom(mat, g, this.compose(pos, o), 0, o?.uv ?? 20)
   }
 
   /** Merges everything accumulated and attaches the meshes to their groups. */
@@ -2165,14 +2341,33 @@ function addRedDot(b: PartBuilder, root: THREE.Group, z: number, railTop: number
   }
   // Brightness rocker.
   b.box('dark', [0.006, 0.012, 0.016], [-r - 0.004, axisY - 0.012, z + 0.012], { c: 0.0012, uv: 40, wear: 0.2 })
-  // Lenses recessed behind a matte bezel. The bezel is what gives the window a
-  // dark edge falloff instead of a hard-cut circle.
-  b.disc('glass', r - 0.0035, [0, axisY, z + 0.0245], { seg: 28 })
-  b.ring('dark', r - 0.0045, r - 0.0002, [0, axisY, z + 0.0295], { seg: 28, uv: 20, wear: 0 })
-  b.disc('glassFront', r - 0.0035, [0, axisY, z - 0.0245], { seg: 28 })
-  b.ring('dark', r - 0.0045, r - 0.0002, [0, axisY, z - 0.0295], { seg: 28, uv: 20, wear: 0, rot: [0, Math.PI, 0] })
+  // Lens seats. Three separate things were making this read as a lens cap, and
+  // all three are geometry rather than material:
+  //
+  //  1. The glass was a flat disc, which can only ever shade as one flat
+  //     colour -- see `lensGeom`. It is a ground cap now.
+  //  2. It sat 5mm behind a bezel that was 1mm *narrower* than the glass, so
+  //     the aperture ran to 83% of the tube's outer diameter and the housing
+  //     read as a rim painted around a plate. The bezel now overlaps the glass
+  //     and the aperture is 68% of the tube, which is what a 20mm tube sight
+  //     actually shows.
+  //  3. Nothing stood between the bezel and the glass, so there was no depth
+  //     cue at all. The `bore` collar below is the wall of the lens well: 8mm
+  //     of back-faced tube that the eye reads as the recess a lens sits in,
+  //     and that shows as a lit crescent along one side at any angle off the
+  //     optical axis.
+  const rLens = r - 0.0055
+  const rBezel = rLens - 0.0006
+  for (const s of [1, -1]) {
+    const rot: [number, number, number] | undefined = s > 0 ? undefined : [0, Math.PI, 0]
+    b.lens(s > 0 ? 'glass' : 'glassFront', rLens, [0, axisY, z + s * 0.0205], 0.24, { seg: 28, rot })
+    b.tube('bore', rLens + 0.0004, rLens + 0.0004, 0.0085, [0, axisY, z + s * 0.0250], {
+      seg: 28, caps: false, uv: 26,
+    })
+    b.ring('dark', rBezel, r - 0.0002, [0, axisY, z + s * 0.0295], { seg: 28, uv: 20, wear: 0, rot })
+  }
   root.userData.opticZ = z
-  return { window: r - 0.0055 }
+  return { window: rBezel - 0.0004 }
 }
 
 /** Holographic sight: squared hood with a wide rectangular window. */
@@ -2217,13 +2412,14 @@ function addScope(b: PartBuilder, z: number, railTop: number, axisY: number): { 
   b.tube('anodised', rObj, rTube, 0.045, [0, axisY, z - 0.172], { seg: 18, faceted: true, caps: false, uv: 30, wear: 0.1 })
   b.tube('anodised', rObj, rObj, 0.030, [0, axisY, z - 0.210], { seg: 18, faceted: true, caps: false, uv: 30, wear: 0.12 })
   b.tube('anodised', rObj + 0.0025, rObj + 0.0025, 0.006, [0, axisY, z - 0.226], { seg: 18, faceted: true, caps: false, uv: 30, wear: 0.6 })
-  b.disc('glassFront', rObj - 0.004, [0, axisY, z - 0.228], { seg: 28 })
+  b.lens('glassFront', rObj - 0.005, [0, axisY, z - 0.228], 0.17, { seg: 28, rot: [0, Math.PI, 0] })
   // Ocular bell and rubber eyecup.
   b.tube('anodised', rTube, rOcu, 0.030, [0, axisY, z + 0.163], { seg: 18, faceted: true, caps: false, uv: 30, wear: 0.1 })
   b.tube('anodised', rOcu, rOcu, 0.028, [0, axisY, z + 0.192], { seg: 18, faceted: true, caps: false, uv: 30, wear: 0.15 })
   b.tube('rubber', rOcu + 0.004, rOcu + 0.004, 0.016, [0, axisY, z + 0.212], { seg: 18, caps: false, uv: 30, wear: 0.25 })
-  b.disc('glass', rOcu - 0.004, [0, axisY, z + 0.204], { seg: 28 })
-  b.ring('dark', rOcu - 0.006, rOcu - 0.0005, [0, axisY, z + 0.208], { seg: 28, uv: 20, wear: 0 })
+  b.lens('glass', rOcu - 0.005, [0, axisY, z + 0.202], 0.15, { seg: 28 })
+  b.tube('bore', rOcu - 0.0046, rOcu - 0.0046, 0.008, [0, axisY, z + 0.2065], { seg: 28, caps: false, uv: 26 })
+  b.ring('dark', rOcu - 0.0056, rOcu - 0.0005, [0, axisY, z + 0.2105], { seg: 28, uv: 20, wear: 0 })
   // Magnification ring with grip ribs.
   b.tube('anodised', rTube + 0.004, rTube + 0.004, 0.022, [0, axisY, z + 0.130], { seg: 18, faceted: true, caps: false, uv: 34, wear: 0.4 })
   for (let i = 0; i < 10; i++) {

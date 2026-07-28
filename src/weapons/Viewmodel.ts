@@ -1,5 +1,5 @@
 import * as THREE from 'three'
-import type { GameContext } from '../core/Types'
+import type { GameContext, RaycastFilter } from '../core/Types'
 import type { WeaponDef, VmPose } from './WeaponDefs'
 import { WeaponMaterials, buildWeaponModel, type WeaponModel } from './WeaponGeometry'
 import { Spring1, Spring3, wrapAngle } from './Recoil'
@@ -81,6 +81,44 @@ const _axis = new THREE.Vector3()
 const _scale = new THREE.Vector3()
 const _fwd = new THREE.Vector3(0, 0, -1)
 const _zAxis = new THREE.Vector3(0, 0, 1)
+
+/**
+ * Authored intensity of every lamp in the studio rig. `syncToEnvironment`
+ * scales the whole set by one factor, so the ratios between key, fill and rim
+ * survive whatever the coupling does to the weapon's exposure.
+ */
+const RIG = { key: 4.1, fill: 0.80, rim: 1.55, sunRim: 1.5, bounce: 0.30 } as const
+
+/**
+ * Sky-visibility probe directions, world space, and their weights.
+ *
+ * Fixed in world space on purpose: a view-dependent probe would change the
+ * weapon's exposure as the player turned on the spot, which reads as the rifle
+ * pulsing. Shipped engines sample a baked irradiance volume at the weapon's
+ * position for the same reason. Weighted toward the zenith because that is
+ * where most of an outdoor surface's sky irradiance comes from, and because
+ * "is there a roof over me" is the single strongest predictor of whether the
+ * frame around the weapon is an enclosed interior or an open exterior.
+ */
+const PROBE_DIRS: readonly (readonly [number, number, number, number])[] = (() => {
+  const out: [number, number, number, number][] = [[0, 1, 0, 2.0]]
+  for (const [polar, weight] of [[0.70, 1.5], [1.18, 1.0]] as const) {
+    const sp = Math.sin(polar)
+    const cp = Math.cos(polar)
+    for (let i = 0; i < 4; i++) {
+      const a = (i / 4) * Math.PI * 2 + (polar > 1 ? Math.PI / 4 : 0)
+      out.push([Math.cos(a) * sp, cp, Math.sin(a) * sp, weight])
+    }
+  }
+  return out
+})()
+
+const PROBE_RANGE = 15
+/** Hoisted: the sweep must not allocate a filter per ray. */
+const PROBE_FILTER: RaycastFilter = { characters: false }
+/** Rig scale when the weapon is fully enclosed, and when it is under open sky. */
+const ENV_FLOOR = 0.38
+const ENV_CEIL = 1.12
 
 function sampleTrack(keys: readonly Key[], t: number, outP: THREE.Vector3, outE: THREE.Euler): void {
   if (t <= keys[0].t) {
@@ -168,9 +206,24 @@ export class Viewmodel {
   private scopeMask!: THREE.Mesh
   private scopeMaskMat!: THREE.MeshBasicMaterial
   private keyLight!: THREE.DirectionalLight
+  private fillLight!: THREE.DirectionalLight
+  private rimLight!: THREE.DirectionalLight
+  private bounceLight!: THREE.HemisphereLight
   private sunRim!: THREE.DirectionalLight
   private studioEnv: THREE.Texture | null = null
   private studioTarget: THREE.WebGLRenderTarget | null = null
+
+  // Environment coupling. See `syncToEnvironment`.
+  private envScale = 1
+  private envTarget = 1
+  private envApplied = -1
+  private probeIndex = -1
+  private probeOpen = 0
+  private probeWeight = 0
+  private probeTimer = 1e3
+  private probed = false
+  private readonly probeAt = new THREE.Vector3()
+  private readonly probeDir = new THREE.Vector3()
   private aimLocalInv = new THREE.Matrix4()
   private adsPos = new THREE.Vector3()
   private adsQuat = new THREE.Quaternion()
@@ -229,7 +282,7 @@ export class Viewmodel {
     // Warm key, up and to the camera's left, angled back toward the eye.
     // Direction works out at roughly (0.48, -0.63, -0.61): 0.48 on the left
     // flank, 0.63 on the top faces, 0.61 on everything facing the camera.
-    const key = new THREE.DirectionalLight(0xfff2e2, 4.1)
+    const key = new THREE.DirectionalLight(0xfff2e2, RIG.key)
     key.position.set(-1.05, 1.40, 0.85)
     key.target = focus
     key.castShadow = true
@@ -259,23 +312,25 @@ export class Viewmodel {
     // ratio. Key to fill now runs about 5:1 rather than 2.5:1, which moves the
     // shaded flank down without moving the median -- the trade the round-3
     // brief asks for, rather than another swing of overall exposure.
-    const fill = new THREE.DirectionalLight(0x9fb6d6, 0.80)
+    const fill = new THREE.DirectionalLight(0x9fb6d6, RIG.fill)
     fill.position.set(1.30, -0.35, 0.95)
     fill.target = focus
     this.rig.add(fill)
+    this.fillLight = fill
 
     // Rim from above and beyond the muzzle. Draws the top edge of the
     // receiver, rail and barrel against whatever is behind them, which is what
     // stops the weapon merging with a dark wall.
-    const rim = new THREE.DirectionalLight(0xc6d8f2, 1.55)
+    const rim = new THREE.DirectionalLight(0xc6d8f2, RIG.rim)
     rim.position.set(0.55, 1.30, -2.20)
     rim.target = focus
     this.rig.add(rim)
+    this.rimLight = rim
 
     // Second rim, steered onto the real sun direction every frame. A weapon
     // backlit by a low sun with no edge highlight is the tell that the
     // viewmodel is lit by a rig that does not know where it is standing.
-    const sunRim = new THREE.DirectionalLight(0xffd7a4, 1.5)
+    const sunRim = new THREE.DirectionalLight(0xffd7a4, RIG.sunRim)
     sunRim.position.set(0, 2, -2)
     sunRim.target = focus
     this.rig.add(sunRim)
@@ -286,8 +341,9 @@ export class Viewmodel {
     // cannot be parented to a rig that rotates. Deliberately weak: a
     // hemisphere term reaches every surface regardless of orientation, so it
     // is the fastest way to flatten an object that is meant to have a ratio.
-    const bounce = new THREE.HemisphereLight(0x9db2cb, 0x3a3025, 0.30)
+    const bounce = new THREE.HemisphereLight(0x9db2cb, 0x3a3025, RIG.bounce)
     ctx.viewmodelScene.add(bounce)
+    this.bounceLight = bounce
 
     // Weapon space gets its own probe, always. Handing the sky PMREM to a
     // metalness-0.9 surface makes the weapon a mirror of the sky, and no amount
@@ -551,7 +607,8 @@ export class Viewmodel {
 
     // The rig follows the camera, so the sun rim has to be re-solved into rig
     // space every frame. Everything it touches is hoisted; this allocates
-    // nothing.
+    // nothing. Level comes first: the sun rim is scaled by it.
+    this.syncToEnvironment(dt)
     this.syncToSun()
 
     // --- blends -----------------------------------------------------------
@@ -872,12 +929,8 @@ export class Viewmodel {
   }
 
   /**
-   * Ties the fixed studio rig to the world it is standing in.
-   *
-   * Only colour and the sun rim's *direction* follow the world; intensity is
-   * deliberately constant. Modulating the rig by scene brightness is what
-   * produced a black rifle in the alley, and a viewmodel that dims with the
-   * environment is the one thing the reference games never do.
+   * Ties the studio rig's colour and its sun rim to the world it stands in.
+   * Overall level is handled separately, in `syncToEnvironment`.
    */
   syncToSun(): void {
     const lighting = this.ctx.services.lighting
@@ -900,7 +953,108 @@ export class Viewmodel {
     // key, so it is held down to a trim. The weapon's overall exposure stays
     // put while the sun still tells you which way it is coming from.
     const backlit = Math.min(1, Math.max(0, -this.sunLocal.z))
-    this.sunRim.intensity = 1.5 * elev * elev * (3 - 2 * elev) * (0.35 + 0.65 * backlit)
+    this.sunRim.intensity =
+      RIG.sunRim * elev * elev * (3 - 2 * elev) * (0.35 + 0.65 * backlit) * this.envScale
+  }
+
+  /**
+   * Partial coupling between the studio rig and the world's light level.
+   *
+   * Round 2 shipped a viewmodel whose rig was modulated by scene brightness and
+   * got a black silhouette in the alley; round 3 answered it by nailing the rig
+   * to a constant and got a chalk-white rifle in the same alley. Both are the
+   * same mistake at opposite ends: a viewmodel needs to *track* the light it
+   * stands in, between a floor and a ceiling, never all the way to either.
+   *
+   * The frames make the mechanism explicit. The post chain meters the frame and
+   * compensates exposure, so a fixed-radiance weapon is graded up in an
+   * enclosed shot and down in an open one — measured over the eight poses the
+   * weapon's screen luma ran 54.6 in the alley against a 47.6 scene, and 17.8
+   * in the plaza against a 68.3 scene. That is the *inverse* of the correct
+   * relationship, and it is not something a tone curve can undo: the weapon has
+   * to emit less light in a dark place so that the meter lifts weapon and world
+   * together instead of prising them apart.
+   *
+   * `PostFxService` exposes no meter reading, so the level is estimated from
+   * the world instead, by how much sky the player can see: rays into the upper
+   * hemisphere plus the level's own indoor volumes. Sky visibility is what
+   * actually separates the enclosed poses from the open ones, and unlike a
+   * sun-shadow test it does not collapse when the player stands in the shadow
+   * of a building on an open plaza — which is exactly the plaza pose.
+   *
+   * The sweep is one ray per frame and only runs when the player has moved or
+   * on a slow heartbeat, so the steady-state per-frame cost is zero.
+   */
+  syncToEnvironment(dt: number): void {
+    const first = !this.probed
+    this.stepProbe(dt)
+
+    // Snap on the first result so a capture that freezes early is never graded
+    // mid-blend, then follow slowly enough that walking through a doorway reads
+    // as an eye adapting rather than as a light switch.
+    if (first || dt <= 0) this.envScale = this.envTarget
+    else this.envScale += (this.envTarget - this.envScale) * (1 - Math.exp(-2.2 * dt))
+
+    if (Math.abs(this.envScale - this.envApplied) < 0.002) return
+    this.envApplied = this.envScale
+    this.keyLight.intensity = RIG.key * this.envScale
+    this.fillLight.intensity = RIG.fill * this.envScale
+    this.rimLight.intensity = RIG.rim * this.envScale
+    this.bounceLight.intensity = RIG.bounce * this.envScale
+    this.mats.setEnvironmentScale(this.envScale)
+  }
+
+  /**
+   * Advances the sky-visibility sweep by at most one ray.
+   *
+   * `PhysicsService.raycast` allocates its hit record, so this is deliberately
+   * not a per-frame path: a sweep starts only when the eye has moved 0.35m or
+   * once a second, and then retires one direction per frame. Standing still —
+   * which is every captured pose — it does nothing at all.
+   */
+  private stepProbe(dt: number): void {
+    const ctx = this.ctx
+    const eye = ctx.camera.position
+
+    if (this.probeIndex < 0) {
+      this.probeTimer += dt > 0 ? dt : 0
+      const moved = this.probed && this.probeAt.distanceToSquared(eye) > 0.1225
+      if (this.probed && !moved && this.probeTimer < 1) return
+      this.probeIndex = 0
+      this.probeOpen = 0
+      this.probeWeight = 0
+      this.probeTimer = 0
+      this.probeAt.copy(eye)
+      return
+    }
+
+    const phys = ctx.services.physics
+    const d = PROBE_DIRS[this.probeIndex]
+    if (phys) {
+      this.probeDir.set(d[0], d[1], d[2])
+      const hit = phys.raycast(this.probeAt, this.probeDir, PROBE_RANGE, PROBE_FILTER)
+      // Any hit means no sky down that direction, so a blocked ray is worth
+      // little however far away the thing blocking it is -- the small residual
+      // is the bounce off the surface it hit. Softening by distance only stops
+      // the estimate snapping as the player walks past a wall.
+      const open = hit ? 0.10 + 0.45 * Math.min(1, hit.distance / PROBE_RANGE) : 1
+      this.probeOpen += open * d[3]
+    } else {
+      this.probeOpen += d[3]
+    }
+    this.probeWeight += d[3]
+    this.probeIndex++
+
+    if (this.probeIndex < PROBE_DIRS.length) return
+    this.probeIndex = -1
+    let open = this.probeWeight > 0 ? this.probeOpen / this.probeWeight : 1
+    // A roofed volume the level has declared is authoritative: a room with a
+    // window can leak enough rays to read as open sky, and it is never lit
+    // like it.
+    if (ctx.services.level?.isIndoors(this.probeAt)) open = Math.min(open, 0.22)
+    const s = open * open * (3 - 2 * open)
+    this.envTarget = ENV_FLOOR + (ENV_CEIL - ENV_FLOOR) * s
+    this.probed = true
   }
 
   dispose(): void {

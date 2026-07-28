@@ -12,7 +12,7 @@
  * so the critic never grades a broken frame.
  */
 import { launch } from 'puppeteer-core'
-import { readdirSync, mkdirSync, existsSync, writeFileSync } from 'node:fs'
+import { readdirSync, mkdirSync, existsSync, writeFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
@@ -95,11 +95,21 @@ async function main() {
     }
   }
 
+  // An explicit, freshly created profile directory. Letting puppeteer manage
+  // its own temp profile intermittently fails to launch after many runs.
+  const profileDir = join(root, '.chrome-profile')
+  rmSync(profileDir, { recursive: true, force: true })
+  mkdirSync(profileDir, { recursive: true })
+
   const browser = await launch({
     executablePath: findChrome(),
     headless: true,
+    userDataDir: profileDir,
     args: [
       '--no-sandbox',
+      '--disable-crashpad',
+      '--disable-breakpad',
+      '--disable-dev-shm-usage',
       '--enable-gpu',
       '--use-angle=metal',
       '--enable-unsafe-swiftshader',

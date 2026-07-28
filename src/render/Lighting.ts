@@ -8,7 +8,8 @@ import { SkyOcclusion } from './lighting/SkyOcclusion'
 import { AerialPerspective } from './lighting/AerialPerspective'
 import {
   DEFAULT_TIME_OF_DAY, SKY_PARAMS, SKY_SCALE_VISIBLE,
-  betaMie, betaRayleigh, luminance, skyColor, sunBeamColor, sunDirectionFor, sunIntensity,
+  betaMie, betaRayleigh, luminance, skyColor, skyRadiance, skyShoulder,
+  sunBeamColor, sunDirectionFor, sunIntensity,
 } from './lighting/SkyModel'
 
 /**
@@ -130,6 +131,14 @@ const RESIDUAL_FOG_DENSITY = 0.0016
 const FOG_ROLLOFF = 0.26
 
 /**
+ * Rec. 709 luminance weights. The same triple appears in the aerial pass's GLSL
+ * and in the analysis harness; the roll-off has to be taken on the quantity the
+ * grade and the metrics are both measured in, or compressing it moves numbers
+ * nobody asked to move.
+ */
+const LUMA_WEIGHTS = new THREE.Vector3(0.2126, 0.7152, 0.0722)
+
+/**
  * Sun, sky, image-based ambient, the shadow cascade, volumetric shafts and the
  * pool of dynamic lights.
  *
@@ -183,7 +192,8 @@ export class LightingSystem implements System, LightingService {
   private readonly sunTint = new THREE.Color()
   private readonly ambientTint = new THREE.Color()
   private readonly bounceTint = new THREE.Color()
-  private readonly fogSample = new THREE.Color()
+  /** Pre-shoulder sky radiance for the current view direction, scene-referred. */
+  private readonly fogSample = new THREE.Vector3()
   private readonly muzzleColor = new THREE.Color(1.0, 0.86, 0.62)
   private readonly explosionColor = new THREE.Color(1.0, 0.52, 0.2)
   private readonly tmpDir = new THREE.Vector3()
@@ -309,7 +319,10 @@ export class LightingSystem implements System, LightingService {
     )
     this.hemisphere.groundColor.copy(this.bounceTint)
     // Enclosed surfaces fall back to bounce, and bounce is the colour of what
-    // it bounced off — never the blue of a sky they cannot see.
+    // it bounced off — never the blue of a sky they cannot see. Surfaces that
+    // *can* see the sky are a different case, and the ambient tint is handed
+    // over so the pass can mix towards it by how much sky each one sees: most
+    // of the lobe over an open street is sky, not road. See BOUNCE_SKY_SHARE.
     //
     // Its direction is the sun's azimuth reversed and tipped below the horizon.
     // A wall in shade is one whose normal points away from the sun, and what it
@@ -320,7 +333,7 @@ export class LightingSystem implements System, LightingService {
     // there is nothing left to bounce once it is down — unlike the enclosed
     // floor, which has to survive to keep rooms out of the black.
     this.tmpDir2.set(-this.sunDirection.x, -0.22, -this.sunDirection.z).normalize()
-    this.occlusion.setBounce(this.tmpDir2, this.bounceTint, horizonFade)
+    this.occlusion.setBounce(this.tmpDir2, this.bounceTint, this.ambientTint, horizonFade)
 
     for (const fill of this.interiorFills) fill.color.copy(this.bounceTint)
 
@@ -389,7 +402,12 @@ export class LightingSystem implements System, LightingService {
     this.tmpDir2.set(viewDirection.x, 0.055, viewDirection.z)
     if (this.tmpDir2.lengthSq() < 1e-6) this.tmpDir2.set(0, 1, 0)
     this.tmpDir2.normalize()
-    skyColor(this.tmpDir2, this.sunDirection, SKY_PARAMS, SKY_SCALE_VISIBLE * 0.92, this.fogSample)
+    // Pre-shoulder radiance, because the shoulder is applied below on luminance
+    // rather than per channel. skyColor() would shoulder each channel first and
+    // this would then compress them again — the double desaturation documented
+    // in AerialPerspective, which is what turned the haze grey.
+    skyRadiance(this.tmpDir2, this.sunDirection, SKY_PARAMS, this.fogSample)
+    this.fogSample.multiplyScalar(SKY_SCALE_VISIBLE * 0.92)
 
     // Looking into a low sun the horizon carries several times the radiance of
     // the sky behind the camera, and haze at that level bleaches every distant
@@ -397,11 +415,23 @@ export class LightingSystem implements System, LightingService {
     // both directions end up on the same near-white, which is the milky look.
     // A soft roll-off keeps the warm-into-the-sun, cool-away-from-it split that
     // is what aerial perspective is actually for.
-    const k = FOG_ROLLOFF
+    //
+    // Rolled off on luminance, with the sample's chromaticity carried straight
+    // through. Compressing each channel separately pulls the brightest one down
+    // hardest, which desaturates, and it was undoing the split this roll-off
+    // exists to protect: across the whole sweep from into-the-sun to away-from-
+    // it the result moved seven per cent in red over blue. It now moves the
+    // sixty-nine per cent the sky itself does, at the same luminance. This must
+    // stay algebraically identical to the GPU pass — the particle shaders and
+    // scene.fog read this colour and the lit world reads that one, and a frame
+    // where the two disagree has haze in two different colours at once.
+    const luma = Math.max(this.fogSample.dot(LUMA_WEIGHTS), 1e-5)
+    const shouldered = skyShoulder(luma)
+    const scale = shouldered / (1 + shouldered / FOG_ROLLOFF) / luma
     this.fogColor.setRGB(
-      this.fogSample.r / (1 + this.fogSample.r / k),
-      this.fogSample.g / (1 + this.fogSample.g / k),
-      this.fogSample.b / (1 + this.fogSample.b / k),
+      this.fogSample.x * scale,
+      this.fogSample.y * scale,
+      this.fogSample.z * scale,
       THREE.LinearSRGBColorSpace,
     )
   }

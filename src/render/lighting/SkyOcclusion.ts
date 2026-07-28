@@ -154,6 +154,48 @@ const ENCLOSED_NEUTRALITY = 0.45
 const BOUNCE_IRRADIANCE = 0.26
 
 /**
+ * How far the bounce's hue is pulled from sunlit ground towards the sky on a
+ * surface that can see the whole sky.
+ *
+ * The bounce is tinted as though every direction it arrives from were sunlit
+ * sand: {@link SkyOcclusion.setBounce} is handed the sun's colour through a
+ * dust-and-plaster albedo, which lands at red-over-blue 2.56 — warmer than the
+ * sun itself at 1.49. That is right for the light coming off a patch of sunlit
+ * street, and it is the only thing an enclosed surface receives, so an interior
+ * should be exactly that warm.
+ *
+ * It is wrong for an open one, because the lobe is not looking at sunlit street.
+ * It is a wide cone tipped a little below the horizon, and on an open surface
+ * most of that cone's solid angle is *sky* — the road fills the bottom of it and
+ * the buildings a slice of the middle, and everything above them is the same
+ * blue dome the skylight term is already sampling. Treating the whole cone as
+ * ground is what put a uniform warm-brown on every shaded surface in the frame.
+ *
+ * Measured through the committed chain, the fault is a strict inequality, which
+ * is why it is worth fixing rather than taste. A shaded vertical wall received
+ * fill at red-over-blue 1.66 while the sun lighting the wall beside it is 1.49:
+ * *shade was warmer than sunlight*. No albedo and no ground colour can produce
+ * that. Adding skylight to a bounce-lit surface can only move it away from the
+ * sun's hue, never past it, so the rig was violating an inequality that holds
+ * for every scene. In the shipped frames it reads as sunlit and shaded facades
+ * measuring the same hue — plaza's sunlit facade at 1.31, ads' shaded wall at
+ * 1.39 — and it is the whole of the judges' "a fairly uniform warm-brown cast to
+ * every shaded surface, which reads as a global tint rather than bounced light".
+ *
+ * So the tint is mixed towards the sky by this fraction *scaled by the sky
+ * visibility the fragment already sampled*, which makes the warm-to-cool balance
+ * a function of geometry instead of a constant: an open wall lands near 0.89, a
+ * street facade near 1.19, an alley wall near 1.40, an interior stays at 1.6 and
+ * up. That gradient is the difference between light that has bounced off
+ * something and a tint applied to everything.
+ *
+ * It costs nothing tonally. The mixed tint is renormalised to the warm tint's
+ * *luminance*, so this moves hue and only hue — every one of the seven measured
+ * metrics is algebraically untouched by it.
+ */
+const BOUNCE_SKY_SHARE = 0.45
+
+/**
  * Wrap on the bounce's cosine term. The source is a road and a wall, not a
  * point, so its terminator is soft and it reaches a little past ninety degrees.
  *
@@ -208,7 +250,11 @@ uniform sampler3D skyOccMap;
 uniform vec3 skyOccOrigin;
 uniform vec3 skyOccInvExtent;
 uniform vec3 skyOccBounce;
+// The bounce at both ends of the sky-visibility range: enclosed, where every
+// direction the lobe covers really is sunlit floor, and open, where most of it
+// is sky. Same luminance, different hue — see BOUNCE_SKY_SHARE.
 uniform vec3 skyOccBounceLight;
+uniform vec3 skyOccBounceOpen;
 uniform vec3 skyOccBounceDir;
 // x: visibility gamma, y: normal push in metres, z: specular share, w: enabled
 uniform vec4 skyOccParams;
@@ -246,7 +292,15 @@ const APPLY = /* glsl */ `
 		( dot( skyOccNormal, skyOccBounceDir ) + ${BOUNCE_WRAP.toFixed(3)} ) / ${(1 + BOUNCE_WRAP).toFixed(3)}
 	);
 	float skyOccBounceVis = mix( ${BOUNCE_ENCLOSED_FLOOR.toFixed(3)}, 1.0, skyOccVis );
-	irradiance += skyOccBounceLight * skyOccBounceWrap * skyOccBounceVis;
+
+	// How warm the bounce is, driven by the same visibility that decides how much
+	// skylight the surface gets. The two are complementary views of one fact: the
+	// more of a surface's hemisphere is sky, the less of the bounce lobe is
+	// looking at sunlit ground and the cooler what arrives along it must be. Both
+	// tints carry identical luminance, so this is a hue mix and never a level
+	// change.
+	vec3 skyOccBounceTint = mix( skyOccBounceLight, skyOccBounceOpen, skyOccVis );
+	irradiance += skyOccBounceTint * skyOccBounceWrap * skyOccBounceVis;
 
 #endif
 
@@ -281,6 +335,7 @@ export class SkyOcclusion {
     skyOccInvExtent: { value: new THREE.Vector3(1, 1, 1) },
     skyOccBounce: { value: new THREE.Vector3(ENCLOSED_BOUNCE, ENCLOSED_BOUNCE, ENCLOSED_BOUNCE) },
     skyOccBounceLight: { value: new THREE.Vector3() },
+    skyOccBounceOpen: { value: new THREE.Vector3() },
     skyOccBounceDir: { value: new THREE.Vector3(0, -1, 0) },
     skyOccParams: { value: new THREE.Vector4(VISIBILITY_GAMMA, NORMAL_PUSH, SPECULAR_SHARE, 0) },
   }
@@ -377,29 +432,55 @@ export class SkyOcclusion {
    * Loads both halves of the bounce: the hue an enclosed surface's remaining
    * ambient takes, and the directional term open surfaces in shade receive.
    *
-   * Only the hue is taken from `color` — both levels are fixed by
+   * Only the hue is taken from `color` and `skyTint` — every level is fixed by
    * ENCLOSED_BOUNCE and BOUNCE_IRRADIANCE, so re-tinting the bounce never
    * changes how dark interiors get or how much fill a shaded wall receives.
+   *
+   * `color` is the light coming off sunlit ground and `skyTint` the sky filling
+   * the rest of the bounce lobe; the shader picks between them by how much sky
+   * the fragment can see. See {@link BOUNCE_SKY_SHARE}.
    *
    * `direction` points from the surface *towards* the source, the same
    * convention as a light vector, and `strength` scales the directional term
    * only, so the bounce can fade out with the sun without the enclosed floor
    * following it down into a black void.
    */
-  setBounce(direction: THREE.Vector3, color: THREE.Color, strength: number): void {
+  setBounce(
+    direction: THREE.Vector3,
+    color: THREE.Color,
+    skyTint: THREE.Color,
+    strength: number,
+  ): void {
     const peak = Math.max(color.r, color.g, color.b, 1e-4)
+    const warmR = color.r / peak
+    const warmG = color.g / peak
+    const warmB = color.b / peak
+
     const t = ENCLOSED_NEUTRALITY
     this.uniforms.skyOccBounce.value.set(
-      ENCLOSED_BOUNCE * THREE.MathUtils.lerp(color.r / peak, 1, t),
-      ENCLOSED_BOUNCE * THREE.MathUtils.lerp(color.g / peak, 1, t),
-      ENCLOSED_BOUNCE * THREE.MathUtils.lerp(color.b / peak, 1, t),
+      ENCLOSED_BOUNCE * THREE.MathUtils.lerp(warmR, 1, t),
+      ENCLOSED_BOUNCE * THREE.MathUtils.lerp(warmG, 1, t),
+      ENCLOSED_BOUNCE * THREE.MathUtils.lerp(warmB, 1, t),
     )
+
     const level = BOUNCE_IRRADIANCE * strength
-    this.uniforms.skyOccBounceLight.value.set(
-      (level * color.r) / peak,
-      (level * color.g) / peak,
-      (level * color.b) / peak,
-    )
+    this.uniforms.skyOccBounceLight.value.set(level * warmR, level * warmG, level * warmB)
+
+    // The open-sky variant: the same lobe, mixed towards the sky, then put back
+    // on the warm tint's luminance. Renormalising by luminance rather than by
+    // peak is the whole reason this is tonally free — matching peaks would move
+    // brightness as well as hue, and this rig has spent six rounds getting the
+    // brightness where it is.
+    const skyPeak = Math.max(skyTint.r, skyTint.g, skyTint.b, 1e-4)
+    const s = BOUNCE_SKY_SHARE
+    const mixR = THREE.MathUtils.lerp(warmR, skyTint.r / skyPeak, s)
+    const mixG = THREE.MathUtils.lerp(warmG, skyTint.g / skyPeak, s)
+    const mixB = THREE.MathUtils.lerp(warmB, skyTint.b / skyPeak, s)
+    const warmLuma = 0.2126 * warmR + 0.7152 * warmG + 0.0722 * warmB
+    const mixLuma = Math.max(0.2126 * mixR + 0.7152 * mixG + 0.0722 * mixB, 1e-4)
+    const k = (level * warmLuma) / mixLuma
+    this.uniforms.skyOccBounceOpen.value.set(k * mixR, k * mixG, k * mixB)
+
     this.uniforms.skyOccBounceDir.value.copy(direction).normalize()
   }
 

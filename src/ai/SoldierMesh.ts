@@ -179,23 +179,68 @@ export function makePalette(rng: Rand): Palette {
   // — coyote brown over green camo, ranger green over tan — because that is how
   // real loadouts are issued and because the hue break is what keeps carrier,
   // pouches, gloves and knee pads from merging into the sleeve once the light
-  // drops. It is matched in value to the camo's own shadow tone rather than
-  // pushed darker: buying the separation with another stop of black is how you
-  // end up with the featureless silhouette this palette exists to avoid.
+  // drops.
+  //
+  // Hue alone did not do it. Authored as fixed hexes the kit landed anywhere
+  // from 0.45 stops under the uniform (olive) to 1.08 (desert) purely as a
+  // side effect of which camo it happened to be paired with, and the shallow
+  // end of that range is not separation at all: on `shots/iter7/firefight.png`
+  // a carrier panel measured 85/255 against a sleeve at 73, half a stop apart,
+  // and the two read as one mass with faint rectangles drawn on it. Anchoring
+  // the kit's *value* to the uniform it is worn over and keeping only its hue
+  // from the hex gives every scheme the same separation.
+  //
+  // This is not the "another stop of black" the previous note warned against.
+  // That failure is the whole figure going dark and losing internal detail;
+  // dropping the kit while the uniform stays put is the opposite operation —
+  // it spends contrast on the boundary between carrier and sleeve, which is
+  // exactly the boundary a viewer reads a soldier by.
   const kit = scheme === 1 ? new THREE.Color(0x585e4c) : new THREE.Color(0x6a5647)
   return {
     camo,
     camoScale: rng.range(11, 15),
-    webbing: new THREE.Color().copy(kit).multiplyScalar(rng.range(0.9, 1.1)),
-    // The helmet cover sits between uniform and kit in value so the head reads
-    // as its own shape against the shoulders at gameplay distance. At 0.88 it
-    // was within a fifth of a stop of the uniform and the two ran together.
-    helmet: new THREE.Color().copy(camo[0]).multiplyScalar(0.74),
+    webbing: reValue(kit, camo[0], KIT_VALUE).multiplyScalar(rng.range(0.9, 1.1)),
+    // The helmet cover sits well under the uniform so the head reads as its own
+    // shape against the shoulders at gameplay distance. 0.88 was within a fifth
+    // of a stop and the two ran together; 0.74 was still only 0.43 stops, which
+    // survives neither aerial haze nor a figure eighty pixels tall.
+    helmet: new THREE.Color().copy(camo[0]).multiplyScalar(0.55),
     boot: new THREE.Color(0x4a4238).multiplyScalar(rng.range(0.88, 1.15)),
     skin: new THREE.Color().setHSL(0.072, rng.range(0.3, 0.44), rng.range(0.4, 0.56)),
-    gun: new THREE.Color(0x565a60),
-    gunPolymer: new THREE.Color(0x494b41),
+    // Matte black anodising and phosphate, not bare steel. 0x565a60 is a light
+    // neutral grey; at metalness 0.72 that is an 11% reflector, so gunmetal sat
+    // only 0.45 stops under the uniform in the olive scheme and went straight
+    // past it wherever the sun caught it. On `shots/iter7/firefight.png` the
+    // night-vision mount over the brow measured 152/255 against a helmet shell
+    // at 100 and a face at 90 — the brightest thing on the head, and neutral
+    // grey where everything around it is warm. Modern kit is the darkest thing
+    // a soldier wears, and on the rifle that darkness is the silhouette.
+    gun: new THREE.Color(0x3a3d42),
+    gunPolymer: new THREE.Color(0x33352f),
   }
+}
+
+/**
+ * Kit value as a fraction of the uniform it is worn over: 1.15 stops under.
+ * Enough that carrier, pouches and gloves cut against the sleeve on a figure
+ * eighty pixels tall, not so much that the kit becomes a hole in it — the
+ * darkest scheme lands at 0.063 linear albedo, still a colour and not a void.
+ */
+const KIT_VALUE = 0.45
+
+/** Rec.709 luminance of a colour already in the linear working space. */
+function luminance(c: THREE.Color): number {
+  return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b
+}
+
+/**
+ * Returns `hue` scaled to `fraction` of `against`'s luminance — chroma from one
+ * colour, value from another. Both are linear-space by the time they get here,
+ * so this is a plain multiply rather than anything perceptual.
+ */
+function reValue(hue: THREE.Color, against: THREE.Color, fraction: number): THREE.Color {
+  const out = new THREE.Color().copy(hue)
+  return out.multiplyScalar((luminance(against) * fraction) / Math.max(1e-4, luminance(hue)))
 }
 
 // --------------------------------------------------------------------------
@@ -338,9 +383,17 @@ class SoldierBuilder {
     // Grime pooling toward the boots and the seat of the trousers.
     const grime = (o.grime ?? 1) * Math.max(0, 1 - y / 0.9) * 0.22 * (0.4 + 0.6 * fbm(x * 9, y * 9, z * 9, 2))
 
+    // Contact shadow under kit. The underside of a pouch, a strap, a magazine
+    // or a mag well is a hard dark line against whatever it is worn over, and
+    // that line is most of what makes gear read as layered at gameplay distance
+    // rather than as rectangles printed on a torso. It goes on after the floor
+    // rather than into `ao`: the floor is there so occlusion deepens a crevice
+    // instead of erasing a surface, and a seam is meant to be the crevice.
+    const seam = o.mat === 'webbing' || o.mat === 'gunmetal' ? Math.max(0, -ny) * 0.22 : 0
+
     const speckle = 0.9 + 0.2 * fbm(x * 60 + 17, y * 60 + 3, z * 60 + 29, 2)
     // Floor the modulation: occlusion should deepen a crevice, not erase it.
-    const k = Math.max(0.42, ao * speckle * (1 + wear) * (1 - grime))
+    const k = Math.max(0.42, ao * speckle * (1 + wear) * (1 - grime)) * (1 - seam)
     return [c.r * k, c.g * k, c.b * k]
   }
 

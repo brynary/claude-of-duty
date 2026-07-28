@@ -3,11 +3,11 @@ import type { MaterialName } from '../render/MaterialNames'
 import type { Rand } from '../core/Rand'
 import type { Surface } from '../core/Types'
 import {
-  Builder, CHAMFER, DOOR_H, DOOR_W, PARAPET_H, SILL_H, SLAB_T, STOREY, WALL_T, WINDOW_H,
+  Builder, CHAMFER, DOOR_H, DOOR_W, PARAPET_H, SILL_H, SLAB_T, STOREY, UP, WALL_T, WINDOW_H,
   catenary, chamferBox, clothQuad, cylinderGeom, decalQuad, impactChip, plainBox, rampPrism,
   sphereGeom, rotRectSdf,
 } from './Kit'
-import { groundHeight } from './Terrain'
+import { groundHeight, settleHeight } from './Terrain'
 
 /**
  * The modular architecture kit and the district's building list.
@@ -112,6 +112,18 @@ export interface WallSpec {
    * already carry their own pier rhythm and coping.
    */
   plain?: boolean
+  /**
+   * Dresses the room side of the panel as well as the street side. Exterior
+   * walls only ever carried relief on the face they were authored from, so the
+   * inside of every enterable building was a bare plane — which is most of what
+   * the interior camera sees.
+   */
+  dressInside?: boolean
+  /**
+   * True on storeys above the ground. Projecting window boxes belong upstairs
+   * and canopies belong downstairs; the wall has no other way to tell.
+   */
+  upperFloor?: boolean
 }
 
 /**
@@ -174,6 +186,386 @@ function wallLamp(b: Builder, x: number, y: number, out: number): void {
 function xform(x: number, y: number, z: number, yaw = 0, pitch = 0, roll = 0): THREE.Matrix4 {
   const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(pitch, yaw, roll, 'YXZ'))
   return new THREE.Matrix4().compose(new THREE.Vector3(x, y, z), q, new THREE.Vector3(1, 1, 1))
+}
+
+const _ONE = new THREE.Vector3(1, 1, 1)
+
+/**
+ * A round member spanning two points in the current local frame.
+ *
+ * Diagonals — awning stays, aerial guys, bracing — are the only lines on a
+ * facade that are neither horizontal nor vertical, which is exactly why they
+ * break up a wall so effectively. Authoring them by hand from an Euler triple
+ * is where the sign errors live, so this takes the two ends instead.
+ */
+function strut(
+  b: Builder, mat: MaterialName,
+  ax: number, ay: number, az: number,
+  cx: number, cy: number, cz: number,
+  r: number, seg = 4,
+): void {
+  const dir = new THREE.Vector3(cx - ax, cy - ay, cz - az)
+  const len = dir.length()
+  if (len < 1e-4) return
+  const q = new THREE.Quaternion().setFromUnitVectors(UP, dir.divideScalar(len))
+  const mid = new THREE.Vector3((ax + cx) / 2, (ay + cy) / 2, (az + cz) / 2)
+  b.geom(mat, cylinderGeom(r, r, len, seg), new THREE.Matrix4().compose(mid, q, _ONE))
+}
+
+/**
+ * A split-system condenser bracketed to the wall, two metres up.
+ *
+ * Nothing already on these facades projects more than 15 cm, and at the 15-30 m
+ * the graded cameras work at, 15 cm of relief is a one-pixel shadow. This
+ * stands 40 cm off the render, is nearly a metre wide, and throws a hard
+ * rectangle of shade across the wall under it — which is the scale of incident
+ * that actually reads as depth at that distance.
+ */
+function wallCondenser(b: Builder, x: number, y: number, out: number, rng: Rand): void {
+  const w = rng.range(0.7, 0.92)
+  const h = rng.range(0.48, 0.62)
+  const dp = 0.3
+  const z = out - 0.08 - dp / 2
+  // Angle brackets under it, with a diagonal stay back to the wall.
+  for (const sx of [-1, 1]) {
+    const bx = x + sx * (w / 2 - 0.08)
+    b.slab('metalRusted', 0.05, 0.045, dp + 0.14, bx, y - h / 2 - 0.03, out - (dp + 0.14) / 2)
+    strut(b, 'metalRusted', bx, y - h / 2 - 0.05, out - dp - 0.06, bx, y - h / 2 - 0.42, out - 0.02, 0.014)
+  }
+  b.box('metalPainted', w, h, dp, x, y, z, 0, 0.022)
+  b.slab('metalPainted', w + 0.03, 0.022, dp + 0.03, x, y + h / 2 - 0.02, z)
+  // Discharge guard: a proud ring with radial bars over a recessed fan.
+  const r = Math.min(0.19, h * 0.38)
+  b.geom('metalRusted', cylinderGeom(r, r, 0.04, 12), xform(x, y, z - dp / 2 + 0.02, 0, Math.PI / 2))
+  b.geom('metalRusted', cylinderGeom(r + 0.03, r + 0.03, 0.028, 14, false), xform(x, y, z - dp / 2 - 0.02, 0, Math.PI / 2))
+  for (let k = 0; k < 4; k++) {
+    b.geom('metalRusted', plainBox(r * 2, 0.013, 0.013), xform(x, y, z - dp / 2 - 0.03, 0, 0, (k * Math.PI) / 4))
+  }
+  // Lagged refrigerant pair elbowing back into the wall, and the condensate
+  // trail it has been washing down the render for years.
+  for (const off of [-0.05, 0.05]) {
+    b.geom('metalPainted', cylinderGeom(0.025, 0.025, 0.34, 5), xform(x + w / 2 + 0.02, y - 0.1 + off, z, 0, 0, Math.PI / 2))
+  }
+  b.geom('dirt', decalQuad(w * 0.55, rng.range(0.9, 1.9), 0.3, x * 11 + y), xform(x + rng.spread(0.1), y - h / 2 - 0.8, out - 0.013))
+}
+
+/**
+ * A latticed timber window box projecting from an upper storey.
+ *
+ * The regional signature, and by a distance the strongest thing that can be put
+ * on a blank upper facade: half a metre of projection gives it a lit top, two
+ * shaded returns and a cast shadow, and the lattice carries relief finer than
+ * anything else on the building, so it holds up both at 30 m and at 3 m.
+ */
+function mashrabiya(
+  b: Builder, trim: MaterialName, x: number, sill: number, w: number, h: number, out: number, rng: Rand,
+): void {
+  const proj = rng.range(0.46, 0.64)
+  const front = out - proj
+  const cy = sill + h / 2
+  // Stone corbels and the timber sole plate they carry.
+  for (const sx of [-1, 1]) {
+    b.slab(trim, 0.14, 0.22, proj + 0.02, x + sx * (w / 2 - 0.12), sill - 0.16, out - (proj + 0.02) / 2)
+  }
+  b.slab('woodPainted', w + 0.14, 0.085, proj + 0.1, x, sill - 0.02, out - (proj + 0.1) / 2)
+  // Corner posts front and back.
+  for (const sx of [-1, 1]) {
+    b.slab('woodPainted', 0.07, h, 0.07, x + sx * (w / 2 - 0.035), cy, out - 0.045)
+    b.slab('woodPainted', 0.07, h, 0.07, x + sx * (w / 2 - 0.035), cy, front + 0.04)
+  }
+  // Lattice across the front and both returns.
+  const cols = Math.max(5, Math.round(w / 0.17))
+  const rows = Math.max(4, Math.round(h / 0.2))
+  for (let i = 1; i < cols; i++) {
+    b.plate('woodPainted', 0.026, h - 0.1, 0.028, x - w / 2 + (w * i) / cols, cy, front + 0.02)
+  }
+  for (let j = 1; j < rows; j++) {
+    b.plate('woodPainted', w - 0.07, 0.024, 0.028, x, sill + (h * j) / rows, front + 0.02)
+  }
+  const rets = Math.max(2, Math.round(proj / 0.16))
+  for (const sx of [-1, 1]) {
+    const px = x + sx * (w / 2 - 0.03)
+    for (let i = 1; i < rets; i++) {
+      b.plate('woodPainted', 0.026, h - 0.1, 0.026, px, cy, front + (proj * i) / rets)
+    }
+    for (let j = 1; j < rows; j++) {
+      b.plate('woodPainted', 0.026, 0.024, proj - 0.08, px, sill + (h * j) / rows, out - proj / 2)
+    }
+  }
+  // Pitched lid with an overhang, and a rail under it.
+  b.slab('metalCorrugated', w + 0.2, 0.035, proj + 0.16, x, sill + h + 0.04, out - (proj + 0.16) / 2, 0)
+  b.slab('woodPainted', w + 0.1, 0.075, 0.08, x, sill + h - 0.02, front + 0.04)
+  // Rust wash off the lid edge.
+  b.geom('dirt', decalQuad(w * 0.9, 0.5, 0.26, x * 5 + sill), xform(x, sill - 0.45, out - 0.012))
+}
+
+/**
+ * A pitched sheet canopy over a ground-floor opening, on angle brackets.
+ *
+ * A canopy is worth more than its own silhouette: it lays a hard diagonal band
+ * of shade down the wall and across the pavement in front of the shop, which is
+ * luminance variation no amount of surface detail produces.
+ */
+function shopCanopy(b: Builder, x: number, top: number, w: number, out: number, rng: Rand): void {
+  // Capped at 1.25 m: the alley is under 3 m wide and canopies on both sides
+  // would meet over the middle of it.
+  const proj = rng.range(0.9, 1.25)
+  const drop = rng.range(0.16, 0.34)
+  const y = top + rng.range(0.18, 0.36)
+  const cw = w + rng.range(0.3, 0.7)
+  const run = Math.hypot(proj, drop)
+  for (const sx of [-1, 1]) {
+    const bx = x + sx * (cw / 2 - 0.09)
+    b.slab('metalRusted', 0.045, 0.045, proj, bx, y - drop / 2, out - proj / 2)
+    strut(b, 'metalRusted', bx, y - drop, out - proj + 0.03, bx, y + 0.52, out - 0.02, 0.015)
+  }
+  // The sheet itself, pitched so the outward edge is the low one.
+  b.geom('metalCorrugated', chamferBox(cw, 0.035, run, 0.009),
+    xform(x, y - drop / 2, out - proj / 2, 0, -Math.atan2(drop, proj)))
+  // Fascia board along the drip edge, and a purlin behind it.
+  b.slab('woodPainted', cw + 0.04, 0.11, 0.035, x, y - drop - 0.05, out - proj)
+  b.slab('metalRusted', cw, 0.045, 0.045, x, y - drop * 0.45 + 0.05, out - proj * 0.5)
+  b.geom('dirt', decalQuad(cw * 0.8, 0.4, 0.24, x * 3 + top), xform(x, y + 0.28, out - 0.013))
+}
+
+/**
+ * The spill of broken masonry that collects where a wall meets the ground.
+ *
+ * Sand is already banked against the building footprints, but sand is smooth
+ * and the junction still resolved as one clean ruled line where the wall met
+ * the paving. What breaks that line is hard rubbish with its own edges: fallen
+ * blocks, spalled render, mortar crumb and a weed in the gap. Every piece sits
+ * half buried, so the line the eye follows along the base is broken rather than
+ * softened.
+ */
+function baseSpill(b: Builder, s: WallSpec, L: number, T: number, rng: Rand): void {
+  const out = -T / 2
+  const probe = new THREE.Vector3()
+  /**
+   * Local y of the drawn ground under a point on this wall.
+   *
+   * A building's base sits on the *highest* terrain sample under its footprint,
+   * so local y = 0 stands as much as 30 cm above the ground at the low corner.
+   * Spilling rubble at a fixed local height would float it exactly where the
+   * near-field cameras look. Only yaw is ever pushed, so world y and local y
+   * stay parallel and one probe per piece is enough.
+   */
+  const drop = (x: number, z: number): number => {
+    b.localToWorld(x, 0, z, probe)
+    return settleHeight(probe.x, probe.z, 0.3, 0.01) - probe.y
+  }
+  let x = rng.range(0.3, 1.6)
+  while (x < L - 0.25) {
+    const kind = rng.next()
+    const z = out - rng.range(0.06, 0.34)
+    const y0 = drop(x, z)
+    if (kind < 0.42) {
+      // A fallen block, part sunk and rotated off the wall line. Built from the
+      // wall's own stone, so it reads as having come off this building — and so
+      // it lands in a batch the block already has and still casts a contact
+      // shadow, which `concreteRubble` (excluded from the shadow pass because
+      // it also carries flat spall sheets) would not.
+      const bh = rng.range(0.12, 0.2)
+      b.geom(rng.bool(0.5) ? s.trim : s.mat, chamferBox(rng.range(0.22, 0.42), bh, rng.range(0.15, 0.26), 0.018),
+        xform(x, y0 + bh * rng.range(0.24, 0.42), z, rng.range(0, Math.PI), rng.spread(0.22), rng.spread(0.28)))
+    } else if (kind < 0.68) {
+      // Crumb: three or four chips too small to be worth a chamfer.
+      for (let i = 0; i < rng.int(3, 5); i++) {
+        const s = rng.range(0.05, 0.12)
+        b.geom('concreteRubble', plainBox(s, s * rng.range(0.5, 0.9), s * rng.range(0.7, 1.3)),
+          xform(x + rng.spread(0.32), y0 + s * 0.28, z + rng.spread(0.16),
+            rng.range(0, Math.PI), rng.spread(0.4), rng.spread(0.4)))
+      }
+    } else if (kind < 0.8) {
+      // A wedge of spoil banked into the angle, sloping up to the wall.
+      const zc = out - rng.range(0.15, 0.28)
+      b.geom('dirt', rampPrism(rng.range(0.5, 1.3), rng.range(0.07, 0.16), rng.range(0.3, 0.55)),
+        xform(x, drop(x, zc) - 0.03, zc, rng.spread(0.12)))
+    }
+    x += rng.range(0.9, 2.3)
+  }
+}
+
+/**
+ * Coping laid as individual stones rather than one extruded band.
+ *
+ * A parapet is the longest straight line any of these buildings puts against
+ * the sky, and running it as a single box gave every roof a ruler edge fourteen
+ * metres long. Laying it as stones with joints, height jitter, a few gone and a
+ * few slumped breaks that line at the frequency masonry actually breaks it.
+ */
+function copingRun(b: Builder, trim: MaterialName, L: number, top: number, pt: number, rng: Rand): void {
+  let x = 0
+  while (x < L - 0.1) {
+    const len = Math.min(L - x, rng.range(0.5, 1.15))
+    const cx = x + len / 2
+    x += len + 0.014
+    if (len < 0.2 || rng.bool(0.06)) continue
+    const slumped = rng.bool(0.11)
+    const dy = slumped ? -rng.range(0.03, 0.07) : rng.spread(0.014)
+    const roll = slumped ? rng.spread(0.055) : rng.spread(0.012)
+    b.geom(trim, chamferBox(len - 0.022, 0.095, pt + rng.range(0.1, 0.2), 0.026),
+      xform(cx, top + 0.05 + dy, rng.spread(0.015), rng.spread(0.022), 0, roll))
+  }
+}
+
+/**
+ * What sits on a roof parapet: scupper spouts through it, and every few metres
+ * something standing on the coping. These are silhouettes against sky, so they
+ * cost nothing to read and there is no distance at which they wash out.
+ */
+function parapetClutter(b: Builder, L: number, top: number, pt: number, rng: Rand): void {
+  // Scuppers: a short spout through the base of the parapet, with the stain it
+  // has been throwing down the wall below it.
+  let sx = rng.range(1.2, 3.5)
+  while (sx < L - 0.8) {
+    b.geom('metalRusted', cylinderGeom(0.05, 0.05, pt + 0.36, 6), xform(sx, 0.16, -0.06, 0, Math.PI / 2))
+    b.slab('concreteRubble', 0.34, 0.05, 0.14, sx, 0.02, -pt / 2 - 0.04)
+    sx += rng.range(3.6, 7.0)
+  }
+  let x = rng.range(0.9, 2.8)
+  while (x < L - 0.9) {
+    const kind = rng.next()
+    if (kind < 0.3) {
+      // Spare blocks stacked on the coping and forgotten.
+      const n = rng.int(2, 4)
+      for (let i = 0; i < n; i++) {
+        b.box('concreteRubble', rng.range(0.32, 0.44), 0.17, 0.2,
+          x + rng.spread(0.06), top + 0.19 + i * 0.176, rng.spread(0.05), rng.spread(0.45), 0.015)
+      }
+    } else if (kind < 0.56) {
+      // A pole lashed to the parapet with a stay wire running off it.
+      const h = rng.range(1.2, 2.4)
+      b.geom('woodPainted', cylinderGeom(0.042, 0.052, h, 6),
+        xform(x, top + 0.1 + h / 2, -0.03, 0, rng.spread(0.05), rng.spread(0.07)))
+      for (const t of [0.18, 0.52]) {
+        b.slab('metalRusted', 0.14, 0.045, 0.05, x, top + 0.1 + h * t, -0.03)
+      }
+      strut(b, 'metalRusted', x, top + 0.08 + h * 0.94, -0.03,
+        x + rng.range(1.3, 2.8) * (rng.bool() ? 1 : -1), top + 0.06, rng.spread(0.12), 0.007, 3)
+    } else if (kind < 0.74) {
+      // Conduit hooked over the coping and dropping down the outer face.
+      const drop = rng.range(1.1, 2.6)
+      b.geom('metalPainted', cylinderGeom(0.022, 0.022, drop, 5), xform(x, top - drop / 2 + 0.06, -pt / 2 - 0.05))
+      b.geom('metalPainted', cylinderGeom(0.022, 0.022, pt + 0.2, 5), xform(x, top + 0.11, 0, 0, Math.PI / 2))
+      b.slab('metalRusted', 0.07, 0.05, 0.06, x, top - drop * 0.55, -pt / 2 - 0.03)
+    } else if (kind < 0.88) {
+      // A dish on a parapet bracket, cocked at the sky.
+      const r = rng.range(0.28, 0.42)
+      b.slab('metalRusted', 0.09, 0.5, 0.09, x, top + 0.25, 0)
+      b.geom('metalPainted', sphereGeom(r, 12, 8, Math.PI * 2, 0.6),
+        xform(x, top + 0.62, -0.05, rng.range(-0.7, 0.7), Math.PI * 0.6))
+      b.slab('metalRusted', 0.22, 0.05, 0.22, x, top + 0.1, 0)
+    }
+    x += rng.range(2.3, 5.6)
+  }
+}
+
+/**
+ * Relief on the room side of an exterior wall.
+ *
+ * Everything `buildWall` emits below the opening loop dresses the street face
+ * only, so the inside of an enterable building was a bare panel carrying
+ * nothing but its albedo. A skirting, a picture rail, a surface conduit run and
+ * a couple of patches where the plaster has come off give that face the two
+ * horizontals and the broken field the outside has had for three iterations.
+ */
+function dressInnerFace(b: Builder, s: WallSpec, list: Opening[]): void {
+  const T = s.thickness
+  const H = s.height
+  const L = s.length
+  const rng = s.rng
+  const inn = T / 2
+  const clear = (px: number, py: number, pad: number): boolean =>
+    !list.some((o) => px > o.at - o.width / 2 - pad && px < o.at + o.width / 2 + pad
+      && py > o.sill - pad && py < o.sill + o.height + pad)
+
+  /**
+   * The clear runs at height `y`, as start/end pairs. A skirting or a conduit
+   * drawn straight across the panel would run over the doorways and in front of
+   * the glazing, which is worse than not drawing it at all.
+   */
+  const spans = (y: number, pad: number): [number, number][] => {
+    const cuts = list
+      .filter((o) => y > o.sill - pad && y < o.sill + o.height + pad)
+      .map((o) => [o.at - o.width / 2 - pad, o.at + o.width / 2 + pad] as [number, number])
+      .sort((a, c) => a[0] - c[0])
+    const out: [number, number][] = []
+    let at = 0
+    for (const [c0, c1] of cuts) {
+      if (c0 - at > 0.12) out.push([at, c0])
+      at = Math.max(at, c1)
+    }
+    if (L - at > 0.12) out.push([at, L])
+    return out
+  }
+  const band = (mat: MaterialName, y: number, h: number, dep: number, z: number): void => {
+    for (const [a, c] of spans(y, 0.06)) b.slab(mat, c - a, h, dep, (a + c) / 2, y, z)
+  }
+
+  // Skirting, and a picture rail at door head height.
+  band(s.trim, 0.075, 0.15, 0.035, inn + 0.018)
+  band(s.trim, Math.min(H - 0.35, 2.05), 0.055, 0.05, inn + 0.025)
+
+  // Plaster gone in patches, exposing coursed blockwork with a real arris on
+  // every unit. Two horizontals and a field of 20 cm courses is what turns this
+  // from a painted plane into a surface.
+  for (let i = 0; i < Math.max(1, Math.round(L * 0.28)); i++) {
+    const pw = rng.range(0.7, 1.9)
+    const ph = rng.range(0.5, 1.4)
+    const px = rng.range(pw / 2 + 0.1, Math.max(pw / 2 + 0.2, L - pw / 2 - 0.1))
+    const py = rng.range(ph / 2 + 0.25, Math.max(ph / 2 + 0.3, H - ph / 2 - 0.25))
+    if (!clear(px, py, 0.25)) continue
+    const courses = Math.max(2, Math.round(ph / 0.21))
+    const chH = ph / courses
+    for (let k = 0; k < courses; k++) {
+      const y = py - ph / 2 + (k + 0.5) * chH
+      let u = px - pw / 2 + (k % 2 === 0 ? 0 : rng.range(0.1, 0.22))
+      while (u < px + pw / 2 - 0.1) {
+        const bl = Math.min(px + pw / 2 - u, rng.range(0.24, 0.44))
+        // Set back 1.5 cm behind the plaster line: losing a skim coat exposes
+        // blockwork that is *below* the finished face, and a patch standing
+        // proud of the wall reads as tiles stuck on rather than plaster gone.
+        b.geom('concreteRubble', chamferBox(bl - 0.014, chH - 0.014, 0.04, 0.011),
+          xform(u + bl / 2, y, inn - 0.035))
+        u += bl
+      }
+    }
+  }
+
+  // Surface conduit: a horizontal run with drops to a switch and a socket, and
+  // a spur box. Every one of them is a hard vertical or horizontal edge on a
+  // face that had none.
+  const cy = rng.range(1.55, Math.min(2.4, Math.max(1.6, H - 0.5)))
+  for (const [a, c] of spans(cy, 0.1)) {
+    if (c - a < 0.4) continue
+    b.geom('metalPainted', cylinderGeom(0.016, 0.016, c - a, 5), xform((a + c) / 2, cy, inn + 0.022, 0, 0, Math.PI / 2))
+    for (let i = 0; i < Math.max(1, Math.round((c - a) / 1.1)); i++) {
+      b.slab('metalRusted', 0.05, 0.045, 0.045, a + 0.25 + i * 1.1, cy, inn + 0.014)
+    }
+    // Drops off the run to a switch and a socket.
+    for (let i = 0; i < rng.int(1, 3); i++) {
+      const dx = a + rng.range(0.15, Math.max(0.2, c - a - 0.15))
+      const dy = rng.bool(0.5) ? 1.15 : 0.35
+      if (!clear(dx, (cy + dy) / 2, 0.2)) continue
+      b.geom('metalPainted', cylinderGeom(0.016, 0.016, cy - dy, 5), xform(dx, (cy + dy) / 2, inn + 0.022))
+      b.slab('plasterWhite', 0.1, 0.13, 0.035, dx, dy, inn + 0.026)
+    }
+    if (rng.bool(0.5)) b.slab('metalPainted', 0.22, 0.28, 0.1, (a + c) / 2, cy + 0.22, inn + 0.055)
+  }
+
+  // A shelf on two brackets, or a run of pegs — one horizontal at eye level
+  // with a shadow under it does more for an interior wall than any texture.
+  if (rng.bool(0.55) && L > 1.8) {
+    const shx = rng.range(0.9, Math.max(1.0, L - 0.9))
+    const shw = rng.range(0.9, 1.7)
+    if (clear(shx, 1.35, 0.4)) {
+      b.slab('woodPainted', shw, 0.035, 0.24, shx, 1.35, inn + 0.13)
+      for (const k of [-1, 1]) {
+        b.slab('metalRusted', 0.025, 0.2, 0.2, shx + k * (shw / 2 - 0.12), 1.24, inn + 0.11)
+      }
+    }
+  }
 }
 
 /**
@@ -661,6 +1053,39 @@ export function buildWall(b: Builder, s: WallSpec): void {
       const py = rng.range(3.2, H - 0.6)
       if (clearAt(px, py, 0.6)) wallDish(b, px, py, out, rng)
     }
+    // --- Relief at the scale the graded cameras actually resolve ----------
+    // Everything above stands 5-15 cm off the render. At the 15-30 m the plaza,
+    // vista and sunset poses frame these facades at, 15 cm of projection is a
+    // one-pixel shadow and the wall still reads as a flat plane. These three
+    // project 0.4-1.5 m, so each one puts a hard band of shade across the
+    // render and a broken edge on the building's silhouette.
+    if (!s.plain && rng.bool(0.55) && H > 2.6) {
+      const px = rng.range(0.9, Math.max(1.0, L - 0.9))
+      const py = rng.range(1.9, Math.max(2.0, H - 0.9))
+      if (clearAt(px, py, 0.7)) wallCondenser(b, px, py, out, rng)
+    }
+    if (!s.plain && s.upperFloor && rng.bool(0.55)) {
+      // Centred over a window where there is one, so it reads as a box built
+      // out from the opening rather than bolted onto blank wall.
+      const host = list.filter((o) => o.kind === 'window' && o.width < 1.9)
+      const bw = rng.range(1.5, 2.1)
+      const bh = rng.range(1.3, 1.75)
+      const px = host.length > 0
+        ? rng.pick(host).at
+        : rng.range(bw / 2 + 0.4, Math.max(bw / 2 + 0.5, L - bw / 2 - 0.4))
+      const sill = Math.min(SILL_H - 0.05, Math.max(0.45, H - bh - 0.65))
+      if (px > bw / 2 + 0.2 && px < L - bw / 2 - 0.2 && sill + bh + 0.4 < H) {
+        mashrabiya(b, s.trim, px, sill, bw, bh, out, rng)
+      }
+    }
+    if (!s.plain && !s.upperFloor && L > 3.5) {
+      for (const o of list) {
+        if (o.kind !== 'shop' && o.kind !== 'door') continue
+        if (!rng.bool(0.55)) continue
+        const top = o.sill + o.height
+        if (top + 0.9 < H) shopCanopy(b, o.at, top, o.width, out, rng)
+      }
+    }
     // A stub of angle bracing left where a sign or an awning was taken down.
     if (rng.bool(0.5)) {
       const px = rng.range(0.5, L - 0.5)
@@ -681,6 +1106,13 @@ export function buildWall(b: Builder, s: WallSpec): void {
       }
     }
   }
+
+  // Ground-level exterior walls only: `plinth` is set on the storey that meets
+  // the ground and nowhere else, which is exactly the wall whose base is in
+  // frame in six of the eight graded poses.
+  if (s.exterior && s.plinth && s.plinth > 0) baseSpill(b, s, L, T, rng)
+
+  if (s.dressInside) dressInnerFace(b, s, list)
 }
 
 // ---------------------------------------------------------------------------
@@ -902,6 +1334,12 @@ export function buildBuilding(b: Builder, spec: BuildingSpec, rng: Rand, result:
         cornice: s === spec.storeys - 1,
         weather: damage,
         backOpenings: !spec.enterable,
+        dressInside: spec.enterable,
+        // A storey carries a balcony or a projecting window box, never both:
+        // the balcony is hung over the middle opening and the box picks a
+        // window at random, so the two would sooner or later land on the same
+        // one and interpenetrate.
+        upperFloor: s > 0 && face.upper !== 'balcony',
         rng,
       })
       // Balcony slab on upper storeys that call for one.
@@ -1016,13 +1454,25 @@ export function buildBuilding(b: Builder, spec: BuildingSpec, rng: Rand, result:
         const cutAt = rng.range(0.2, 0.8)
         const a = p.length * (cutAt - cut / 2)
         const c = p.length * (cutAt + cut / 2)
-        if (a > 0.3) b.solid(spec.wall, a, parapet, pt, a / 2, parapet / 2, 0, 0, 0.03)
-        if (c < p.length - 0.3) b.solid(spec.wall, p.length - c, parapet * rng.range(0.5, 0.9), pt, (p.length + c) / 2, (parapet * 0.7) / 2, 0, 0, 0.03)
+        if (a > 0.3) {
+          b.solid(spec.wall, a, parapet, pt, a / 2, parapet / 2, 0, 0, 0.03)
+          b.push(0, 0, 0, 0)
+          copingRun(b, trim, a, parapet, pt, rng)
+          b.pop()
+        }
+        if (c < p.length - 0.3) {
+          const rh = parapet * rng.range(0.5, 0.9)
+          b.solid(spec.wall, p.length - c, rh, pt, (p.length + c) / 2, rh / 2, 0, 0, 0.03)
+          b.push(c, 0, 0, 0)
+          copingRun(b, trim, p.length - c, rh, pt, rng)
+          b.pop()
+        }
         b.solid(spec.wall, c - a, parapet * rng.range(0.2, 0.45), pt, (a + c) / 2, parapet * 0.16, 0, 0, 0.03)
       } else {
         b.solid(spec.wall, p.length, parapet, pt, p.length / 2, parapet / 2, 0, 0, 0.03)
-        b.box(trim, p.length, 0.09, pt + 0.16, p.length / 2, parapet + 0.045, 0, 0, 0.03)
+        copingRun(b, trim, p.length, parapet, pt, rng)
       }
+      parapetClutter(b, p.length, parapet, pt, rng)
       b.pop()
     }
     result.decks.push({ cx: spec.cx, cz: spec.cz, w: w - 1.2, d: d - 1.2, y: base + roofY, yaw })
@@ -1434,7 +1884,9 @@ export function buildMarketHall(b: Builder, rng: Rand, result: BuildResult): voi
       // Open where the exterior stair lands — the way onto the deck.
       const gap = 4.2
       b.solid('brickPainted', p.length - gap, parapet, pt, gap + (p.length - gap) / 2, parapet / 2, 0, 0, 0.03)
-      b.box('concreteWorn', p.length - gap, 0.08, pt + 0.14, gap + (p.length - gap) / 2, parapet + 0.04, 0, 0, 0.03)
+      b.push(gap, 0, 0, 0)
+      copingRun(b, 'concreteWorn', p.length - gap, parapet, pt, rng)
+      b.pop()
     } else if (side === 's') {
       // A shell took out the middle of this run. The breach is what makes the
       // overwatch position read: the district opens up through it, and the
@@ -1442,9 +1894,11 @@ export function buildMarketHall(b: Builder, rng: Rand, result: BuildResult): voi
       const a = 1.8
       const c = 5.0
       b.solid('brickPainted', a, parapet, pt, a / 2, parapet / 2, 0, 0, 0.03)
-      b.box('concreteWorn', a, 0.08, pt + 0.14, a / 2, parapet + 0.04, 0, 0, 0.03)
+      copingRun(b, 'concreteWorn', a, parapet, pt, rng)
       b.solid('brickPainted', p.length - c, parapet, pt, (p.length + c) / 2, parapet / 2, 0, 0, 0.03)
-      b.box('concreteWorn', p.length - c, 0.08, pt + 0.14, (p.length + c) / 2, parapet + 0.04, 0, 0, 0.03)
+      b.push(c, 0, 0, 0)
+      copingRun(b, 'concreteWorn', p.length - c, parapet, pt, rng)
+      b.pop()
       b.solid('brickPainted', c - a, 0.24, pt, (a + c) / 2, 0.12, 0, 0, 0.03)
       for (let i = 0; i < 5; i++) {
         b.geom('rebar', cylinderGeom(0.013, 0.013, rng.range(0.3, 0.6), 4),
@@ -1452,7 +1906,10 @@ export function buildMarketHall(b: Builder, rng: Rand, result: BuildResult): voi
       }
     } else {
       b.solid('brickPainted', p.length, parapet, pt, p.length / 2, parapet / 2, 0, 0, 0.03)
-      b.box('concreteWorn', p.length, 0.08, pt + 0.14, p.length / 2, parapet + 0.04, 0, 0, 0.03)
+      copingRun(b, 'concreteWorn', p.length, parapet, pt, rng)
+      // Only the two closed runs carry clutter: the west run is the way onto
+      // the deck and the south run is the firing line the pose is composed on.
+      parapetClutter(b, p.length, parapet, pt, rng)
     }
     b.pop()
   }
@@ -1550,7 +2007,13 @@ export function buildCompoundWalls(b: Builder, rng: Rand): void {
     const cxm = (r.x0 + r.x1) / 2
     const czm = (r.z0 + r.z1) / 2
     const base = footprintBase(cxm, czm, Math.abs(dx) + 0.4, Math.abs(dz) + 0.4)
-    b.push(cxm, base, czm, yaw)
+    // Pushed at the run's start, not its midpoint: `buildWall` lays its panel
+    // from local x = 0 to x = length, which is why every other caller offsets by
+    // half the side before pushing. Pushing at the midpoint put the wall half
+    // its own length up the run while the coping and the piers below stayed on
+    // the declared line, so each boundary had piers carrying nothing at one end
+    // and a panel with no coping at the other.
+    b.push(r.x0, base, r.z0, yaw)
     const openings: Opening[] = []
     if (r.gate !== undefined) {
       openings.push({ at: len * r.gate, width: 2.4, sill: 0, height: 2.15, kind: 'hole' })
@@ -1559,13 +2022,23 @@ export function buildCompoundWalls(b: Builder, rng: Rand): void {
       length: len, height: r.h, thickness: 0.28, mat: r.mat, trim: 'concreteWorn',
       openings, exterior: true, plinth: 0.3, weather: 0.8, rng, plain: true,
     })
-    // Coping and pier caps.
-    b.box('concreteWorn', len, 0.1, 0.4, 0, r.h + 0.05, 0, 0, 0.03)
+    // Coping laid as stones, and pier caps.
+    copingRun(b, 'concreteWorn', len, r.h, 0.28, rng)
     const piers = Math.max(2, Math.round(len / 4))
     for (let i = 0; i <= piers; i++) {
-      const px = (len * i) / piers - len / 2
+      const px = (len * i) / piers
       b.solid(r.mat, 0.46, r.h + 0.3, 0.46, px, (r.h + 0.3) / 2, 0, 0, 0.035)
       b.box('concreteWorn', 0.58, 0.12, 0.58, px, r.h + 0.36, 0, 0, 0.03)
+      // Something is always leaning against a compound pier. A board propped at
+      // 15 degrees is the one line on a boundary wall that is neither vertical
+      // nor horizontal, and it breaks the pier rhythm the eye is counting.
+      if (rng.bool(0.4)) {
+        const lean = rng.range(0.13, 0.26) * (rng.bool() ? 1 : -1)
+        const lh = rng.range(1.1, 1.9)
+        b.geom('woodPainted', chamferBox(rng.range(0.16, 0.32), lh, 0.035, 0.006),
+          xform(px + rng.spread(0.6) + Math.sin(lean) * lh / 2, Math.cos(lean) * lh / 2,
+            -0.16 - Math.sin(Math.abs(lean)) * lh / 2, 0, 0, -lean))
+      }
     }
     b.pop()
   }
