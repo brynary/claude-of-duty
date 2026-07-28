@@ -114,6 +114,7 @@ export class PlayBotSystem implements System {
   private firingFor = 0
   private burstRest = 0
   private stuckFor = 0
+  private slideCooldown = 3
   private lastPos = new THREE.Vector3()
   private wantAds = false
   private t = 0
@@ -158,13 +159,26 @@ export class PlayBotSystem implements System {
     const weapons = ctx.services.weapons
     if (!player) return
 
+    this.prevDown.clear()
+    for (const k of this.frame.down) this.prevDown.add(k)
     this.frame.down.clear()
 
     this.chooseTarget(ctx, player.eye)
     this.aim(dt, ctx, player.eye)
     this.move(dt, ctx, player)
     this.trigger(dt, ctx, weapons)
+
+    // Derive the edge-triggered set from the held set, the way real hardware
+    // does. Writing only `down` meant `wasPressed` never fired for anything the
+    // bot held: it added ControlLeft every frame while hurt and therefore never
+    // produced a single `crouchPressed`, so it never slid once and none of the
+    // slide tuning could appear in telemetry.
+    for (const k of this.frame.down) {
+      if (!this.prevDown.has(k)) this.frame.pressed.add(k)
+    }
   }
+
+  private prevDown = new Set<string>()
 
   // --- target selection ----------------------------------------------------
 
@@ -320,7 +334,18 @@ export class PlayBotSystem implements System {
 
     // Sprint when there is nothing to shoot and the path is long.
     const engaged = this.target !== null
-    if (!engaged && dist > 6 && fwd > 0.5) this.frame.down.add('ShiftLeft')
+    const sprinting = !engaged && dist > 6 && fwd > 0.5
+    if (sprinting) this.frame.down.add('ShiftLeft')
+
+    // Slide into contact occasionally, the way a player closing on a fight
+    // does. Only from a sprint, and rate-limited so it stays a decision rather
+    // than a tic — this exists so slide tuning shows up in telemetry at all.
+    this.slideCooldown -= dt
+    if (sprinting && player.isSprinting && this.slideCooldown <= 0 && this.rng.next() < 0.6 * dt) {
+      this.frame.down.add('ControlLeft')
+      this.slideCooldown = 4 + this.rng.next() * 4
+      this.note('slide')
+    }
 
     // Take cover when hurt, if the profile is cautious enough.
     if (engaged && player.health < 55 * this.skill.cautiousness * 2) {
