@@ -80,6 +80,14 @@ precision highp float;
 uniform float uTime;
 uniform vec3  uGravity;
 uniform vec2  uSheet;
+/**
+ * x = projected half-extent (in NDC half-height units) at which a card starts
+ * fading, y = the extent it may never exceed. Set y to 0 to disable. This is
+ * what stops a single billboard from becoming a full-screen wash when the
+ * camera walks into it, which is the failure that veils the near field and
+ * flattens local contrast across half the frame.
+ */
+uniform vec2  uScreenLimit;
 
 attribute vec4 aOrigin;   // xyz spawn position, w spawn time
 attribute vec4 aVelLife;  // xyz initial velocity, w lifetime
@@ -90,6 +98,7 @@ attribute vec4 aColA;     // rgb start, a start
 attribute vec4 aColB;     // rgb end, a end
 
 varying vec2  vUv;
+varying vec2  vQuad;
 varying vec4  vColor;
 varying float vViewZ;
 varying float vSoft;
@@ -98,6 +107,7 @@ varying vec4  vScreen;
 
 void main() {
   vUv = vec2(0.0);
+  vQuad = vec2(0.0);
   vColor = vec4(0.0);
   vViewZ = -1.0;
   vSoft = 0.0;
@@ -133,6 +143,21 @@ void main() {
 
   vec4 mv = modelViewMatrix * vec4(p, 1.0);
 
+  // --- screen coverage limit ------------------------------------------------
+  // Projected half-extent as a fraction of half the viewport height. A card
+  // thins out as it grows past the fade point and is gone by the cap, so a puff
+  // the camera walks into disappears instead of smearing a translucent sheet
+  // over the whole frame.
+  float cover = 1.0;
+  if (uScreenLimit.y > 0.0) {
+    float projHalf = size * 0.5 * projectionMatrix[1][1] / max(-mv.z, 1e-4);
+    cover = 1.0 - smoothstep(uScreenLimit.x, uScreenLimit.y, projHalf);
+    if (cover <= 0.0) {
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+      return;
+    }
+  }
+
   vec2 corner = position.xy;
   float rot = aParamB.x + aParamB.y * t;
   float cr = cos(rot);
@@ -158,11 +183,14 @@ void main() {
   vec2 cell = vec2(mod(tf, uSheet.x), floor(tf / uSheet.x));
   vUv = vec2((uv.x + cell.x) / uSheet.x, 1.0 - (cell.y + 1.0 - uv.y) / uSheet.y);
 
-  float alpha = mix(aColA.a, aColB.a, u) * smoothstep(0.0, 0.055, u);
+  float alpha = mix(aColA.a, aColB.a, u) * smoothstep(0.0, 0.055, u) * cover;
   vColor = vec4(mix(aColA.rgb, aColB.rgb, ease), alpha);
-  vSoft = aParamC.z;
+  // A big card needs a correspondingly long depth fade, otherwise a 1.5m puff
+  // still cuts a visible line where it meets the floor.
+  vSoft = aParamC.z > 0.0 ? aParamC.z + size * 0.45 : 0.0;
   vErode = aParamC.w * u;
   vViewZ = mv.z;
+  vQuad = uv - 0.5;
 
   gl_Position = projectionMatrix * mv;
   vScreen = gl_Position;
@@ -176,8 +204,10 @@ uniform sampler2D map;
 uniform sampler2D uDepth;
 uniform float uNear;
 uniform float uFar;
+uniform float uHasDepth;
 
 varying vec2  vUv;
+varying vec2  vQuad;
 varying vec4  vColor;
 varying float vViewZ;
 varying float vSoft;
@@ -200,18 +230,25 @@ void main() {
   // Dissolve: raising the threshold over life eats the puff from its thin
   // edges inward, which is how real smoke thins out.
   float shape = (vErode > 0.0) ? smoothstep(vErode, vErode + 0.34, mask) : mask;
+  // Guarantee the card silhouette is never the quad. Mip bleed, anisotropic
+  // taps across atlas cells and a mask that survives to the tile border all
+  // end in the same tell: a straight polygon edge across the scene.
+  shape *= 1.0 - smoothstep(0.46, 0.5, length(vQuad));
   float alpha = shape * vColor.a;
   if (alpha <= 0.003) discard;
 
   float dist = -vViewZ;
 
 #ifdef SOFT_PARTICLES
-  if (vSoft > 0.0) {
+  if (vSoft > 0.0 && uHasDepth > 0.5) {
     vec2 suv = vScreen.xy / vScreen.w * 0.5 + 0.5;
     float d = texture2D(uDepth, suv).x;
     // Non-linear depth to view space; both values are negative.
     float sceneZ = (uNear * uFar) / ((uFar - uNear) * d - uFar);
-    alpha *= clamp((vViewZ - sceneZ) / vSoft, 0.0, 1.0);
+    // Squared so the card leans hard away from the surface it is crossing;
+    // a linear ramp still leaves a readable seam on a large puff.
+    float fade = clamp((vViewZ - sceneZ) / vSoft, 0.0, 1.0);
+    alpha *= fade * fade * (3.0 - 2.0 * fade);
   }
 #endif
 
@@ -285,11 +322,13 @@ class ParticleGroup {
         {
           map: { value: null },
           uDepth: { value: null },
+          uHasDepth: { value: 0 },
           uTime: { value: 0 },
           uNear: { value: 0.06 },
           uFar: { value: 900 },
           uGravity: { value: new THREE.Vector3(0, -9.81, 0) },
           uSheet: { value: new THREE.Vector2(4, 4) },
+          uScreenLimit: { value: new THREE.Vector2(0, 0) },
         },
       ]),
       vertexShader: VERT,
@@ -348,8 +387,13 @@ class ParticleGroup {
 
   setDepth(depth: THREE.Texture | null, near: number, far: number): void {
     this.material.uniforms.uDepth.value = depth
+    this.material.uniforms.uHasDepth.value = depth ? 1 : 0
     this.material.uniforms.uNear.value = near
     this.material.uniforms.uFar.value = far
+  }
+
+  setScreenLimit(fadeStart: number, cap: number): void {
+    ;(this.material.uniforms.uScreenLimit.value as THREE.Vector2).set(fadeStart, cap)
   }
 
   dispose(): void {
@@ -411,6 +455,16 @@ export class Particles {
 
   setDepth(depth: THREE.Texture | null, near: number, far: number): void {
     for (const g of this.groups.values()) g.setDepth(depth, near, far)
+  }
+
+  /**
+   * Caps how much of the frame any one card may cover, in NDC half-height
+   * units — 0.36 is roughly a fifth of the screen width at 16:9. Pass a cap of
+   * 0 to disable, which is what the viewmodel scene wants: its muzzle flash
+   * lives 40cm from the lens and is *supposed* to be large.
+   */
+  setScreenLimit(fadeStart: number, cap: number): void {
+    for (const g of this.groups.values()) g.setScreenLimit(fadeStart, cap)
   }
 
   setVisible(v: boolean): void {

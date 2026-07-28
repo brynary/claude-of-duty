@@ -214,7 +214,10 @@ export class Viewmodel {
    */
   private setupLighting(): void {
     const ctx = this.ctx
-    const shadows = ctx.config.quality === 'high' || ctx.config.quality === 'ultra'
+    // The viewmodel pass runs after SSAO and never receives a pixel of it, so
+    // the key's own shadow map is the only screen-space occlusion the weapon
+    // can get. It is worth a map at every quality level, not just the top two.
+    const low = ctx.config.quality === 'low'
 
     // One shared aim point in the middle of the posed weapon. The viewmodel
     // sits 0.25-1.1m ahead of the eye, so aiming lights at the rig origin
@@ -226,18 +229,21 @@ export class Viewmodel {
     // Warm key, up and to the camera's left, angled back toward the eye.
     // Direction works out at roughly (0.48, -0.63, -0.61): 0.48 on the left
     // flank, 0.63 on the top faces, 0.61 on everything facing the camera.
-    const key = new THREE.DirectionalLight(0xfff2e2, 3.2)
+    const key = new THREE.DirectionalLight(0xfff2e2, 4.1)
     key.position.set(-1.05, 1.40, 0.85)
     key.target = focus
-    if (shadows) {
-      key.castShadow = true
-      key.shadow.mapSize.set(1024, 1024)
+    key.castShadow = true
+    key.shadow.mapSize.set(low ? 1024 : 2048, low ? 1024 : 2048)
+    {
+      // Tight to the posed weapon. The old 1.5m box spread 1024 texels over a
+      // volume mostly full of air, which is 1.5mm a texel; at 0.45m it is
+      // 0.22mm and the rail ribs and trigger guard finally self-shadow.
       const cam = key.shadow.camera
-      cam.left = -0.75; cam.right = 0.75; cam.top = 0.75; cam.bottom = -0.75
-      cam.near = 0.4; cam.far = 5.0
+      cam.left = -0.45; cam.right = 0.45; cam.top = 0.45; cam.bottom = -0.45
+      cam.near = 0.5; cam.far = 3.2
       cam.updateProjectionMatrix()
-      key.shadow.bias = -0.0006
-      key.shadow.normalBias = 0.0025
+      key.shadow.bias = -0.00035
+      key.shadow.normalBias = 0.0012
       key.shadow.radius = 2
     }
     this.rig.add(key)
@@ -245,9 +251,15 @@ export class Viewmodel {
 
     // Cool fill from the opposite quadrant: camera-right and slightly below,
     // so the shadow flank and the undersides of the handguard and magazine
-    // keep readable texture instead of blocking up. This is the light that
-    // decides whether the rifle has form in shade or is a cut-out.
-    const fill = new THREE.DirectionalLight(0x9fb6d6, 1.25)
+    // keep readable texture instead of blocking up.
+    //
+    // Cut back this round against a brighter key. Measured over the eight
+    // poses the weapon sat at std 17-20 against a frame target of 45-65: every
+    // face of it was receiving light from somewhere, which is a rig with no
+    // ratio. Key to fill now runs about 5:1 rather than 2.5:1, which moves the
+    // shaded flank down without moving the median -- the trade the round-3
+    // brief asks for, rather than another swing of overall exposure.
+    const fill = new THREE.DirectionalLight(0x9fb6d6, 0.80)
     fill.position.set(1.30, -0.35, 0.95)
     fill.target = focus
     this.rig.add(fill)
@@ -255,7 +267,7 @@ export class Viewmodel {
     // Rim from above and beyond the muzzle. Draws the top edge of the
     // receiver, rail and barrel against whatever is behind them, which is what
     // stops the weapon merging with a dark wall.
-    const rim = new THREE.DirectionalLight(0xc6d8f2, 1.9)
+    const rim = new THREE.DirectionalLight(0xc6d8f2, 1.55)
     rim.position.set(0.55, 1.30, -2.20)
     rim.target = focus
     this.rig.add(rim)
@@ -271,8 +283,10 @@ export class Viewmodel {
 
     // Diffuse floor for the cloth and glove, which the probe alone leaves flat.
     // World oriented on purpose: its position *is* its up axis in three, so it
-    // cannot be parented to a rig that rotates.
-    const bounce = new THREE.HemisphereLight(0x9db2cb, 0x3a3025, 0.55)
+    // cannot be parented to a rig that rotates. Deliberately weak: a
+    // hemisphere term reaches every surface regardless of orientation, so it
+    // is the fastest way to flatten an object that is meant to have a ratio.
+    const bounce = new THREE.HemisphereLight(0x9db2cb, 0x3a3025, 0.30)
     ctx.viewmodelScene.add(bounce)
 
     // Weapon space gets its own probe, always. Handing the sky PMREM to a
@@ -405,9 +419,12 @@ export class Viewmodel {
     if (model.reticleKind === 'cross') {
       this.reticleMat.color.set(0xffffff)
     } else {
-      // Above 1.0 in linear working space so the emitter crosses the bloom
-      // threshold and reads as a lit dot rather than a red decal.
-      this.reticleMat.color.setRGB(2.8, 0.30, 0.12, THREE.LinearSRGBColorSpace)
+      // Well above 1.0 in linear working space so the core clips through the
+      // tonemapper and blooms, which is how a red dot actually looks against a
+      // daylit target: a white-hot centre with a red bleed, not a red decal.
+      // It is also one of the few honestly emissive things in frame, so it is
+      // allowed to be part of the white point.
+      this.reticleMat.color.setRGB(7.5, 0.85, 0.32, THREE.LinearSRGBColorSpace)
     }
     this.reticleMat.needsUpdate = true
     this.reticle.visible = model.reticleKind !== 'none'

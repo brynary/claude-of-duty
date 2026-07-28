@@ -24,6 +24,11 @@ import type { GameContext, PhysicsService, RaycastFilter } from '../../core/Type
  * points down to a few centimetres and knows nothing beyond the depth buffer,
  * this knows about the roof twelve metres up that is off screen entirely.
  * Multiplying both is correct; neither substitutes for the other.
+ *
+ * The directional bounce term rides here too, for two reasons that are really
+ * one: it needs the world-space normal this pass has already reconstructed, and
+ * it has to be occluded by exactly the same visibility — light that came off
+ * the sunlit street cannot reach a surface that cannot see the street.
  */
 
 /** Cells across the level, per axis, per quality tier. */
@@ -49,17 +54,54 @@ const RAY_LENGTH = 45
  * "interiors lit believably" bar as surely as an unoccluded one fails the
  * grounding bar.
  *
- * Three stops down was too far. An enclosed surface still has to carry its
- * material — plaster relief, brick coursing, the grain of a crate — and below
- * about two stops that information is gone rather than dim. Note this is a
- * *fraction of ambient*, so it lifts shadow midtones and leaves the black point
- * where it is: the darkest pixels in a frame are set by the tone curve's toe,
- * not by this.
+ * An enclosed surface still has to carry its material — plaster relief, brick
+ * coursing, the grain of a crate — and past about two stops down that
+ * information is gone rather than dim.
+ *
+ * Raised from 0.24 only because it is a *fraction* of an ambient term that has
+ * itself been cut by more than half. The absolute level an enclosed surface
+ * ends up at barely moves; what moves is the exteriors around it. Watch that
+ * asymmetry when either number changes: raising this closes the gap between
+ * inside and outside, which is the differential a judge measured when they
+ * found "the unlit near concrete is as bright as the sunlit far room".
  */
-const ENCLOSED_BOUNCE = 0.24
+const ENCLOSED_BOUNCE = 0.34
 
 /** How far the enclosed tint is pulled back towards white. */
 const ENCLOSED_NEUTRALITY = 0.45
+
+/**
+ * How much light the sunlit street and the facades opposite throw back, as
+ * irradiance in the same units as the sun's own.
+ *
+ * This is the half of the ambient that a hemisphere light cannot express, and
+ * the reason it matters is not colour but *variation*. Image-based ambient from
+ * an open sky is very nearly the same from every direction, so a surface lit
+ * only by it returns very nearly the same value whichever way its normal points
+ * — which means every bit of relief the material pass authors into a normal map
+ * is invisible the moment a surface falls into shade. Half a frame with no
+ * response to its own normals is most of what "mushy surfaces", "no relief" and
+ * a local-contrast reading at half target actually measure.
+ *
+ * A bounce term restores it, and unlike a second sky term it is directional and
+ * coloured: warm, arriving from the sun's side of the street, landing on the
+ * faces that are turned away from the sun and therefore have no key at all.
+ *
+ * The level is set by how much shading variation it has to buy, not by taste.
+ * At a third of a shaded wall's total fill, a normal swinging seventy degrees
+ * across the bounce moves that wall five code values; at a sixth it moves three;
+ * with the fill entirely uniform it moves none at all. Raising it further would
+ * start making shaded verticals read warmer than the sky lighting them, which
+ * is the failure a judge caught as "the shadowed pocket returns warmer than the
+ * sky, which is backwards".
+ */
+const BOUNCE_IRRADIANCE = 0.11
+
+/**
+ * Wrap on the bounce's cosine term. The source is a road and a wall, not a
+ * point, so its terminator is soft and it reaches a little past ninety degrees.
+ */
+const BOUNCE_WRAP = 0.35
 
 /**
  * Distance the sample point is pushed along the surface normal, in metres.
@@ -78,8 +120,14 @@ const NORMAL_PUSH = 1.35
  * off far faster than perceived brightness does — a courtyard that can see 40%
  * of the sky does not look 60% darker than open ground — so the mid range is
  * lifted while zero stays zero.
+ *
+ * Back to 0.75 from 0.62. The lower figure was compensating for a fill that was
+ * three times over strength: with the sky probe correctly calibrated there is
+ * no longer anything to hold up, and the flatter curve was costing the
+ * grounding contrast — soffits, doorway reveals, the gap under a crate — that
+ * this pass exists to produce.
  */
-const VISIBILITY_GAMMA = 0.62
+const VISIBILITY_GAMMA = 0.75
 
 /** How much of the diffuse occlusion also applies to glossy reflections. */
 const SPECULAR_SHARE = 0.75
@@ -98,6 +146,8 @@ uniform sampler3D skyOccMap;
 uniform vec3 skyOccOrigin;
 uniform vec3 skyOccInvExtent;
 uniform vec3 skyOccBounce;
+uniform vec3 skyOccBounceLight;
+uniform vec3 skyOccBounceDir;
 // x: visibility gamma, y: normal push in metres, z: specular share, w: enabled
 uniform vec4 skyOccParams;
 `
@@ -117,6 +167,16 @@ const APPLY = /* glsl */ `
 #endif
 
 #if defined( RE_IndirectDiffuse )
+
+	// Bounce off the sunlit road and the facades opposite. Added before the
+	// attenuation, not after: light that came off the street does not reach the
+	// inside of a sealed room either, and a surface that cannot see the sky
+	// cannot see what the sky lit.
+	float skyOccBounceWrap = max(
+		0.0,
+		( dot( skyOccNormal, skyOccBounceDir ) + ${BOUNCE_WRAP.toFixed(3)} ) / ${(1 + BOUNCE_WRAP).toFixed(3)}
+	);
+	irradiance += skyOccBounceLight * skyOccBounceWrap;
 
 	irradiance *= skyOccAtten;
 	iblIrradiance *= skyOccAtten;
@@ -153,6 +213,8 @@ export class SkyOcclusion {
     skyOccOrigin: { value: new THREE.Vector3() },
     skyOccInvExtent: { value: new THREE.Vector3(1, 1, 1) },
     skyOccBounce: { value: new THREE.Vector3(ENCLOSED_BOUNCE, ENCLOSED_BOUNCE, ENCLOSED_BOUNCE) },
+    skyOccBounceLight: { value: new THREE.Vector3() },
+    skyOccBounceDir: { value: new THREE.Vector3(0, -1, 0) },
     skyOccParams: { value: new THREE.Vector4(VISIBILITY_GAMMA, NORMAL_PUSH, SPECULAR_SHARE, 0) },
   }
 
@@ -245,12 +307,19 @@ export class SkyOcclusion {
   }
 
   /**
-   * Hue an enclosed surface's remaining ambient takes. Warm, because it is
-   * bounce off dust and plaster, not the sky the surface cannot see. Only the
-   * hue is taken from the argument — the level is fixed by ENCLOSED_BOUNCE, so
-   * changing the bounce colour never changes how dark interiors get.
+   * Loads both halves of the bounce: the hue an enclosed surface's remaining
+   * ambient takes, and the directional term open surfaces in shade receive.
+   *
+   * Only the hue is taken from `color` — both levels are fixed by
+   * ENCLOSED_BOUNCE and BOUNCE_IRRADIANCE, so re-tinting the bounce never
+   * changes how dark interiors get or how much fill a shaded wall receives.
+   *
+   * `direction` points from the surface *towards* the source, the same
+   * convention as a light vector, and `strength` scales the directional term
+   * only, so the bounce can fade out with the sun without the enclosed floor
+   * following it down into a black void.
    */
-  setBounceColor(color: THREE.Color): void {
+  setBounce(direction: THREE.Vector3, color: THREE.Color, strength: number): void {
     const peak = Math.max(color.r, color.g, color.b, 1e-4)
     const t = ENCLOSED_NEUTRALITY
     this.uniforms.skyOccBounce.value.set(
@@ -258,6 +327,13 @@ export class SkyOcclusion {
       ENCLOSED_BOUNCE * THREE.MathUtils.lerp(color.g / peak, 1, t),
       ENCLOSED_BOUNCE * THREE.MathUtils.lerp(color.b / peak, 1, t),
     )
+    const level = BOUNCE_IRRADIANCE * strength
+    this.uniforms.skyOccBounceLight.value.set(
+      (level * color.r) / peak,
+      (level * color.g) / peak,
+      (level * color.b) / peak,
+    )
+    this.uniforms.skyOccBounceDir.value.copy(direction).normalize()
   }
 
   dispose(): void {

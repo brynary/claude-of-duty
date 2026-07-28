@@ -63,6 +63,15 @@ export interface TriplanarOptions {
   detailFreq?: number
   /** Strength of the micro-detail normal. 0 disables its contribution. */
   detailNormal?: number
+  /**
+   * Albedo swing contributed by the micro-detail's own height, as a fraction.
+   *
+   * A normal map modulates the key light, so it contributes exactly nothing on
+   * a surface that has no key — and roughly half of any first-person frame is
+   * in shadow. Shading the albedo with the same height field is what makes the
+   * micro-detail survive there.
+   */
+  detailAlbedo?: number
   /** Roughness swing contributed by the micro-detail, absolute. */
   detailRough?: number
   /** How much the micro-detail's pore cavities collect grime, 0..1. */
@@ -102,6 +111,7 @@ uniform float uDustAmount;
 uniform float uDustRough;
 uniform float uDetailFreq;
 uniform float uDetailNormal;
+uniform float uDetailAlbedo;
 uniform float uDetailRough;
 uniform float uDetailCavity;
 uniform float uParallax;
@@ -224,7 +234,11 @@ const MAP_FRAGMENT = /* glsl */ `
 	vec4 triDetX = texture2D( uDetailMap, triDp.zy );
 	vec4 triDetY = texture2D( uDetailMap, triDp.xz );
 	vec4 triDetZ = texture2D( uDetailMap, triDp.xy );
-	vec2 triDetBA = triDetX.ba * triBlend.x + triDetY.ba * triBlend.y + triDetZ.ba * triBlend.z;
+	// x = roughness breakup, y = micro relief height.
+	vec2 triDetRH = triDetX.ba * triBlend.x + triDetY.ba * triBlend.y + triDetZ.ba * triBlend.z;
+	// The cavity mask is derived here rather than baked, so the same channel can
+	// also shade the albedo below. Alpha used to carry the mask and nothing else.
+	float triDetCavity = clamp( 1.0 - triDetRH.y * 1.7, 0.0, 1.0 );
 
 	float triMacro = triValueNoise( triWorld * uMacroScale ) * 0.62
 		+ triValueNoise( triWorld * uMacroScale * 2.7 + 19.3 ) * 0.38;
@@ -238,12 +252,17 @@ const MAP_FRAGMENT = /* glsl */ `
 		( 1.0 + uMacroAlbedo ) * vec3( 1.05, 1.0, 0.94 ),
 		triMacro );
 
+	// Micro relief shading. Projected in world space with a per-material origin,
+	// so it also decorrelates the material's own tile repeat — the same detail
+	// never lands twice in the same place relative to a brick course.
+	triAlbedo.rgb *= 1.0 + ( triDetRH.y - 0.5 ) * uDetailAlbedo;
+
 	// Grime in every cavity. The baked occlusion channel already knows where
 	// the surface dips below its neighbourhood, and the detail map's pore mask
 	// knows where it dips below that; squaring the pair gives a tight crease
 	// mask for free. Unlike an AO term this darkens albedo, so it still reads
 	// under full sun where ambient occlusion contributes nothing.
-	float triCav = max( 1.0 - triOrm.r, triDetBA.y * uDetailCavity );
+	float triCav = max( 1.0 - triOrm.r, triDetCavity * uDetailCavity );
 	float triCavity = clamp( triCav * triCav * uCavityDirt * ( 0.5 + 1.0 * triMacro ), 0.0, 0.85 );
 	triAlbedo.rgb = mix( triAlbedo.rgb, uGrimeColor * ( 0.55 + 0.8 * triMacro ), triCavity );
 
@@ -275,7 +294,7 @@ const ROUGHNESS_FRAGMENT = /* glsl */ `
 	float roughnessFactor = roughness * triOrm.g;
 	roughnessFactor *= mix( 1.0 - uMacroRough, 1.0 + uMacroRough, triMacro );
 	roughnessFactor *= mix( 1.0 - uMesoRough, 1.0 + uMesoRough, triMeso );
-	roughnessFactor += ( triDetBA.x - 0.5 ) * uDetailRough;
+	roughnessFactor += ( triDetRH.x - 0.5 ) * uDetailRough;
 	roughnessFactor = mix( roughnessFactor, 0.95, triFilth );
 	roughnessFactor = mix( roughnessFactor, uDustRough, triDust );
 	roughnessFactor = clamp( roughnessFactor, 0.06, 1.0 );
@@ -367,7 +386,7 @@ const VERTEX_NORMAL = /* glsl */ `
 	vTriWorldNormal = transpose( mat3( viewMatrix ) ) * normalize( transformedNormal );
 `
 
-const CACHE_KEY = 'cod-triplanar-v3'
+const CACHE_KEY = 'cod-triplanar-v4'
 
 /** True once `applyTriplanar` has patched this material. */
 export function isTriplanar(material: THREE.Material): boolean {
@@ -398,6 +417,7 @@ export function applyTriplanar(
     uDustRough: { value: options.dustRough ?? 0.94 },
     uDetailFreq: { value: options.detailFreq ?? 1.6 },
     uDetailNormal: { value: options.detailNormal ?? 0 },
+    uDetailAlbedo: { value: options.detailAlbedo ?? 0.3 },
     uDetailRough: { value: options.detailRough ?? 0.22 },
     uDetailCavity: { value: options.detailCavity ?? 0.5 },
     uParallax: { value: options.parallax ?? 0 },

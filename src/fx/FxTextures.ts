@@ -7,11 +7,13 @@ import { Rand } from '../core/Rand'
  *
  * Two encodings are used:
  *
- * - **Particle masks** (`smokeSheet`, `sprites`): RGB is white, the shape lives
- *   entirely in the alpha channel. Particle colour comes from the per-particle
- *   gradient, so one mask serves dust, blood, sparks and fireball alike. The
- *   alpha channel is also used as an *erosion field*: raising a threshold over
- *   a particle's life dissolves the puff organically instead of just fading it.
+ * - **Particle masks** (`smokeSheet`, `sprites`): the shape lives in the alpha
+ *   channel and particle colour comes from the per-particle gradient, so one
+ *   mask serves dust, blood, sparks and fireball alike. The alpha channel is
+ *   also used as an *erosion field*: raising a threshold over a particle's life
+ *   dissolves the puff organically instead of just fading it. `sprites` keeps
+ *   RGB white; `smokeSheet` bakes a shading term into RGB so a puff has a lit
+ *   side and a self-shadowed core rather than being one flat tinted wash.
  * - **Decal atlases** (`decalAlbedo` + `decalNormal`): real albedo with a mask
  *   in alpha, plus a tangent-space normal map Sobel-derived from a height pass
  *   drawn with the same primitives.
@@ -118,6 +120,46 @@ function valueOctave(size: number, freq: number, seed: number, amp: number, out:
   }
 }
 
+/** Tiling fBm as a raw float field in 0..1, for generators that need to sample
+ *  it with warping and rotation rather than blit it. */
+function fbmField(size: number, baseFreq: number, octaves: number, seed: number): Float32Array {
+  const buf = new Float32Array(size * size)
+  let amp = 1
+  let total = 0
+  let freq = baseFreq
+  for (let o = 0; o < octaves; o++) {
+    valueOctave(size, freq, seed + o * 977, amp, buf)
+    total += amp
+    amp *= 0.52
+    freq *= 2
+  }
+  const inv = 1 / total
+  for (let i = 0; i < buf.length; i++) buf[i] *= inv
+  return buf
+}
+
+/** Bilinear sample of a tiling field; `x` and `y` are in texels and wrap. */
+function sampleField(f: Float32Array, size: number, x: number, y: number): number {
+  const x0 = Math.floor(x)
+  const y0 = Math.floor(y)
+  const tx = x - x0
+  const ty = y - y0
+  const xa = ((x0 % size) + size) % size
+  const ya = ((y0 % size) + size) % size
+  const xb = (xa + 1) % size
+  const yb = (ya + 1) % size
+  const ra = ya * size
+  const rb = yb * size
+  const top = f[ra + xa] + (f[ra + xb] - f[ra + xa]) * tx
+  const bot = f[rb + xa] + (f[rb + xb] - f[rb + xa]) * tx
+  return top + (bot - top) * ty
+}
+
+function smooth01(t: number): number {
+  const x = t < 0 ? 0 : t > 1 ? 1 : t
+  return x * x * (3 - 2 * x)
+}
+
 /** Tiling greyscale fBm rendered opaque into its own canvas. */
 function fbmCanvas(size: number, baseFreq: number, octaves: number, seed: number, contrast: number): HTMLCanvasElement {
   const buf = new Float32Array(size * size)
@@ -148,27 +190,6 @@ function fbmCanvas(size: number, baseFreq: number, octaves: number, seed: number
   return g.canvas
 }
 
-/**
- * Collapses an opaque greyscale tile into `rgb = white, a = curve(luminance)`.
- * Every particle mask goes through this so the shader has one convention.
- */
-function luminanceToAlpha(g: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, lo: number, hi: number): void {
-  const img = g.getImageData(x, y, w, h)
-  const px = img.data
-  const span = Math.max(hi - lo, 1e-3)
-  for (let i = 0; i < px.length; i += 4) {
-    const l = px[i] / 255
-    let a = (l - lo) / span
-    a = a < 0 ? 0 : a > 1 ? 1 : a
-    a = a * a * (3 - 2 * a)
-    px[i] = 255
-    px[i + 1] = 255
-    px[i + 2] = 255
-    px[i + 3] = Math.round(a * 255)
-  }
-  g.putImageData(img, x, y)
-}
-
 function radial(g: CanvasRenderingContext2D, cx: number, cy: number, r: number, stops: [number, string][]): CanvasGradient {
   const grad = g.createRadialGradient(cx, cy, 0, cx, cy, Math.max(r, 0.001))
   for (const [t, c] of stops) grad.addColorStop(t, c)
@@ -177,50 +198,131 @@ function radial(g: CanvasRenderingContext2D, cx: number, cy: number, r: number, 
 
 // --- smoke sheet ------------------------------------------------------------
 
+/**
+ * 16-frame smoke sheet.
+ *
+ * Three things this has to get right, because all three were visible defects:
+ *
+ * 1. **The alpha must die well inside its cell.** A mask that still carries
+ *    alpha at the tile border shows the quad, and the quad is the single most
+ *    obvious tell in a particle system. The puff is trimmed by a noise-warped
+ *    radius that reaches zero by 0.45 of the cell, leaving a real gutter that
+ *    also survives a couple of mip levels.
+ * 2. **No axis-aligned structure.** The previous sheet blitted one noise tile
+ *    twice side by side, which left a linear seam every card shared regardless
+ *    of its per-particle rotation. Here the sample frame is rotated per frame
+ *    and domain-warped, so no two frames share a direction.
+ * 3. **RGB carries baked shading, not white.** The particle shader multiplies
+ *    the per-particle colour by this, so a puff arrives with a lit side, a
+ *    self-shadowed core and real internal relief. A flat-white mask tinted by a
+ *    single colour is a grey wash that flattens local contrast wherever it
+ *    covers, which is exactly what the frames were showing.
+ */
 function buildSmokeSheet(rand: Rand): HTMLCanvasElement {
-  const T = 128
+  const T = 160
   const COLS = 4
+  const N = 256
   const sheet = makeCanvas(T * COLS, T * COLS, true)
-  const nA = fbmCanvas(256, 3, 4, Math.floor(rand.next() * 1e6), 1.5)
-  const nB = fbmCanvas(256, 5, 3, Math.floor(rand.next() * 1e6), 1.7)
-  const frame = makeCanvas(T, T, true)
+
+  const shape = fbmField(N, 3, 5, Math.floor(rand.next() * 1e6))
+  const detail = fbmField(N, 9, 4, Math.floor(rand.next() * 1e6))
+  const warpU = fbmField(N, 2, 3, Math.floor(rand.next() * 1e6))
+  const warpV = fbmField(N, 2, 3, Math.floor(rand.next() * 1e6))
+
+  const raw = new Float32Array(T * T)
+  const density = new Float32Array(T * T)
+  const BINS = 512
+  const hist = new Int32Array(BINS)
+  const img = sheet.createImageData(T, T)
+  const px = img.data
+
+  // Key from the upper left, which is where the eye expects a puff to be lit
+  // from in a frame whose sun is high and behind the camera's shoulder.
+  const LX = -0.42
+  const LY = -0.58
+  const LZ = 0.70
 
   for (let f = 0; f < 16; f++) {
-    const g = frame
-    g.setTransform(1, 0, 0, 1, 0, 0)
-    g.globalCompositeOperation = 'source-over'
-    g.globalAlpha = 1
-    g.fillStyle = '#000'
-    g.fillRect(0, 0, T, T)
+    const grow = 1 + f * 0.085
+    const rise = f * 0.030
+    const ang = f * 0.12 + 0.17
+    const ca = Math.cos(ang)
+    const sa = Math.sin(ang)
+    const scale = 2.35 / grow
 
-    // Two noise layers sliding past each other produce billowing over the sheet.
-    const s1 = T * (1.7 + f * 0.045)
-    const s2 = T * (2.9 + f * 0.09)
-    g.drawImage(nA, -f * 5 - 10, f * 9 - 20, s1, s1)
-    g.globalCompositeOperation = 'lighter'
-    g.drawImage(nA, s1 - f * 5 - 10, f * 9 - 20, s1, s1)
-    g.globalCompositeOperation = 'multiply'
-    g.drawImage(nB, f * 11 - 30, -f * 6 - 10, s2, s2)
+    for (let y = 0; y < T; y++) {
+      const v = (y + 0.5) / T - 0.5
+      for (let x = 0; x < T; x++) {
+        const u = (x + 0.5) / T - 0.5
+        const cu = u * ca - v * sa
+        const cv = u * sa + v * ca
 
-    // A softly growing disc trims the billows into a coherent puff.
-    const r = T * (0.30 + f * 0.0125)
-    g.globalCompositeOperation = 'multiply'
-    g.fillStyle = radial(g, T / 2, T / 2, r, [
-      [0, '#ffffff'],
-      [0.55, '#e2e2e2'],
-      [0.82, '#585858'],
-      [1, '#000000'],
-    ])
-    g.fillRect(0, 0, T, T)
-    g.globalCompositeOperation = 'source-over'
+        const wu = cu + (sampleField(warpU, N, (cu * 1.9 + 0.31) * N, (cv * 1.9 + 0.11) * N) - 0.5) * 0.30
+        const wv = cv + (sampleField(warpV, N, (cu * 1.9 + 0.63) * N, (cv * 1.9 + 0.77) * N) - 0.5) * 0.30 - rise
 
-    // Later frames are thinner: raise the black point as the puff dissipates.
-    luminanceToAlpha(g, 0, 0, T, T, 0.12 + f * 0.018, 0.52 + f * 0.02)
+        let d = sampleField(shape, N, wu * scale * N, wv * scale * N) * 0.78
+        d += sampleField(detail, N, (wu * scale * 2.4 + 0.5) * N, wv * scale * 2.4 * N) * 0.22
+        // fBm piles up around 0.5; expand it so the puff has real internal
+        // range instead of resolving to one translucent grey value.
+        d = (d - 0.5) * 1.45 + 0.5
 
-    const col = f % COLS
-    const row = (f / COLS) | 0
-    sheet.clearRect(col * T, row * T, T, T)
-    sheet.drawImage(frame.canvas, col * T, row * T)
+        // Noise-warped trim. Reaches zero by r = 0.45, so the cell keeps a
+        // gutter and no mip level can carry alpha to the tile border.
+        const rad = Math.sqrt(u * u + v * v) / 0.40
+        const rim = rad * (0.85 + 0.34 * sampleField(warpU, N, (u * 3.1 + 0.9) * N, (v * 3.1 + 0.4) * N))
+        const edge = 1 - smooth01((rim - 0.35) / 0.65)
+
+        const rv = d * edge
+        raw[y * T + x] = rv < 0 ? 0 : rv > 1 ? 1 : rv
+      }
+    }
+
+    // The frame advects through the noise, so a fixed black point makes some
+    // frames dense and others nearly empty. Pick the threshold from the frame's
+    // own histogram instead, against a coverage schedule that thins the puff
+    // out over its life.
+    hist.fill(0)
+    for (let i = 0; i < raw.length; i++) hist[Math.min(BINS - 1, (raw[i] * BINS) | 0)]++
+    const target = (0.34 - f * 0.008) * raw.length
+    let acc = 0
+    let bin = BINS - 1
+    for (; bin > 0; bin--) {
+      acc += hist[bin]
+      if (acc >= target) break
+    }
+    const lo = bin / BINS
+    const invSpan = 1 / Math.max(Math.min(1, lo + 0.45) - lo, 1e-3)
+    for (let i = 0; i < raw.length; i++) density[i] = smooth01((raw[i] - lo) * invSpan)
+
+    for (let y = 0; y < T; y++) {
+      const yUp = y > 0 ? y - 1 : 0
+      const yDn = y < T - 1 ? y + 1 : T - 1
+      for (let x = 0; x < T; x++) {
+        const i = y * T + x
+        const a = density[i]
+        const gx = density[y * T + (x < T - 1 ? x + 1 : x)] - density[y * T + (x > 0 ? x - 1 : x)]
+        const gy = density[yDn * T + x] - density[yUp * T + x]
+        // Read the density field as a height field: gradients tilt the surface
+        // toward or away from the key, which is what gives a puff its billows.
+        const nx = -gx * 6.5
+        const ny = -gy * 6.5
+        const inv = 1 / Math.sqrt(nx * nx + ny * ny + 1)
+        const ndl = Math.max(0, (nx * LX + ny * LY + LZ) * inv)
+        // Stored sRGB 0.62..1.0. Emitter colours therefore land roughly a third
+        // darker in linear than the old flat-white mask produced, which is the
+        // right direction anyway: the frames were over-bright and over-veiled.
+        let shade = 0.80 + 0.24 * ndl - 0.20 * a
+        shade = shade < 0.62 ? 0.62 : shade > 1 ? 1 : shade
+        const b = Math.round(shade * 255)
+        const o = i * 4
+        px[o] = b
+        px[o + 1] = b
+        px[o + 2] = b
+        px[o + 3] = Math.round(a * 255)
+      }
+    }
+
+    sheet.putImageData(img, (f % COLS) * T, ((f / COLS) | 0) * T)
   }
   return sheet.canvas
 }
@@ -896,25 +998,36 @@ function heightToNormal(src: CanvasRenderingContext2D, size: number, tileSize: n
   return g.canvas
 }
 
+/**
+ * Street litter. Deliberately dirty rather than fresh: a near-white scrap
+ * catches the sun harder than anything around it and reads as a bright artefact
+ * rather than as rubbish, which is how it kept getting flagged.
+ */
 function buildPaper(rand: Rand): HTMLCanvasElement {
   const T = 128
   const g = makeCanvas(T, T, true)
-  g.fillStyle = '#cfc7b4'
+  g.fillStyle = '#9c9484'
   g.fillRect(0, 0, T, T)
   const noise = fbmCanvas(128, 8, 3, Math.floor(rand.next() * 1e6), 0.6)
-  g.globalAlpha = 0.35
+  g.globalAlpha = 0.6
   g.globalCompositeOperation = 'multiply'
   g.drawImage(noise, 0, 0)
   g.globalCompositeOperation = 'source-over'
   g.globalAlpha = 1
-  // Print-like smudges so it does not read as a blank white card.
-  g.fillStyle = 'rgba(70,64,56,0.5)'
+  // Print-like smudges so it does not read as a blank card.
+  g.fillStyle = 'rgba(52,47,41,0.55)'
   for (let i = 0; i < 9; i++) {
     const y = 18 + i * 11 + rand.range(-2, 2)
     g.fillRect(16 + rand.range(0, 10), y, rand.range(40, 92), 2.5)
   }
-  g.strokeStyle = 'rgba(120,110,96,0.6)'
-  g.lineWidth = 3
+  // Ground-in dirt along the creases and edges.
+  g.fillStyle = 'rgba(46,40,32,0.4)'
+  for (let i = 0; i < 14; i++) {
+    const s = rand.range(6, 26)
+    g.fillRect(rand.range(0, T - s), rand.range(0, T - s), s, rand.range(3, 9))
+  }
+  g.strokeStyle = 'rgba(38,33,27,0.75)'
+  g.lineWidth = 4
   g.strokeRect(2, 2, T - 4, T - 4)
   return g.canvas
 }

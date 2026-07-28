@@ -3,11 +3,11 @@ import type { GameContext, System, LevelService } from '../core/Types'
 import type { MaterialName } from '../render/MaterialNames'
 import { Rand } from '../core/Rand'
 import { Builder, InstanceFarm, type StaticPhysics } from './Kit'
-import { buildKerbs, buildSteps, buildTerrain, groundHeight } from './Terrain'
+import { buildDrainage, buildKerbs, buildPaving, buildSteps, buildTerrain, groundHeight } from './Terrain'
 import {
   BUILDINGS, buildAlleyTerminus, buildBuilding, buildCompoundWalls, buildMarketHall,
   buildMinaret, buildMosque, buildRoofClutter, buildSabat, buildSkyline, buildWaterTower,
-  footprintBase, type BuildResult,
+  footprintBase, insideAnyBuilding, type BuildResult,
 } from './Buildings'
 import {
   buildInteriors, buildOverhead, buildPosters, buildSetPieces, definePropKinds, scatterClutter,
@@ -96,6 +96,13 @@ export class LevelSystem implements System, LevelService {
     // Steps up onto the raised market square and the plaza kerbs.
     const streetKit = new Builder()
     buildKerbs(streetKit, new Rand(seed ^ 0x2b17))
+    // Modelled paving over the square, the alley and the gate. It lives in its
+    // own batch because it must never cast: the flags stand a centimetre or two
+    // proud of each other, which is exactly the depth range a sun cascade
+    // resolves as acne rather than as relief.
+    const paveKit = new Builder()
+    buildPaving(paveKit, new Rand(seed ^ 0x51c3), insideAnyBuilding)
+    buildDrainage(paveKit, new Rand(seed ^ 0x77a1))
     buildSteps(streetKit, -3.0, 1.3, 0, 5.4, 2, 0.095, 0.44)
     buildSteps(streetKit, -20.0, 1.3, 0, 4.0, 2, 0.095, 0.44)
     buildSteps(streetKit, 6.0, -12.0, Math.PI / 2, 3.6, 2, 0.095, 0.44)
@@ -167,6 +174,7 @@ export class LevelSystem implements System, LevelService {
     const flatDressing: MaterialName[] = ['dirt', 'water', 'plasterDamaged']
     commit(landmarks, 'landmarks', true, true, wallDressing)
     commit(streetKit, 'street', true, true, wallDressing)
+    commit(paveKit, 'paving', false, true)
     commit(propsKit, 'props', true, true, ['dirt'])
     commit(overheadKit, 'overhead')
     commit(debrisKit, 'debris', true, true, flatDressing)

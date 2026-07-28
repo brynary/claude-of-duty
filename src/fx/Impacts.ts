@@ -173,8 +173,8 @@ export class Impacts {
       this.cone(this.n, 1.0, this.dir)
       p.velocity.copy(this.dir).multiplyScalar(r.range(3.5, 8.5))
       p.life = r.range(0.16, 0.3)
-      p.sizeStart = r.range(0.07, 0.14)
-      p.sizeEnd = r.range(0.3, 0.55)
+      p.sizeStart = r.range(0.06, 0.12)
+      p.sizeEnd = r.range(0.22, 0.42)
       p.drag = 9
       p.gravity = 0.1
       p.colorStart.setHex(0xf2ede2, THREE.SRGBColorSpace)
@@ -212,7 +212,10 @@ export class Impacts {
       P.emit('sprite', time)
     }
 
-    // 3. Slow-drifting cloud that hangs in the air.
+    // 3. Slow-drifting cloud that hangs in the air. Sized so that a burst
+    //    landing on cover two metres from the lens does not veil the frame:
+    //    incoming fire hits close to the camera constantly, and this is the
+    //    single largest source of near-field haze in the game.
     for (let i = 0; i < Math.ceil(3 * density); i++) {
       const p = P.params
       p.position.copy(point).addScaledVector(this.n, r.range(0.05, 0.22))
@@ -220,21 +223,21 @@ export class Impacts {
       p.velocity.copy(this.dir).multiplyScalar(r.range(0.35, 1.3))
       p.velocity.y += 0.35
       p.life = r.range(1.4, 2.6)
-      p.sizeStart = r.range(0.2, 0.35)
-      p.sizeEnd = r.range(0.9, 1.6)
+      p.sizeStart = r.range(0.16, 0.28)
+      p.sizeEnd = r.range(0.5, 0.9)
       p.drag = 2.2
       p.gravity = -0.03
       p.turbulence = 0.16
       p.colorStart.setHex(hot, THREE.SRGBColorSpace)
       p.colorEnd.setHex(cool, THREE.SRGBColorSpace)
-      p.alphaStart = 0.42
+      p.alphaStart = 0.3
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(0.6)
       p.tile = r.int(0, 2)
       p.frames = 16
       p.erode = 0.62
-      p.soft = 0.5
+      p.soft = 0.65
       P.emit('smoke', time)
     }
 
@@ -254,11 +257,11 @@ export class Impacts {
       const p = P.params
       p.position.copy(point).addScaledVector(this.n, 0.02)
       p.life = 0.05
-      p.sizeStart = 0.16
-      p.sizeEnd = 0.28
+      p.sizeStart = 0.10
+      p.sizeEnd = 0.18
       p.drag = 4
-      p.colorStart.setRGB(4.2, 3.0, 1.6)
-      p.colorEnd.setRGB(1.6, 0.7, 0.2)
+      p.colorStart.setRGB(2.9, 2.1, 1.05)
+      p.colorEnd.setRGB(1.0, 0.44, 0.12)
       p.alphaStart = 1
       p.alphaEnd = 0
       p.tile = SPRITE.core
@@ -318,13 +321,13 @@ export class Impacts {
       this.cone(this.n, 1.2, this.dir)
       p.velocity.copy(this.dir).multiplyScalar(r.range(0.5, 1.6))
       p.life = r.range(0.5, 1.1)
-      p.sizeStart = 0.09
-      p.sizeEnd = r.range(0.35, 0.6)
+      p.sizeStart = 0.07
+      p.sizeEnd = r.range(0.24, 0.42)
       p.drag = 3
       p.gravity = -0.02
       p.colorStart.setHex(thin ? 0x8d8d90 : 0x6f6e70, THREE.SRGBColorSpace)
       p.colorEnd.setHex(0x4a4a4c, THREE.SRGBColorSpace)
-      p.alphaStart = 0.4
+      p.alphaStart = 0.34
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(1.5)
@@ -367,14 +370,14 @@ export class Impacts {
       this.cone(this.n, 1.2, this.dir)
       p.velocity.copy(this.dir).multiplyScalar(r.range(1, 4))
       p.life = r.range(0.8, 1.8)
-      p.sizeStart = r.range(0.1, 0.2)
-      p.sizeEnd = r.range(0.5, 1.0)
+      p.sizeStart = r.range(0.08, 0.16)
+      p.sizeEnd = r.range(0.32, 0.62)
       p.drag = 3.2
       p.gravity = 0.05
       p.turbulence = 0.14
       p.colorStart.setHex(0xb0916a, THREE.SRGBColorSpace)
       p.colorEnd.setHex(0x6d5638, THREE.SRGBColorSpace)
-      p.alphaStart = 0.55
+      p.alphaStart = 0.42
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(1.2)
@@ -422,14 +425,14 @@ export class Impacts {
       this.cone(this.n, 0.8, this.dir)
       p.velocity.copy(this.dir).multiplyScalar(r.range(1.2, 3.6))
       p.life = r.range(1.1, 2.4)
-      p.sizeStart = r.range(0.15, 0.28)
-      p.sizeEnd = r.range(0.8, 1.5)
+      p.sizeStart = r.range(0.12, 0.22)
+      p.sizeEnd = r.range(0.45, 0.85)
       p.drag = 2.6
       p.gravity = 0.06
       p.turbulence = 0.2
       p.colorStart.setHex(hot, THREE.SRGBColorSpace)
       p.colorEnd.setHex(cool, THREE.SRGBColorSpace)
-      p.alphaStart = 0.5
+      p.alphaStart = 0.36
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(0.8)

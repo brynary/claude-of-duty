@@ -52,11 +52,43 @@ const ADS_FOCUS_RANGE = 150
 const ADS_BOKEH_SCALE = 2
 
 /**
- * Scene exposure. The tone curve is ACES with no pre-scale, so this is the only
- * thing standing between scene radiance and the curve: at 1.76 a scene
- * luminance of 0.18 lands on sRGB 136 and 0.5 lands on 192.
+ * Base exposure: the multiplier applied when the frame meters at
+ * {@link METER_REFERENCE}. Off the reference, {@link AutoExposure} corrects it.
  */
 const DEFAULT_EXPOSURE = 1.76
+
+/**
+ * Geometric mean scene luminance that the meter normalises to, and how far it
+ * is allowed to push.
+ *
+ * Measured across the eight capture poses, the frames span 0.019 (the interior)
+ * to 0.178 (the sunset rooftop) — 3.2 stops. A single fixed exposure across
+ * that spread is what produced round 3's contradictory critique: the interior
+ * and the ADS frame were both marked "raise exposure about 1.5 stops" while the
+ * frame average measured far too bright, because the two poses with sky in them
+ * were carrying it.
+ *
+ * 0.042 puts the metered mid-point of a frame at roughly sRGB 40 through the
+ * committed curve — a late-afternoon exterior with real shadow, not a mid-grey
+ * image. The 1.7-stop bound is a deliberate refusal to fully normalise: it lets
+ * the sunset rooftop stay the brightest frame in the set and the interior stay
+ * the darkest, which is the difference between exposure compensation and
+ * flattening every location into the same picture.
+ */
+const METER_REFERENCE = 0.042
+const METER_MAX_STOPS = 1.7
+const METER_RATE = 2.5
+
+/**
+ * Scene radiance, after exposure, that maps to display white.
+ *
+ * Hill's ACES fit only reaches 1.0 at 25.7, which is why round 3's frames
+ * topped out at 236 and read as veiled. Normalising the curve at 5.0 — about
+ * 4.8 stops over the metered mid-point — puts the sun disc, muzzle flashes and
+ * specular glints hard on white while leaving a sunlit plaster wall, which
+ * measures nearer 1.0, with two stops of headroom above it.
+ */
+const SCENE_WHITE = 5.0
 
 /**
  * Scene luminance above which a pixel blooms, in linear scene-referred units.
@@ -108,8 +140,14 @@ function clamp01(value: number): number {
  * Pass order is the whole design:
  *
  *   world → normals → SSAO → SSR → motion blur → depth of field
- *        → viewmodel (depth cleared) → bloom + tone map + grade
+ *        → viewmodel (depth cleared) → bloom + meter + tone map + grade
  *        → SMAA → temporal accumulation → lens
+ *
+ * The meter runs inside the bloom/grade pass rather than as a pass of its own,
+ * because that is the one place that sees scene radiance after the viewmodel is
+ * in the frame and before exposure has been applied to it. Metering the frame
+ * it is about to expose would be a feedback loop; metering the frame *before*
+ * exposure is just a measurement.
  *
  * The viewmodel is drawn after every depth-dependent effect and after the
  * depth buffer has been cleared, so the weapon can never intersect level
@@ -137,6 +175,7 @@ export class PostFxSystem implements System, PostFxService {
   private bloom: BloomEffect | null = null
 
   private exposure = 1
+  private autoExposure = true
   private damageFlash = 0
   private requestedAds = 0
   private smoothedAds = 0
@@ -154,6 +193,10 @@ export class PostFxSystem implements System, PostFxService {
 
     this.exposure = Number(urlParam('exposure') ?? DEFAULT_EXPOSURE) || DEFAULT_EXPOSURE
     const operator = (urlParam('tonemap') as ToneMapOperator | null) ?? 'filmic'
+    // `?exposure=` means "grade this frame at exactly this value", so it turns
+    // the meter off rather than fighting it. `?autoexposure=0` does the same
+    // while keeping the calibrated base.
+    this.autoExposure = urlParam('autoexposure') !== '0' && urlParam('exposure') === null
 
     this.composer = new EffectComposer(renderer, {
       frameBufferType: THREE.HalfFloatType,
@@ -218,7 +261,8 @@ export class PostFxSystem implements System, PostFxService {
     viewmodelPass.needsDepthBlit = false
     this.composer.addPass(viewmodelPass)
 
-    this.composer.addPass(new EffectPass(camera, ...this.createHdrEffects(config.bloom, operator)))
+    this.composer.addPass(
+      new EffectPass(camera, ...this.createHdrEffects(config.bloom, operator, this.autoExposure)))
 
     const smaa = new SMAAEffect({
       preset: SMAA_PRESETS[config.quality] ?? SMAAPreset.ULTRA,
@@ -233,13 +277,11 @@ export class PostFxSystem implements System, PostFxService {
 
     this.lens = new LensEffect({
       aberration: config.chromaticAberration ? 0.001 : 0,
-      // The contrast-adaptive sharpen below amplifies grain along with edges,
-      // so what lands on a flat mid-tone wall is close to half again this
-      // number. 0.018 through a 0.38 sharpen was legible as speckle on plaster.
-      grainAmount: config.filmGrain ? 0.013 : 0,
+      // Grain is added after the sharpen, so the sharpen does not amplify it.
+      grainAmount: config.filmGrain ? 0.015 : 0,
       // Applied after the temporal accumulation, whose one-pixel jitter
       // footprint is a box filter and costs a little acutance.
-      sharpenAmount: config.sharpen ? 0.38 : 0,
+      sharpness: config.sharpen ? 0.75 : 0,
     })
     this.composer.addPass(new EffectPass(camera, this.lens))
 
@@ -295,7 +337,7 @@ export class PostFxSystem implements System, PostFxService {
     })
   }
 
-  private createHdrEffects(useBloom: boolean, operator: ToneMapOperator): Effect[] {
+  private createHdrEffects(useBloom: boolean, operator: ToneMapOperator, autoExposure: boolean): Effect[] {
     const effects: Effect[] = []
 
     if (useBloom) {
@@ -315,7 +357,19 @@ export class PostFxSystem implements System, PostFxService {
       effects.push(this.bloom)
     }
 
-    this.grade = new GradeEffect({ operator, exposure: this.exposure })
+    this.grade = new GradeEffect({
+      operator,
+      exposure: this.exposure,
+      sceneWhite: SCENE_WHITE,
+      autoExposure: autoExposure
+        ? {
+            referenceLuminance: METER_REFERENCE,
+            strength: 1,
+            maxStops: METER_MAX_STOPS,
+            rate: METER_RATE,
+          }
+        : undefined,
+    })
     effects.push(this.grade)
     return effects
   }
@@ -339,6 +393,12 @@ export class PostFxSystem implements System, PostFxService {
     this.lens.grainTime = (ctx.elapsed * 71.3) % 1024
 
     this.motionBlur?.updateCamera(camera, dt)
+
+    // Once the harness has frozen the simulation the frame stops changing, so
+    // the meter takes it outright. Easing across the two dozen accumulated
+    // frames would fold a slightly different exposure into each of them and
+    // make the capture depend on the machine's frame rate.
+    this.grade.snapExposure = ctx.config.freezeAt !== null && ctx.elapsed >= ctx.config.freezeAt
 
     this.beginJitter()
     try {
@@ -431,9 +491,12 @@ export class PostFxSystem implements System, PostFxService {
   }
 
   /**
-   * Scene exposure as a linear multiplier, applied before tone mapping.
-   * {@link DEFAULT_EXPOSURE} is the calibrated value; anything else re-grades
-   * the whole image. Bloom does not follow it — see {@link BLOOM_THRESHOLD}.
+   * Base exposure, as a linear multiplier applied before tone mapping. This is
+   * the value used when the frame meters at {@link METER_REFERENCE}; the meter
+   * still corrects around it, bounded by {@link METER_MAX_STOPS}, so this is an
+   * offset on the whole grade rather than an absolute setting.
+   * {@link DEFAULT_EXPOSURE} is the calibrated value. Bloom does not follow it —
+   * see {@link BLOOM_THRESHOLD}.
    */
   setExposure(value: number): void {
     this.exposure = value

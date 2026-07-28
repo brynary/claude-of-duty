@@ -30,6 +30,13 @@ import { FxLightPool } from './FxLights'
  *    dust slice through the floor along a hard line, which is the single most
  *    obvious tell of amateur particle work.
  *
+ * 3. **No card may own the frame.** `Particles.setScreenLimit` caps the
+ *    projected size of an individual billboard and fades it out as it reaches
+ *    the cap, so a puff spawned two metres from the lens thins away instead of
+ *    laying a translucent sheet over the midground. Every world-space emitter
+ *    here is additionally sized on the assumption that incoming fire lands
+ *    close to the camera constantly.
+ *
  * The system is also defensive about who drives it: effects fire both from
  * direct `FxService` calls and from the event bus, de-duplicated by position
  * and time, so a weapon system that only emits events still gets full VFX.
@@ -97,6 +104,11 @@ export class FxSystem implements System, FxService {
 
     this.world = new Particles(ctx.scene, Math.floor(budget * 0.9), this.textures, this.softEnabled)
     this.view = new Particles(ctx.viewmodelScene, Math.min(320, Math.floor(budget * 0.1) + 96), this.textures, false)
+    // No world card may exceed ~20% of screen width, and they start thinning
+    // at half of that. Without this a single impact cloud two metres from the
+    // lens veils the whole midground.
+    this.world.setScreenLimit(0.18, 0.36)
+    this.view.setScreenLimit(0, 0)
     this.decals = new Decals(ctx.scene, ctx.config.decalBudget, this.textures)
     this.tracers = new Tracers(ctx.scene, 96)
     this.debris = new Debris(ctx.scene, ctx.config.quality === 'low' ? 10 : 26, ctx.config.seed)
@@ -226,14 +238,14 @@ export class FxSystem implements System, FxService {
       p.position.y += 0.03
       p.velocity.set(Math.cos(a) * r.range(0.8, 2.6) * strength, r.range(0.1, 0.6), Math.sin(a) * r.range(0.8, 2.6) * strength)
       p.life = r.range(0.7, 1.5)
-      p.sizeStart = r.range(0.1, 0.2)
-      p.sizeEnd = r.range(0.5, 0.95)
+      p.sizeStart = r.range(0.08, 0.16)
+      p.sizeEnd = r.range(0.3, 0.55)
       p.drag = 3
       p.gravity = 0.04
       p.turbulence = 0.2
       p.colorStart.setHex(0xa89f8d, THREE.SRGBColorSpace)
       p.colorEnd.setHex(0x746c5f, THREE.SRGBColorSpace)
-      p.alphaStart = 0.32 * strength + 0.08
+      p.alphaStart = 0.24 * strength + 0.06
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(0.7)
@@ -381,11 +393,11 @@ export class FxSystem implements System, FxService {
     this.sawTracer = false
     this.sawShell = false
 
-    this.renderDepthPrepass(ctx)
+    const depth = this.renderDepthPrepass(ctx)
 
     const near = ctx.camera.near
     const far = ctx.camera.far
-    this.world.setDepth(this.depthTarget?.depthTexture ?? null, near, far)
+    this.world.setDepth(depth, near, far)
     this.view.setDepth(null, ctx.viewmodelCamera.near, ctx.viewmodelCamera.far)
     this.world.update(this.time)
     this.view.update(this.time)
@@ -424,11 +436,12 @@ export class FxSystem implements System, FxService {
   /**
    * Renders scene depth only, at half resolution, so particles can fade where
    * they intersect geometry. Skipped entirely on frames where nothing is
-   * fading, which is most of them.
+   * fading, which is most of them; returns null in that case so the particle
+   * shader disables its depth fade rather than reading a stale buffer.
    */
-  private renderDepthPrepass(ctx: GameContext): void {
+  private renderDepthPrepass(ctx: GameContext): THREE.DepthTexture | null {
     const target = this.depthTarget
-    if (!target || !this.world.needsDepth(this.time)) return
+    if (!target || !this.world.needsDepth(this.time)) return null
 
     const gl = ctx.renderer
     const prevTarget = gl.getRenderTarget()
@@ -456,6 +469,7 @@ export class FxSystem implements System, FxService {
     ctx.scene.background = prevBackground
     this.world.setVisible(true)
     this.tracers.setVisible(true)
+    return target.depthTexture
   }
 
   resize(_width: number, _height: number): void {

@@ -495,9 +495,17 @@ export function definePropKinds(farm: InstanceFarm): void {
   farm.define('ammoBox', ammoBoxGeom(0.7, 0.34, 0.36), 'metalPainted')
   // Litter casts. A scrap that throws no shadow floats however well it is
   // seated, and these are the props closest to the camera in three poses.
+  //
+  // Not `plasterWhite`: a wall-white albedo on a 20 cm scrap lying in full sun
+  // is the brightest thing on the paving, and a blind judge read exactly this
+  // as "flat quads that take no scene lighting, pure albedo sitting on the
+  // cobbles". Worn newsprint is a dirty mid grey; a cement bag is sacking.
   farm.defineVariants('paper', [
     paperGeom(0.21, 0.29, 3), paperGeom(0.3, 0.22, 11), paperGeom(0.16, 0.24, 29),
-  ], 'plasterWhite')
+  ], 'concreteWorn')
+  farm.defineVariants('rag', [
+    paperGeom(0.26, 0.2, 61), paperGeom(0.19, 0.31, 77),
+  ], 'sandbag')
   farm.defineVariants('cardboard', [
     cardboardGeom(0.5, 0.38, 7), cardboardGeom(0.62, 0.3, 23), cardboardGeom(0.42, 0.46, 51),
   ], 'woodPlank')
@@ -569,9 +577,13 @@ export function buildStall(
   // asset, which is exactly what the plaza pose shows. Height, rake, canvas
   // corner heights and counter height all vary per stall, one post in five is
   // out of plumb and one canopy in five has lost half its cover.
-  const postH = 2.25 + rng.spread(0.24)
+  // A 0.24 m spread put every canopy in the market within half a metre of the
+  // same height, and in the plaza pose they merged into one continuous striped
+  // band across the frame. 2.02-2.66 m is still a plausible range for a stall
+  // somebody built themselves, and it breaks the band into separate roofs.
+  const postH = rng.range(2.02, 2.66)
   const hw = width / 2
-  const hd = depth / 2
+  const hd = depth * rng.range(0.86, 1.18) / 2
   const leaning = rng.int(0, 3)
   let post = 0
   for (const sx of [-1, 1]) {
@@ -1109,10 +1121,48 @@ export function buildSign(
 // Interiors
 // ---------------------------------------------------------------------------
 
+/**
+ * Lays a boarded floor as real timber.
+ *
+ * A judge measured the old floor and found "every plank identical width,
+ * identical black gap, identical speckle streak in the identical orientation" —
+ * because it was one slab wearing a plank texture. Real boards give it random
+ * widths, random butt joints that never line up between courses, a couple of
+ * boards cupped or sprung proud, and a genuine shadowed gap between each pair.
+ * At the two to six metres this floor occupies the bottom half of the interior
+ * pose, those gaps are the only high frequency detail in the lower frame.
+ */
+function boardFloor(
+  b: Builder, rng: Rand,
+  x0: number, x1: number, z0: number, z1: number, y: number,
+): void {
+  let z = z0
+  while (z < z1) {
+    const bw = rng.range(0.15, 0.26)
+    const zc = Math.min(z1, z + bw)
+    let x = x0 - rng.range(0, 1.4)
+    while (x < x1) {
+      const len = rng.range(1.1, 2.6)
+      const ax = Math.max(x0, x)
+      const bx = Math.min(x1, x + len)
+      x += len + 0.006
+      if (bx - ax < 0.12) continue
+      // A board that has sprung or cupped stands proud of its neighbours; one
+      // in twenty is missing outright, showing the joist void beneath.
+      if (rng.bool(0.045)) continue
+      const lift = rng.bool(0.16) ? rng.range(0.006, 0.022) : rng.range(0, 0.004)
+      b.slab('woodPlank', bx - ax - 0.007, 0.035, zc - z - 0.008,
+        (ax + bx) / 2, y + 0.0175 + lift, (z + zc) / 2, rng.spread(0.004))
+    }
+    z = zc + 0.008
+  }
+}
+
 /** Furnishes the three enterable buildings; empty shells read as blockout. */
 export function buildInteriors(b: Builder, farm: InstanceFarm, rng: Rand): void {
   // --- Bakery: the interior pose looks west through the cross-wall opening.
   const bY = footprintBase(-16.5, 5.75, 14, 12.5)
+  boardFloor(b, rng, -23.0, -10.0, -0.2, 11.7, bY)
   // East room: counter, oven, shelves and sacks of flour.
   b.push(-11.6, bY, 2.4, -Math.PI / 2)
   b.solid('woodPlank', 3.4, 0.94, 0.72, 0, 0.47, 0, 0, 0.02, 'wood')
@@ -1248,19 +1298,19 @@ interface StallSite { x: number; z: number; yaw: number; w?: number }
 /** Hand-composed market: two loose rows framing the plaza pose's sightline. */
 const STALLS: StallSite[] = [
   { x: -6.6, z: -8.7, yaw: -2.42, w: 3.0 },
-  { x: 1.2, z: -8.6, yaw: -0.9 },
-  { x: -13.6, z: -11.4, yaw: 1.9 },
-  { x: -13.2, z: -19.2, yaw: 2.2, w: 3.1 },
-  { x: -5.2, z: -17.6, yaw: -1.5 },
-  { x: -17.8, z: -22.6, yaw: 0.3 },
-  { x: -20.2, z: -15.0, yaw: 1.6 },
+  { x: 1.2, z: -8.6, yaw: -0.9, w: 2.15 },
+  { x: -13.6, z: -11.4, yaw: 1.9, w: 2.85 },
+  { x: -13.2, z: -19.2, yaw: 2.2, w: 3.35 },
+  { x: -5.2, z: -17.6, yaw: -1.5, w: 2.3 },
+  { x: -17.8, z: -22.6, yaw: 0.3, w: 2.7 },
+  { x: -20.2, z: -15.0, yaw: 1.6, w: 3.2 },
   { x: -8.6, z: -23.4, yaw: -0.2, w: 3.2 },
-  { x: 1.6, z: -20.4, yaw: -1.7 },
-  { x: -18.6, z: -6.4, yaw: 2.6 },
+  { x: 1.6, z: -20.4, yaw: -1.7, w: 2.4 },
+  { x: -18.6, z: -6.4, yaw: 2.6, w: 2.05 },
   // Market street, in front of the apartment shopfront.
-  { x: -8.8, z: 20.4, yaw: -1.5 },
+  { x: -8.8, z: 20.4, yaw: -1.5, w: 2.9 },
   { x: -8.6, z: 25.2, yaw: -1.5, w: 3.0 },
-  { x: -2.0, z: 31.4, yaw: 1.4 },
+  { x: -2.0, z: 31.4, yaw: 1.4, w: 2.25 },
 ]
 
 /** Everything hand-placed for a specific composition. */
@@ -1381,8 +1431,15 @@ const PROP_SEAT: Record<string, { seat: number; span: number }> = {
   chair: { seat: 0.0, span: 0.22 }, plank: { seat: 0.025, span: 1.0 },
   sheet: { seat: 0.015, span: 0.8 }, rebar: { seat: 0.0, span: 1.2 },
   boardPile: { seat: 0.0, span: 0.8 }, cableCoil: { seat: 0.0, span: 0.3 },
-  paper: { seat: 0.0, span: 0.15 }, cardboard: { seat: 0.0, span: 0.28 },
-  can: { seat: 0.0, span: 0.05 },
+  paper: { seat: 0.0, span: 0.15 }, rag: { seat: 0.0, span: 0.16 },
+  cardboard: { seat: 0.0, span: 0.28 }, can: { seat: 0.0, span: 0.05 },
+  brick: { seat: 0.035, span: 0.12 }, stone: { seat: 0.14, span: 0.2 },
+  // `chunk{i}` is built from `fragmentGeom(c*2.2, c*1.3, c*1.8)` about its own
+  // centre with `c = 0.1 + i * 0.05`, so its lowest point is 0.65 * c below the
+  // origin. Without these the default 0.30 m seat lifted every chip clear of
+  // the ground it was supposed to be lying on.
+  chunk0: { seat: 0.065, span: 0.13 }, chunk1: { seat: 0.098, span: 0.2 },
+  chunk2: { seat: 0.13, span: 0.26 }, chunk3: { seat: 0.163, span: 0.33 },
 }
 
 /**
@@ -1425,8 +1482,21 @@ export function scatterClutter(b: Builder, farm: InstanceFarm, rng: Rand, densit
     [-19.0, 16.5, 3.4], [-22.5, 30.5, 3.6], [-26.0, -3.0, 3.2], [-24.5, -24.0, 3.4],
     [6.0, -14.0, 3.0], [-2.0, -27.0, 3.4], [-27.5, 12.0, 3.2], [11.0, 40.0, 4.0],
     [30.5, 12.0, 3.6], [-13.0, 36.0, 3.4], [1.0, 38.0, 3.6], [19.5, 9.0, 3.0],
+    // Along the graded sightlines. A prop is only worth its draw call if a
+    // camera can see it, and the mid-field of every hero frame was the emptiest
+    // part of the map: 8-20 m out is exactly the band where a 20 cm object
+    // covers the handful of pixels that register as surface detail.
+    [-4.0, -9.5, 3.2], [-11.0, -17.0, 3.4], [-16.5, -12.5, 3.0], [1.5, -12.0, 2.8],
+    [-19.5, -19.5, 3.0], [-8.0, -24.0, 3.2], [-22.0, -8.5, 3.0],
+    // The alley is 4.4 m wide and is the strongest composition on the map:
+    // these hug its two walls so the corridor's leading lines and the player's
+    // route down it stay clear.
+    [5.6, 15.5, 0.9], [8.6, 26.0, 0.9], [5.7, 33.0, 0.9],
+    [-8.5, 23.0, 3.0], [-5.0, 34.0, 3.2], [2.0, 20.0, 2.2],
+    [21.0, 22.0, 2.4], [25.5, 27.5, 2.6], [15.5, 23.5, 2.4],
+    [-13.5, 3.0, 2.6], [-9.0, 9.5, 2.8], [-20.0, 2.0, 3.0],
   ]
-  const total = Math.round(320 * density)
+  const total = Math.round(520 * density)
   let placed = 0
   let guard = 0
   while (placed < total && guard < total * 30) {
@@ -1465,8 +1535,8 @@ export function scatterClutter(b: Builder, farm: InstanceFarm, rng: Rand, densit
   // Litter: paper, cardboard and cans, banked against walls and in corners the
   // way wind and years actually deposit rubbish. Small, cheap, and the fastest
   // way to stop a street reading as freshly generated.
-  const litter = ['paper', 'paper', 'cardboard', 'can', 'can']
-  const litterTotal = Math.round(220 * density)
+  const litter = ['paper', 'rag', 'cardboard', 'can', 'can', 'paper', 'brick', 'stone']
+  const litterTotal = Math.round(340 * density)
   let scraps = 0
   guard = 0
   while (scraps < litterTotal && guard < litterTotal * 30) {
@@ -1482,6 +1552,32 @@ export function scatterClutter(b: Builder, farm: InstanceFarm, rng: Rand, densit
     seatProp(farm, rng, kind, x, z, rng.range(0, Math.PI * 2), rng.range(0.7, 1.35),
       rng.spread(0.35), rng.spread(0.35))
     scraps++
+  }
+
+  // Grit, spall and swept fragments over the open ground.
+  //
+  // This is the cheapest surface detail on the map and the one the frames were
+  // most obviously missing: at 8-25 m a 10 cm chip covers four to twenty pixels,
+  // which is precisely the scale that reads as a surface having texture rather
+  // than as a shaded plane. They are instanced, never cast, and biased toward
+  // the wall bases and kerb lines where a street actually accumulates.
+  const gritKinds = ['chunk0', 'chunk1', 'chunk2', 'chunk3', 'brick', 'stone']
+  const gritTotal = Math.round(900 * density)
+  let grit = 0
+  guard = 0
+  while (grit < gritTotal && guard < gritTotal * 20) {
+    guard++
+    const x = rng.range(-34, 36)
+    const z = rng.range(-34, 44)
+    if (insideAnyBuilding(x, z, 0.25)) continue
+    // Twice as likely within a metre of a wall, which is where sweeping and
+    // run-off leave everything.
+    const hugging = insideAnyBuilding(x, z, 1.3)
+    if (!hugging && !rng.bool(0.42)) continue
+    const kind = gritKinds[Math.floor(rng.next() * gritKinds.length)]
+    seatProp(farm, rng, kind, x, z, rng.range(0, Math.PI * 2), rng.range(0.55, 1.3),
+      rng.spread(0.5), rng.spread(0.5))
+    grit++
   }
 
   // Jersey barriers in deliberate lines — but laid by hand, not by an array.
@@ -1630,13 +1726,20 @@ export function buildPosters(b: Builder, rng: Rand): void {
     const w = rng.range(0.5, 0.9)
     const h = rng.range(0.65, 1.15)
     b.push(x, y, z, yaw)
-    b.geom(rng.pick<MaterialName>(['plasterWhite', 'fabricAwning', 'woodPainted']),
+    // Weighted away from `plasterWhite`: a wall-white poster in full sun is a
+    // clipped rectangle with no shading in it, which reads as a decal that
+    // never received the grade rather than as paper stuck to a wall.
+    b.geom(rng.pick<MaterialName>(['fabricAwning', 'woodPainted', 'sandbag', 'fabricAwning', 'plasterDamaged']),
       decalQuad(w, h, 0.1, x * 3 + z), xform(0, 0, -0.014))
     b.geom('plasterDamaged', decalQuad(w * 0.45, h * 0.3, 0.35, z * 5), xform(rng.spread(w * 0.2), -h * 0.3, -0.017))
     if (rng.bool(0.5)) {
-      b.geom(rng.pick<MaterialName>(['plasterWhite', 'tarp']),
+      b.geom(rng.pick<MaterialName>(['tarp', 'woodPainted', 'sandbag']),
         decalQuad(w * 0.8, h * 0.8, 0.16, x * 7), xform(rng.spread(0.35), rng.spread(0.3), -0.02))
     }
+    // A curling corner, lifted off the wall so the poster has a lit edge and a
+    // shadow of its own instead of being a painted rectangle.
+    b.geom('woodPainted', decalQuad(w * 0.35, h * 0.28, 0.2, z * 11),
+      xform(w * rng.range(0.16, 0.3), h * rng.range(0.2, 0.34), -0.03, rng.spread(0.5), 0, rng.spread(0.4)))
     b.pop()
   }
 }

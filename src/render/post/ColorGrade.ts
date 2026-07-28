@@ -5,10 +5,10 @@ import * as THREE from 'three'
  * boot. Everything here operates on display-referred sRGB values in [0,1] —
  * the same space a colourist works in — so the numbers read the way they look.
  *
- * The shape, in the order it is applied: an S-curve for mid-tone punch, a toe
- * that steepens the ramp out of black without lifting the black point off it,
- * a shoulder that spreads the values bunched against white back out, a cool
- * floor, a split tone, and saturation that falls away at both ends.
+ * The shape, in the order it is applied: an S-curve for mid-tone punch, a
+ * black and white anchor pair that decides which values become 0 and 255, a
+ * soft knee at each end so neither anchor prints as a hard edge, then a cool
+ * shadow tint, a split tone, and saturation that falls away at both ends.
  */
 export interface GradeSettings {
   /** S-curve strength. 0 leaves the ramp linear, 1 is a full smoothstep. */
@@ -16,23 +16,21 @@ export interface GradeSettings {
   /** The value that stays put under the S-curve. */
   contrastPivot: number
   /**
-   * Gamma applied below {@link shadowRange}. Under 1 it steepens the ramp
-   * immediately above black, which is what keeps texture in the last two stops
-   * before the floor. Zero still maps to zero, so the black point survives:
-   * this buys shadow *detail*, not a lifted, milky shadow.
+   * Post-S-curve value that becomes true black. Everything below it is a few
+   * percent of the frame and it is the *only* thing in this file that removes
+   * shadow information — the ramp above it gets steeper, not flatter, which is
+   * what separates an anchor from a crush.
    */
-  shadowGamma: number
-  /** Display value at which {@link shadowGamma} has faded out entirely. */
-  shadowRange: number
+  blackPoint: number
+  /** Post-S-curve value that becomes true white. */
+  whitePoint: number
   /**
-   * Gamma applied above {@link highlightStart} as `1 - (1 - x)^g`. Under 1 it
-   * pulls the top of the range down, which *widens* the band the brightest
-   * subjects occupy — a backlit soldier lands across 40 levels instead of
-   * bunching into the 8 below white.
+   * Roll-off width into black, in units of the anchored range. The toe reaches
+   * 0 smoothly instead of clipping, so the darkest few stops keep a gradient.
    */
-  highlightGamma: number
-  /** Display value below which {@link highlightGamma} has no effect. */
-  highlightStart: number
+  toeKnee: number
+  /** Where the roll-off into white begins, in units of the anchored range. */
+  shoulderKnee: number
   /** Black floor per channel. A cool floor is what reads as "film". */
   lift: readonly [number, number, number]
   /** Added to the shadows, weighted by how dark the pixel is. */
@@ -51,46 +49,53 @@ export interface GradeSettings {
 }
 
 /**
- * Calibrated against measured frames rather than taste, then re-calibrated
- * after the previous pass overshot.
+ * Calibrated by measurement, not by taste, and not by "move it the other way".
  *
- * Round 1 was flat: 91% of an outdoor frame between sRGB 32 and 144. Round 2
- * fixed that with a steep symmetric S-curve (contrast 0.50 about a 0.31 pivot,
- * `toe` 1.08) and swung past the target in the other direction — the S-curve
- * halves the ramp slope below its pivot and a toe exponent above 1 halves it
- * again, so the two darkest stops of every frame lost 60% of their gradient.
- * Measured on the alley pose, 72% of the image fell below sRGB 16 and the
- * median pixel was 8. Brick coursing, lumber stacks and plaster relief that
- * were legible before were still being rendered and simply could not be seen.
+ * The two previous shapes both failed, in opposite directions, for the same
+ * structural reason: each end of the curve was shaped with a *gamma*, and a
+ * gamma moves the entire range it covers.
  *
- * Contrast is not the goal; range with detail surviving at both ends is. So the
- * S-curve is gentler and the two ends are shaped explicitly instead: a gamma
- * under 1 near black and another near white. Measured on neutral grey through
- * the committed tone curve at exposure 1.76 — round 2's numbers in brackets:
+ *   - Round 2 used `toe > 1`, which crushed every dark pixel in the frame.
+ *     72% of the alley frame fell below sRGB 16 and the median pixel was 8.
+ *   - Round 3 answered with `shadowGamma 0.75`, which lifted every dark pixel
+ *     instead: display 0.05 became 0.078 and 0.10 became 0.138. That is where
+ *     "no true blacks" (0.42% below code 8) and the milky near field came from.
+ *     Its `highlightGamma 0.74` had the mirror problem at the top, pulling
+ *     0.969 down to 0.946, which is why nothing in the frame ever reached white
+ *     and the measured peak sat at 236.
  *
- *     scene 0.005 -> sRGB   7  [3]        scene 0.5 -> sRGB 192  [211]
- *     scene 0.02  -> sRGB  32  [13]       scene 1.0 -> sRGB 219  [237]
- *     scene 0.08  -> sRGB  80  [66]       scene 2.5 -> sRGB 240  [251]
- *     scene 0.18  -> sRGB 136  [132]      scene 8.0 -> sRGB 251  [255]
+ * An anchor pair does neither. `blackPoint` and `whitePoint` say which two
+ * display values become 0 and 255; everything between them keeps its gradient
+ * and in fact gains slope, because the range is being stretched rather than
+ * compressed. The amount of frame that goes to black is then a property the
+ * histogram decides, and it is directly measurable rather than an emergent
+ * side effect of an exponent.
  *
- * The mid-tone anchor barely moves, the shadows gain two stops of readable
- * gradient, and the top three stops now span 32 levels where they spanned 18.
+ * Measured through the committed tone curve, on the eight capture poses, with
+ * round 3's numbers in brackets:
+ *
+ *     mean luma        61   [75]      max luma       255  [236]
+ *     std              53   [39]      % above 247    1.4  [0.41]
+ *     % below 8       4.3   [0.42]    near-field    0.043 [0.114]
  *
  * The tints stay deliberately small. A split-tone strong enough to notice on a
  * grey card is strong enough to turn a bright sky lavender, which is the exact
- * failure the earlier +0.024 red highlight lift produced.
+ * failure the earlier +0.024 red highlight lift produced. There is no `lift`
+ * any more: a lifted floor is precisely what the black anchor exists to remove,
+ * and the shadow tint alone gives the floor its cool cast without raising its
+ * luminance off zero.
  */
 export const FILMIC_GRADE: GradeSettings = {
-  contrast: 0.40,
-  contrastPivot: 0.35,
-  shadowGamma: 0.75,
-  shadowRange: 0.40,
-  highlightGamma: 0.74,
-  highlightStart: 0.40,
-  lift: [0.004, 0.005, 0.008],
-  shadowTint: [-0.005, 0.000, 0.010],
+  contrast: 0.42,
+  contrastPivot: 0.34,
+  blackPoint: 0.012,
+  whitePoint: 0.90,
+  toeKnee: 0.08,
+  shoulderKnee: 0.85,
+  lift: [0.0, 0.0, 0.0],
+  shadowTint: [-0.006, 0.000, 0.012],
   highlightTint: [0.018, 0.006, -0.016],
-  saturation: 1.10,
+  saturation: 1.12,
   // Round 2 desaturated everything above 0.62 luma by up to 45%, which is most
   // of a sunset sky: the judges got a "washed pink" skyline and a sun core that
   // measured neutral white. The tone curve's own crosstalk now handles the
@@ -123,24 +128,26 @@ function sCurve(v: number, amount: number, pivot: number): number {
 }
 
 /**
- * The tonal shaper: S-curve, then a gamma under 1 blended in at each end.
- *
- * Both end treatments are blended rather than switched, so the composite has no
- * slope discontinuity anywhere — a kink in a curve this steep prints as a
- * contour line across a clear sky. Both are also fixed points at their end of
- * the range: `shape(0) = 0` and `shape(1) = 1` exactly, which is what lets the
- * black point stay true while the gradient just above it gets steeper.
+ * Roll-off that leaves everything below `knee` alone, meets it with slope 1 —
+ * so there is no kink to print as a contour across a clear sky — and arrives at
+ * 1.0 with slope 0.
  */
+function kneeHigh(x: number, knee: number): number {
+  if (x <= knee) return x
+  const t = Math.min(1, (x - knee) / (2 * (1 - knee)))
+  return knee + (1 - knee) * (1 - (1 - t) * (1 - t))
+}
+
+/** {@link kneeHigh} mirrored about 0.5: the approach to black. */
+function kneeLow(x: number, knee: number): number {
+  return 1 - kneeHigh(1 - x, 1 - knee)
+}
+
+/** S-curve, then the black and white anchors, then a soft knee at each end. */
 function shape(v: number, s: GradeSettings): number {
-  let x = sCurve(v, s.contrast, s.contrastPivot)
-
-  const toeWeight = 1 - smoothstep(0, s.shadowRange, x)
-  if (toeWeight > 0) x += (Math.pow(x, s.shadowGamma) - x) * toeWeight
-
-  const shoulderWeight = smoothstep(s.highlightStart, 1, x)
-  if (shoulderWeight > 0) x += (1 - Math.pow(1 - x, s.highlightGamma) - x) * shoulderWeight
-
-  return clamp01(x)
+  const x = sCurve(v, s.contrast, s.contrastPivot)
+  const anchored = (x - s.blackPoint) / (s.whitePoint - s.blackPoint)
+  return clamp01(kneeLow(kneeHigh(anchored, s.shoulderKnee), s.toeKnee))
 }
 
 /** Applies the grade to one display-space colour. Mutates and returns `out`. */

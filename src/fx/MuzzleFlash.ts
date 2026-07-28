@@ -16,6 +16,13 @@ import type { Rand } from '../core/Rand'
  * The flash also drives a real point light, so the walls beside the player
  * actually brighten when the gun goes off. That single detail is most of what
  * separates a convincing weapon from a glowing sprite.
+ *
+ * **Energy budget.** Bloom keys off scene luminance above 1.6, and the sun is
+ * 2.1. The layers are authored so the summed core sits a little over the bloom
+ * threshold and rolls off warm through the tonemapper, rather than clipping to
+ * flat white with a wide halo — a flash that erases the soldier holding it is
+ * worse than no flash. The light is 5cd at 6.5m to match the intensity the AI
+ * muzzle lights already use, so the player's gun and an enemy's read alike.
  */
 
 export class MuzzleFlash {
@@ -30,6 +37,7 @@ export class MuzzleFlash {
   private readonly camForward = new THREE.Vector3()
   private readonly world = new THREE.Matrix4()
   private readonly dir = new THREE.Vector3()
+  private readonly lightPos = new THREE.Vector3()
   private readonly colour = new THREE.Color()
 
   constructor(
@@ -105,16 +113,17 @@ export class MuzzleFlash {
     const origin = inViewmodelScene ? this.origin : this.worldOrigin
     const forward = inViewmodelScene ? this.forward : this.worldForward
 
-    // 1. Hot white core, one to two frames.
+    // 1. Hot core, one to two frames. Small and only just over the bloom
+    //    threshold: this is the part that must not become a white disc.
     {
       const p = P.params
       p.position.copy(origin).addScaledVector(forward, 0.035 * flashScale)
       p.life = 0.035
-      p.sizeStart = 0.115 * flashScale
-      p.sizeEnd = 0.16 * flashScale
+      p.sizeStart = 0.075 * flashScale
+      p.sizeEnd = 0.105 * flashScale
       p.drag = 6
-      p.colorStart.setRGB(6.5, 5.4, 3.6)
-      p.colorEnd.setRGB(3.0, 1.7, 0.6)
+      p.colorStart.setRGB(3.2, 2.4, 1.3)
+      p.colorEnd.setRGB(1.4, 0.85, 0.32)
       p.alphaStart = 1
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
@@ -123,17 +132,18 @@ export class MuzzleFlash {
       P.emit('spriteAdd', time)
     }
 
-    // 2. Orange bloom, slightly longer and larger.
+    // 2. Orange bloom, slightly longer and larger. Carries the hue that has to
+    //    survive the tonemapper, so it stays well under the core in luminance.
     {
       const p = P.params
       p.position.copy(origin).addScaledVector(forward, 0.075 * flashScale)
       p.life = 0.055
-      p.sizeStart = 0.2 * flashScale
-      p.sizeEnd = 0.34 * flashScale
+      p.sizeStart = 0.13 * flashScale
+      p.sizeEnd = 0.22 * flashScale
       p.drag = 8
-      p.colorStart.setRGB(4.2, 1.9, 0.55)
-      p.colorEnd.setRGB(1.2, 0.34, 0.05)
-      p.alphaStart = 0.95
+      p.colorStart.setRGB(1.75, 0.78, 0.22)
+      p.colorEnd.setRGB(0.55, 0.15, 0.02)
+      p.alphaStart = 0.9
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(6)
@@ -142,17 +152,18 @@ export class MuzzleFlash {
       P.emit('spriteAdd', time)
     }
 
-    // 3. Radial star flare — the shape the eye actually registers.
+    // 3. Radial star flare — the shape the eye actually registers, and the
+    //    reason the flash reads as directional rather than as a cotton ball.
     {
       const p = P.params
       p.position.copy(origin).addScaledVector(forward, 0.05 * flashScale)
       p.life = 0.045
-      p.sizeStart = 0.34 * flashScale * r.range(0.8, 1.35)
+      p.sizeStart = 0.23 * flashScale * r.range(0.8, 1.35)
       p.sizeEnd = p.sizeStart * 1.25
       p.drag = 8
-      p.colorStart.setRGB(5.2, 3.4, 1.5)
-      p.colorEnd.setRGB(1.6, 0.6, 0.15)
-      p.alphaStart = 0.9
+      p.colorStart.setRGB(1.9, 1.25, 0.55)
+      p.colorEnd.setRGB(0.6, 0.22, 0.05)
+      p.alphaStart = 0.85
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(2)
@@ -172,12 +183,12 @@ export class MuzzleFlash {
         .normalize()
       p.velocity.copy(this.dir).multiplyScalar(r.range(4, 14))
       p.life = r.range(0.08, 0.22)
-      p.sizeStart = r.range(0.008, 0.018) * flashScale
+      p.sizeStart = r.range(0.007, 0.015) * flashScale
       p.sizeEnd = 0.002
       p.drag = 4
       p.gravity = 0.5
-      p.colorStart.setRGB(4.5, 2.6, 0.9)
-      p.colorEnd.setRGB(1.2, 0.25, 0.03)
+      p.colorStart.setRGB(2.4, 1.4, 0.5)
+      p.colorEnd.setRGB(0.7, 0.15, 0.02)
       p.alphaStart = 1
       p.alphaEnd = 0
       p.stretch = 0.05
@@ -199,14 +210,16 @@ export class MuzzleFlash {
       p.velocity.copy(this.dir).multiplyScalar(r.range(0.8, 2.6))
       p.velocity.y += 0.3
       p.life = r.range(0.7, 1.5)
-      p.sizeStart = r.range(0.09, 0.16) * flashScale
-      p.sizeEnd = r.range(0.5, 0.95) * flashScale
+      // Kept small: this card is born 60cm from the player's own lens, and at
+      // half a metre a puff of any size is a screen-wide grey veil.
+      p.sizeStart = r.range(0.07, 0.12) * flashScale
+      p.sizeEnd = r.range(0.28, 0.5) * flashScale
       p.drag = 3.4
       p.gravity = -0.05
       p.turbulence = 0.22
-      p.colorStart.setHex(0xa9a49a, THREE.SRGBColorSpace)
-      p.colorEnd.setHex(0x6c6862, THREE.SRGBColorSpace)
-      p.alphaStart = 0.3
+      p.colorStart.setHex(0xc4beb2, THREE.SRGBColorSpace)
+      p.colorEnd.setHex(0x7f7a73, THREE.SRGBColorSpace)
+      p.alphaStart = 0.24
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(1.4)
@@ -217,12 +230,14 @@ export class MuzzleFlash {
       this.worldParticles.emit('smoke', time)
     }
 
-    // 6. The light. Warm, short, and bright enough to matter indoors.
+    // 6. The light, pushed clear of the muzzle so the shooter's own hands and
+    //    chest are not sitting 20cm from a point source. Matched to the AI
+    //    muzzle lights (5cd, 6.5m) so every gun in frame flashes alike.
     this.colour.setRGB(1.0, 0.72, 0.42)
-    const peak = 26 * scale
-    this.worldLights.flash(this.worldOrigin, this.colour, peak, 11 * scale, 0.07, time, 2.6)
+    this.lightPos.copy(this.worldOrigin).addScaledVector(this.worldForward, 0.35)
+    this.worldLights.flash(this.lightPos, this.colour, 5 * scale, 6.5 * scale, 0.06, time, 2.6)
     if (inViewmodelScene) {
-      this.viewLights.flash(this.origin, this.colour, 4.5 * scale, 1.6 * scale, 0.07, time, 2.6)
+      this.viewLights.flash(this.origin, this.colour, 1.6 * scale, 1.4 * scale, 0.06, time, 2.6)
     }
   }
 }

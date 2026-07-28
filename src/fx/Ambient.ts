@@ -45,8 +45,9 @@ export class Ambient {
 
     this.paperMaterial = new THREE.MeshStandardMaterial({
       map: textures.paper,
+      color: 0xa39a89,
       side: THREE.DoubleSide,
-      roughness: 0.95,
+      roughness: 1,
       metalness: 0,
     })
     this.paperMaterial.name = 'fx-litter'
@@ -92,7 +93,15 @@ export class Ambient {
     this.litter(ctx, time, dt)
   }
 
-  /** Fine dust suspended in the air, brightest where a sunbeam reaches it. */
+  /**
+   * Fine dust suspended in the air, brightest where a sunbeam reaches it.
+   *
+   * Motes are sized in *screen* space, not world space: a mote is a couple of
+   * pixels whether it is one metre away or twelve. Sizing them in metres is
+   * what turned the ones nearest the lens into bright white lozenges with no
+   * visible source — the "floating specks" the frames were showing. Real
+   * particulate reads as a sparkle at the resolution limit, never as a shape.
+   */
   private motes(ctx: GameContext, time: number, dt: number, backlit: number): void {
     const budget = ctx.config.particleBudget
     const interval = budget >= 8000 ? 1 / 34 : budget >= 4000 ? 1 / 18 : 1 / 8
@@ -100,6 +109,9 @@ export class Ambient {
     let spawned = 0
     const r = this.rand
     const physics = ctx.services.physics
+    // Metres of world size per metre of distance that subtends ~3px at 1080p
+    // with the default 80 degree vertical FOV.
+    const perMetre = 0.0047
 
     while (this.moteTimer <= 0 && spawned < 6) {
       this.moteTimer += interval
@@ -111,6 +123,9 @@ export class Ambient {
         cam.y + r.range(-1.6, 4.5),
         cam.z + this.fwd.z * 5 + r.spread(9),
       )
+      const dist = this.pos.distanceTo(cam)
+      // Anything inside arm's reach is a lens artefact, not atmosphere.
+      if (dist < 1.6) continue
 
       // One cheap shadow probe per mote is affordable at this rate and is what
       // makes the motes gather in shafts instead of filling the whole volume.
@@ -119,20 +134,20 @@ export class Ambient {
         const hit = physics.raycast(this.pos, this.toSun, 26, { characters: false })
         if (hit) lit = 0.12
       }
-      const brightness = (0.28 + backlit * 0.95) * lit
+      const brightness = (0.2 + backlit * 0.6) * lit
 
       const p = this.particles.params
       p.position.copy(this.pos)
       p.velocity.set(r.spread(0.12), r.range(-0.02, 0.09), r.spread(0.12))
       p.life = r.range(6, 13)
-      p.sizeStart = r.range(0.006, 0.019)
+      p.sizeStart = dist * perMetre * r.range(0.7, 1.25)
       p.sizeEnd = p.sizeStart
       p.drag = 0.5
       p.gravity = 0.004
       p.turbulence = 0.055
       p.colorStart.setRGB(1.15 * brightness, 1.05 * brightness, 0.88 * brightness)
       p.colorEnd.setRGB(0.9 * brightness, 0.82 * brightness, 0.7 * brightness)
-      p.alphaStart = 0.85 * lit
+      p.alphaStart = 0.4 * lit
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.tile = SPRITE.spark
@@ -154,7 +169,10 @@ export class Ambient {
       spawned++
 
       const cam = ctx.camera.position
-      this.pos.set(cam.x + this.fwd.x * 6 + r.spread(11), cam.y + 3, cam.z + this.fwd.z * 6 + r.spread(11))
+      this.pos.set(cam.x + this.fwd.x * 9 + r.spread(11), cam.y + 3, cam.z + this.fwd.z * 9 + r.spread(11))
+      // Drift belongs in the middle distance. Close in it is a translucent
+      // sheet over the one part of the frame that has to be the sharpest.
+      if (Math.abs(this.pos.x - cam.x) + Math.abs(this.pos.z - cam.z) < 4.5) continue
       let groundY = 0
       if (physics) {
         const hit = physics.raycast(this.pos, this.down, 14, { characters: false })
@@ -168,14 +186,14 @@ export class Ambient {
       p.velocity.copy(this.windDir).multiplyScalar(r.range(1.6, 4.4))
       p.velocity.y = r.range(0.05, 0.5)
       p.life = r.range(1.6, 3.4)
-      p.sizeStart = r.range(0.05, 0.13)
-      p.sizeEnd = r.range(0.3, 0.7)
+      p.sizeStart = r.range(0.04, 0.1)
+      p.sizeEnd = r.range(0.22, 0.45)
       p.drag = 1.1
       p.gravity = 0.05
       p.turbulence = 0.34
       p.colorStart.setHex(0xbfb49c, THREE.SRGBColorSpace)
       p.colorEnd.setHex(0x8e8470, THREE.SRGBColorSpace)
-      p.alphaStart = 0.16
+      p.alphaStart = 0.11
       p.alphaEnd = 0
       p.rotation = r.range(0, 6.28)
       p.rotationSpeed = r.spread(0.8)
@@ -242,7 +260,16 @@ export class Ambient {
     }
   }
 
-  /** Wind-blown paper tumbling down the street. */
+  /**
+   * Wind-blown paper skittering down the street.
+   *
+   * It stays on the street: an earlier version let each sheet loft nearly a
+   * metre and accepted whatever surface the downward probe found, so scraps
+   * ended up hovering over awnings and stall roofs as hard-edged white
+   * polygons with no shading, no contact and no visible cause. A sheet is only
+   * drawn when the ground under it is at least a metre below the eye — i.e.
+   * actual ground — and it never lifts more than ankle height.
+   */
   private litter(ctx: GameContext, time: number, dt: number): void {
     const physics = ctx.services.physics
     const cam = ctx.camera.position
@@ -271,17 +298,21 @@ export class Ambient {
           const hit = physics.raycast(this.pos, this.down, 16, { characters: false })
           this.paperGround[i] = hit ? hit.point.y : cam.y - 1.68
         } else {
-          this.paperGround[i] = 0
+          this.paperGround[i] = cam.y - 1.68
         }
       }
 
+      const ground = this.paperGround[i]
       const bob = Math.abs(Math.sin(time * 1.9 + seed * 1.3))
-      this.pos.y = this.paperGround[i] + 0.02 + bob * bob * 0.85
+      this.pos.y = ground + 0.015 + bob * bob * 0.16
 
       this.euler.set(time * 3.1 + seed, time * 2.2 + seed * 0.7, time * 4.3 + seed * 1.9)
       this.quat.setFromEuler(this.euler)
       const near = this.pos.distanceTo(cam)
-      this.scaleVec.setScalar(near < 1.1 || near > span * 0.75 ? 0 : 1)
+      const onStreet = ground < cam.y - 1.0
+      // Fade in with distance rather than popping to full size at a hard cut.
+      const grow = THREE.MathUtils.smoothstep(near, 2.2, 4.5) * (1 - THREE.MathUtils.smoothstep(near, 16, 22))
+      this.scaleVec.setScalar(onStreet ? grow : 0)
       this.m4.compose(this.pos, this.quat, this.scaleVec)
       this.paper.setMatrixAt(i, this.m4)
     }

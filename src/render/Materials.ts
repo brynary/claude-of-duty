@@ -63,7 +63,12 @@ export class MaterialSystem implements System, MaterialService {
    * shared. See `Detail.ts`.
    */
   private buildDetailMap(): THREE.DataTexture {
-    const size = this.resolutionScale < 1 ? 256 : 512
+    // Shared by every triplanar surface in the world, so its resolution is
+    // paid for exactly once. At the 1.6 tiles per metre it is projected at,
+    // 1024 puts roughly 1600 texels on a metre — fine enough that a wall stays
+    // resolved at arm's length, which is where a first-person camera spends
+    // most of its time.
+    const size = this.resolutionScale < 1 ? 512 : 1024
     const tex = new THREE.DataTexture(
       buildDetailNormal(hashName(this.seed, 'detail'), size),
       size,
@@ -178,7 +183,7 @@ export class MaterialSystem implements System, MaterialService {
     // Order-independent per-material seeding: the library produces byte-identical
     // textures whatever order materials happen to be requested in.
     const noise = new Noise(hashName(this.seed, name))
-    const built = spec.build(noise, size)
+    const built = spec.build(noise, size, spec.worldSize)
     const maps = bakeSurface(built, this.anisotropy)
 
     const repeat = spec.repeat ?? [1, 1]

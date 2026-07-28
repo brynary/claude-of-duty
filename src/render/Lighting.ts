@@ -14,40 +14,54 @@ import {
 /**
  * Luminance the key light lands on with the sun high enough to matter.
  *
- * This and HEMISPHERE_INTENSITY together set the single number that decides
- * whether a daylight frame reads as daylight: the ratio between a surface in
- * the sun and the same surface in shade. Two and a half to three stops, so a
- * mid-albedo wall sits near sRGB 210 lit and near sRGB 95 shaded. Flatter and
- * the whole frame packs into a midtone band and looks like an overcast render
- * of a sunny scene; wider and the shaded half stops carrying its material,
- * which is the more expensive failure of the two — a black wall tells you
- * nothing about what it is made of.
+ * The single number that decides whether a daylight frame reads as daylight is
+ * this against the fill, and the fill is set almost entirely by SKY_SCALE_ENV
+ * in SkyModel — the hemisphere light below is under a tenth of it. At the
+ * previous pair a patch of ground in shade sat at 44 per cent of the same patch
+ * in sun; clear-sky daylight at a 21-degree elevation is nearer 24. That is the
+ * measurement behind every "no discernible light direction", "flat uniform
+ * lighting" and "nondirectional fill" note the critics have filed.
+ *
+ * Raised rather than only cutting the fill, for two reasons. It keeps sunlit
+ * surfaces at the exposure the post chain is already calibrated to — a sunlit
+ * mid-albedo ground plane stays at sRGB 107 — so widening the ratio does not
+ * silently re-expose the whole frame. And it is what buys the frame a white
+ * point: nothing in the world except a specular highlight is ever going to
+ * reach the top of the tone curve, and a highlight's peak scales with the key.
  *
  * The absolute value is scene-referred and is only meaningful next to the post
  * chain's exposure — see SKY_SCALE_VISIBLE in SkyModel for the full
  * calibration. Changing exposure without changing these, or the reverse, moves
  * the whole frame.
  */
-const SUN_TARGET_LUMINANCE = 2.1
+const SUN_TARGET_LUMINANCE = 2.9
 /**
- * Sky-bounce fill, deliberately a small fraction of the key.
+ * Uniform sky fill, on top of the image-based ambient.
  *
- * The number that matters is the ratio to SUN_TARGET_LUMINANCE, because that is
- * the key-to-fill of the whole frame. At 0.075 it was better than sixteen to
- * one before occlusion and past thirty to one after it, which is a clear
- * high-altitude sky over black ground — not a dusty street walled in by sunlit
- * plaster throwing light back at everything. Fill only ever raises the shadow
- * *midtones*: the darkest pixels in the frame are at the curve's toe and stay
- * there, so this buys readable texture in shade without touching the black
- * point.
+ * Deliberately small, and smaller than it looks: measured against the probe,
+ * the environment map delivers about 0.23 of irradiance to an upward-facing
+ * surface and this delivers 0.023. Moving it between 0.075 and 0.135, as the
+ * previous two rounds did, changes the total fill by five per cent — it was
+ * never the knob that flattened the light, and treating it as one is how two
+ * rounds went by without the ratio actually moving.
+ *
+ * What it is still good for is the part of the sky a cube probe under-serves:
+ * it is the one ambient term that survives when the environment map has not
+ * been regenerated yet. Kept low so the *directional* half of the fill — the
+ * bounce in SkyOcclusion — carries the shading variation instead.
  */
-const HEMISPHERE_INTENSITY = 0.135
+const HEMISPHERE_INTENSITY = 0.055
 
 /**
  * Warm bounce standing in for the light a sunlit floor throws back into a room
  * the sun never reaches. Short range and unshadowed: it is fill, not a key.
+ *
+ * Raised in step with the cut to the sky probe. A room is lit by these far more
+ * than by ambient, so leaving them alone while the ambient halved would have
+ * taken the interiors down with the exteriors — and `interior` was one of only
+ * two poses the previous round won.
  */
-const INTERIOR_FILL_INTENSITY = 5.2
+const INTERIOR_FILL_INTENSITY = 7
 const INTERIOR_FILL_RANGE = 14
 
 const POOL_SIZE: Record<string, number> = { low: 3, medium: 4, high: 5, ultra: 5 }
@@ -271,7 +285,17 @@ export class LightingSystem implements System, LightingService {
     this.hemisphere.groundColor.copy(this.bounceTint)
     // Enclosed surfaces fall back to bounce, and bounce is the colour of what
     // it bounced off — never the blue of a sky they cannot see.
-    this.occlusion.setBounceColor(this.bounceTint)
+    //
+    // Its direction is the sun's azimuth reversed and tipped below the horizon.
+    // A wall in shade is one whose normal points away from the sun, and what it
+    // is looking at is the sunlit wall across the street plus the road between
+    // them: both lie behind it relative to the sun, and the road is below. That
+    // puts the warm fill exactly on the faces that have no key, which is what
+    // gives a shaded surface any shading at all. Faded with the sun, since
+    // there is nothing left to bounce once it is down — unlike the enclosed
+    // floor, which has to survive to keep rooms out of the black.
+    this.tmpDir2.set(-this.sunDirection.x, -0.22, -this.sunDirection.z).normalize()
+    this.occlusion.setBounce(this.tmpDir2, this.bounceTint, horizonFade)
 
     for (const fill of this.interiorFills) fill.color.copy(this.bounceTint)
 

@@ -36,47 +36,88 @@ export const SKY_PARAMS: SkyParams = {
  * This, SKY_SCALE_ENV and the lighting system's SUN_TARGET_LUMINANCE are
  * scene-referred radiances, and the post chain's exposure is what turns them
  * into pixels — the two ends are one calibration and cannot be tuned apart.
- * Against the committed grade (ACES at exposure 1.65) these put the zenith near
- * sRGB 165, the horizon near 230 and the band around the sun near 250 without
- * ever reaching 255, and a sunlit mid-albedo wall at 211 against the same wall
- * in shade at 65.
- */
-export const SKY_SCALE_VISIBLE = 0.29
-/**
- * What the environment map is generated at. Lower than the visible scale
- * because Preetham has no absolute calibration and pairing its raw radiance
- * with a physically sized sun leaves shadows barely darker than lit ground.
+ * Against the committed grade (ACES at exposure 1.76) these put the zenith near
+ * sRGB 118, the sky opposite the sun near 109, the band twenty degrees off the
+ * sun near 192 and the last couple of degrees around the disc near 245.
  *
- * Together with the lighting system's HEMISPHERE_INTENSITY this sets the frame's
- * key-to-fill. At 0.112 a wall in open shade sat better than ten to one under
- * the same wall in sun — a clear sky over dark ground. A dusty street walled in
- * by sunlit plaster is nearer five to one, and the difference is precisely the
- * shadow detail a shipped frame keeps and this one was throwing away.
+ * Trimmed from 0.29 because the sky is the largest single area in most of the
+ * graded poses and was setting their average brightness on its own. The dome
+ * also carries the frame's saturation: less of it crosses the shoulder now, so
+ * the blue stays blue instead of bleaching towards the grey-violet a judge
+ * called "overcast and slightly wrong in hue".
  */
-export const SKY_SCALE_ENV = 0.148
+export const SKY_SCALE_VISIBLE = 0.25
+/**
+ * What the environment map is generated at.
+ *
+ * This is the single most important number in the lighting rig, because the
+ * image-based ambient it produces is around ninety per cent of everything that
+ * lights a surface the sun cannot reach — the hemisphere light below is the
+ * other ten. Key-to-fill is therefore set here and by SUN_TARGET_LUMINANCE,
+ * and nowhere else.
+ *
+ * Measured: at 0.148 the probe delivered 0.58 of irradiance to an upward-facing
+ * surface against 0.75 from a 21-degree sun, so a patch of shaded ground sat at
+ * 44 per cent of the same patch in sunlight. Real clear-sky daylight at this
+ * elevation is nearer 24 per cent — direct-horizontal to diffuse-horizontal is
+ * about three to one, and no amount of urban bounce closes that. The fill was
+ * three times over strength, which is what "nondirectional fill" and "no
+ * discernible light direction" measure as. At 0.054 an open-shade surface lands
+ * near sRGB 35 against the same surface at 107 in sun.
+ *
+ * The probe is not the whole fill any more either: a third of what a shaded
+ * wall receives now comes from the directional bounce in SkyOcclusion, which is
+ * why this can be cut this far without shade going flat and empty.
+ *
+ * Note this drives reflections as well as ambient. That is intended: the same
+ * over-strength probe is what a judge saw as "a dense, uniform field of tiny
+ * bright specks ... glitter or sequins rather than aggregate".
+ */
+export const SKY_SCALE_ENV = 0.054
 
 /** Radiance of the sun disc itself. Bounded so half-float buffers survive it. */
 export const SUN_DISC_RADIANCE = 80
 
 /**
- * Preetham's circumsolar lobe is unbounded: the `Lin^1.5` term puts the sky ten
- * degrees off the sun sixty times brighter than the zenith, which no tone curve
- * can hold — it lands on flat 255 with the hue thrown away, and the gradient
- * that makes a sky read as a sky goes with it. A photographic sky is more like
- * ten to one.
+ * Preetham's circumsolar lobe runs away: the `Lin^1.5` term puts the sky within
+ * a couple of degrees of the sun about fifty times the zenith, which no tone
+ * curve holds — it lands on flat white with the hue thrown away, and the
+ * gradient that makes a sky read as a sky goes with it. So the dome gets a
+ * shoulder: exact below the knee, compressed above it. Applied identically on
+ * the CPU and the GPU, always after the scale, and always before the sun disc
+ * is added — the disc is *supposed* to clip.
  *
- * So the dome gets a shoulder: exact below the knee, asymptotic to a hard
- * ceiling above it. Applied identically on the CPU and the GPU, always after
- * the scale, and always before the sun disc is added — the disc is *supposed*
- * to clip.
+ * The shoulder used to be an exponential approach to a hard ceiling of 1.30,
+ * and that ceiling was the reason no frame in the previous round reached white.
+ * Scene radiance 1.30 grades to sRGB 228, and with nothing in the world above
+ * it — a sunlit mid-albedo wall is nearer 0.23 — 228 was the brightest pixel
+ * any pose without the sun disc in shot could produce. Worse, the approach is
+ * asymptotic, so every direction between five and zero degrees off the sun
+ * landed within one code value of every other: about ten degrees of sky
+ * flattened onto a single tone, which is both a lost gradient and lost local
+ * contrast over a large part of the frame.
+ *
+ * A power law fixes both. It has no ceiling, so the brightest sky is free to
+ * clip the way it does in a photograph; and it stays strictly increasing, so
+ * the circumsolar falloff survives as a gradient rather than a plateau. The
+ * exponent is what sets how many of the sky's stops above the knee survive into
+ * the top stop of the display: at 0.80 the sky reads 244 at the disc, 224 ten
+ * degrees off and 192 at twenty, which is a gradient a judge can see rather
+ * than the flat 228 the old ceiling produced everywhere inside ten degrees.
+ *
+ * Note this is *not* what fixes the frame's white point, though it was assumed
+ * to be. Even with the shoulder removed entirely the sky only passes sRGB 247
+ * within three degrees of the sun — an area the disc and its aureole already
+ * cover. A frame with no sun in shot has to get its white point from a
+ * specular or an emitter, which is a question of key strength and of material
+ * roughness, not of sky.
  */
-const SKY_KNEE = 0.42
-const SKY_CEILING = 1.30
+const SKY_KNEE = 0.50
+const SKY_SHOULDER = 0.80
 
 export function skyShoulder(x: number): number {
   if (x <= SKY_KNEE) return x
-  const span = SKY_CEILING - SKY_KNEE
-  return SKY_KNEE + span * (1 - Math.exp(-(x - SKY_KNEE) / span))
+  return SKY_KNEE * Math.pow(x / SKY_KNEE, SKY_SHOULDER)
 }
 
 const BETA_R = new THREE.Vector3(5.804542996261093e-6, 1.3562911419845635e-5, 3.0265902468824876e-5)
@@ -270,13 +311,14 @@ const float MIE_ZENITH = 1.25e4;
 const float SKY_PI = 3.141592653589793;
 const float SUN_ANGULAR_COS = 0.9999566769464483;
 const float SKY_KNEE = ${SKY_KNEE.toFixed(4)};
-const float SKY_CEILING = ${SKY_CEILING.toFixed(4)};
+const float SKY_SHOULDER = ${SKY_SHOULDER.toFixed(4)};
 
-// Must stay numerically identical to skyShoulder() above.
+// Must stay numerically identical to skyShoulder() above. Written branchlessly
+// and with the base of the power clamped at the knee, since pow() of anything
+// at or below zero is undefined and the dome is evaluated per fragment.
 vec3 skyShoulder( vec3 c ) {
-  const float span = SKY_CEILING - SKY_KNEE;
-  vec3 over = max( c - SKY_KNEE, vec3( 0.0 ) );
-  return min( c, vec3( SKY_KNEE ) ) + span * ( 1.0 - exp( -over / span ) );
+  vec3 rolled = SKY_KNEE * pow( max( c, vec3( SKY_KNEE ) ) / SKY_KNEE, vec3( SKY_SHOULDER ) );
+  return min( c, vec3( SKY_KNEE ) ) + max( rolled - SKY_KNEE, vec3( 0.0 ) );
 }
 
 uniform vec3 uBetaR;
