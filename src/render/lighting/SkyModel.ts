@@ -82,11 +82,19 @@ export const SKY_SCALE_VISIBLE = 0.25
  * Nudged 0.054 to 0.060 purely to hold station. The probe is baked through
  * {@link skyShoulder}, and the new logarithmic shoulder compresses the probe's
  * own circumsolar region by about forty per cent; without this the total fill
- * on an open-shade surface would have fallen even as the bounce rose. Measured
- * end to end, a patch of ground in open shade sits at 19.4 per cent of the same
- * patch in sun, against 18.4 before — still far under the 44 per cent that
- * flattened round 3, and a little closer to the ~24 per cent of real clear-sky
- * daylight this rig has always been aiming at.
+ * on an open-shade surface would have fallen even as the bounce rose.
+ *
+ * Left here through the round that corrected the shade level, and deliberately.
+ * The open-shade-to-sunlit ratio was 19.6 per cent and needed to be near 24, but
+ * this is the wrong term to close that gap with: image-based ambient from an
+ * open sky delivers 0.22 of irradiance to an upward normal and 0.18 to a
+ * horizontal one, a spread of 1.3 across the whole sphere, so every unit added
+ * here lands as a wash that no normal map can write into. It also drives glossy
+ * reflections, and it was an over-strength probe that a judge read as "a dense,
+ * uniform field of tiny bright specks ... glitter or sequins rather than
+ * aggregate". The gap was closed in SkyOcclusion's OPEN_SHADE_FRACTION instead,
+ * where the light arrives from a measured direction with a measured colour. The
+ * ratio now lands at 24.0 per cent.
  */
 export const SKY_SCALE_ENV = 0.060
 

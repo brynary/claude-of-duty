@@ -130,6 +130,23 @@ export interface TriplanarOptions {
   cavityDirt?: number
   /** Splash-back strength at the bottom of vertical faces, 0..1. */
   grimeAmount?: number
+  /**
+   * How much of the splash-back deposit is opaque film rather than stain, 0..1.
+   *
+   * A film hides the surface and a stain only tints it, and the difference is
+   * the whole of whether the band keeps its texture. See the splash-back block
+   * in `MAP_FRAGMENT`.
+   */
+  grimeOpacity?: number
+  /**
+   * How dark the staining half of the deposit gets, as a fraction of the
+   * surface's own value at full coverage.
+   *
+   * Applied as a multiply through `uGrimeStain`, which carries the grime's hue
+   * renormalised to unit luminance so that this number alone says how dark and
+   * `grimeColor` alone says what colour.
+   */
+  grimeStain?: number
   /** Metres over which splash-back fades out going up. */
   grimeHeight?: number
   /** World Y that splash-back is measured from. */
@@ -163,8 +180,10 @@ uniform float uParallax;
 uniform vec2 uParallaxFade;
 uniform float uMicroShadow;
 uniform vec3 uGrimeColor;
+uniform vec3 uGrimeStain;
 uniform float uCavityDirt;
 uniform float uGrimeAmount;
+uniform float uGrimeOpacity;
 uniform float uGrimeHeight;
 uniform float uGrimeBase;
 
@@ -348,7 +367,37 @@ const MAP_FRAGMENT = /* glsl */ `
 	float triFoot = 1.0 - smoothstep( 0.0, max( 0.02, uGrimeHeight * triEdge ),
 		max( vTriWorldPos.y - uGrimeBase, 0.0 ) );
 	float triBaseGrime = clamp( uGrimeAmount * triSide * triFoot * triFoot * ( 0.55 + 0.8 * triMacro ), 0.0, 0.8 );
-	triAlbedo.rgb = mix( triAlbedo.rgb, uGrimeColor * ( 0.45 + 0.6 * triMacro ), triBaseGrime );
+
+	// A deposit is part film and part stain, and the two do opposite things to
+	// the surface underneath.
+	//
+	// Film hides it. That is a mix towards the deposit's own colour, and it
+	// scales whatever relief the surface had by ( 1 - coverage ). Stain only
+	// tints it. That is a multiply, which darkens and shifts hue while leaving
+	// the surface's variation untouched in relative terms — and relative
+	// variation is what survives a tone curve, so it is what still reads when
+	// the only light on the surface is fill.
+	//
+	// This band used to be pure film at up to 0.8 coverage. Measured across the
+	// library, that left the foot of a wall at 0.21 relative deviation against
+	// 0.28 on the same wall above the band, and on ochre plaster and worn
+	// concrete it more than halved. Every mask the band is built from — the
+	// vertical ramp, the side facing, the ten-metre macro field — is smooth at
+	// the scale of a brick, so there was nothing left to carry detail once the
+	// surface itself had been mixed away.
+	//
+	// That is the worst place in the frame to spend texture. It is the closest
+	// masonry to a standing camera, and being at the bottom of a wall it is the
+	// part most reliably in shadow — so under a key it still read as dirt and
+	// got signed off, and everywhere else it read as a flat brown stripe.
+	//
+	// Splitting the deposit puts relative deviation back to 0.26 while the
+	// band's mean only moves from 0.59 of the clean surface to 0.67: nearly all
+	// of the texture returns and almost none of the frame's exposure does.
+	float triOpaque = triBaseGrime * uGrimeOpacity;
+	float triStain = triBaseGrime - triOpaque;
+	triAlbedo.rgb *= mix( vec3( 1.0 ), uGrimeStain, triStain );
+	triAlbedo.rgb = mix( triAlbedo.rgb, uGrimeColor * ( 0.45 + 0.6 * triMacro ), triOpaque );
 
 	float triUp = clamp( triN.y, 0.0, 1.0 );
 	float triDust = clamp(
@@ -356,7 +405,13 @@ const MAP_FRAGMENT = /* glsl */ `
 		0.0, 0.9 );
 	triAlbedo.rgb = mix( triAlbedo.rgb, uDustColor * ( 0.7 + 0.6 * triMacro ), triDust );
 
-	float triFilth = max( triCavity * 0.75, triBaseGrime );
+	// Coverage for the terms that only care how much of the surface is buried.
+	// The staining half counts for half: it is on the surface, but you can
+	// still see through it.
+	float triFilth = max( triCavity * 0.75, triOpaque + triStain * 0.5 );
+	// Coverage by the part that actually hides the surface. Only this much of
+	// the deposit is entitled to replace a surface property outright.
+	float triFilm = max( triCavity * 0.75, triOpaque );
 
 	diffuseColor *= triAlbedo;
 `
@@ -370,7 +425,14 @@ const ROUGHNESS_FRAGMENT = /* glsl */ `
 	roughnessFactor *= mix( 1.0 - uMesoRough, 1.0 + uMesoRough, triMeso );
 	roughnessFactor += ( triCoarse.y - 0.5 ) * uCoarseRough;
 	roughnessFactor += ( triDetRH.x - 0.5 ) * uDetailRough;
-	roughnessFactor = mix( roughnessFactor, 0.95, triFilth );
+	// Only the part of the deposit that buries the surface may flatten its
+	// gloss. Driving the whole splash-back band to a single roughness was the
+	// other half of why it read as a stripe: with the albedo mixed away and the
+	// gloss pinned, the band had no variation left in either channel.
+	roughnessFactor = mix( roughnessFactor, 0.95, triFilm );
+	// The staining half still dulls the surface, but as an offset, which moves
+	// the mean and leaves the deviation exactly where it was.
+	roughnessFactor += triStain * 0.22;
 	roughnessFactor = mix( roughnessFactor, uDustRough, triDust );
 	roughnessFactor = clamp( roughnessFactor, 0.06, 1.0 );
 `
@@ -461,7 +523,7 @@ const VERTEX_NORMAL = /* glsl */ `
 	vTriWorldNormal = transpose( mat3( viewMatrix ) ) * normalize( transformedNormal );
 `
 
-const CACHE_KEY = 'cod-triplanar-v5'
+const CACHE_KEY = 'cod-triplanar-v6'
 
 /** True once `applyTriplanar` has patched this material. */
 export function isTriplanar(material: THREE.Material): boolean {
@@ -478,6 +540,18 @@ export function applyTriplanar(
   const grime = options.grimeColor ?? new THREE.Color(0.05, 0.044, 0.035)
   const fade = options.parallaxFade ?? [9, 22]
   const detailFreq = options.detailFreq ?? 1.6
+  // The staining multiply, as the grime's hue renormalised to unit luminance
+  // and then scaled to the depth wanted. Splitting it this way means a recipe
+  // can restyle the dirt without also changing how dark the band gets, and it
+  // keeps the multiply from carrying the grime colour's own darkness twice —
+  // once in the hue and again in the depth.
+  const grimeLum = Math.max(0.2126 * grime.r + 0.7152 * grime.g + 0.0722 * grime.b, 1e-4)
+  const stainDepth = options.grimeStain ?? 0.3
+  const stain = new THREE.Color(
+    (grime.r / grimeLum) * stainDepth,
+    (grime.g / grimeLum) * stainDepth,
+    (grime.b / grimeLum) * stainDepth,
+  )
   const uniforms = {
     uDetailMap: { value: detailMap },
     uTriScale: { value: options.scale },
@@ -507,8 +581,10 @@ export function applyTriplanar(
     uParallaxFade: { value: new THREE.Vector2(fade[0], fade[1]) },
     uMicroShadow: { value: options.microShadow ?? 0.85 },
     uGrimeColor: { value: grime },
+    uGrimeStain: { value: stain },
     uCavityDirt: { value: options.cavityDirt ?? 0.5 },
     uGrimeAmount: { value: options.grimeAmount ?? 0.55 },
+    uGrimeOpacity: { value: options.grimeOpacity ?? 0.3 },
     uGrimeHeight: { value: options.grimeHeight ?? 0.55 },
     uGrimeBase: { value: options.grimeBase ?? 0 },
   }

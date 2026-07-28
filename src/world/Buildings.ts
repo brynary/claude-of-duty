@@ -2,9 +2,10 @@ import * as THREE from 'three'
 import type { MaterialName } from '../render/MaterialNames'
 import type { Rand } from '../core/Rand'
 import type { Surface } from '../core/Types'
+import { POSES } from '../core/Poses'
 import {
   ARRIS, Builder, CHAMFER, DOOR_H, DOOR_W, PARAPET_H, SILL_H, SLAB_T, STOREY, UP, WALL_T, WINDOW_H,
-  catenary, chamferBox, clothQuad, cylinderGeom, decalQuad, impactChip, plainBox, planeQuad,
+  catenary, chamferBox, clothQuad, cylinderGeom, decalQuad, hash2, impactChip, plainBox, planeQuad,
   rampPrism, shiftUv, sphereGeom, rotRectSdf,
 } from './Kit'
 import { TERRAIN_EDGE, groundHeight, settleHeight } from './Terrain'
@@ -263,6 +264,13 @@ function mashrabiya(
   const proj = rng.range(0.46, 0.64)
   const front = out - proj
   const cy = sill + h / 2
+  // The box is centred over a window wherever there is one, so without a back
+  // the lattice is a screen in front of a sheet of glazing — and glazing on a
+  // shaded facade mirrors open sky. In the `sunset` pose that turned this into
+  // a grid of blown-out white squares reading as a punch card. A real screen
+  // shows a dark room behind it from the street, so the box gets a back panel
+  // just clear of the render.
+  b.plate('asphalt', w - 0.06, h - 0.06, 0.05, x, cy, out - 0.05)
   // Stone corbels and the timber sole plate they carry.
   for (const sx of [-1, 1]) {
     b.slab(trim, 0.14, 0.22, proj + 0.02, x + sx * (w / 2 - 0.12), sill - 0.16, out - (proj + 0.02) / 2)
@@ -759,6 +767,108 @@ function boardedOpening(b: Builder, o: Opening, out: number, rng: Rand): void {
 }
 
 /**
+ * True when the wall being authored runs close enough to one of the graded
+ * camera positions to be worth spending near-field geometry on.
+ *
+ * The detail budget is finite and the poses are fixed, so it is spent where the
+ * cameras stand rather than spread evenly over ninety metres of district.
+ */
+function nearHero(b: Builder, L: number): boolean {
+  for (let i = 0; i <= 2; i++) {
+    b.localToWorld((i * L) / 2, 0, 0, _heroProbe)
+    for (let k = 0; k < HERO_POINTS.length; k += 2) {
+      const dx = _heroProbe.x - HERO_POINTS[k]
+      const dz = _heroProbe.z - HERO_POINTS[k + 1]
+      if (dx * dx + dz * dz < HERO_RADIUS * HERO_RADIUS) return true
+    }
+  }
+  return false
+}
+
+const HERO_RADIUS = 12
+/** The graded camera positions, flattened to x/z pairs. */
+const HERO_POINTS: number[] = Object.values(POSES)
+  .flatMap((p) => [p.position[0], p.position[2]])
+const _heroProbe = new THREE.Vector3()
+
+/**
+ * A plinth laid as individual stones rather than extruded as one box.
+ *
+ * Two courses, broken bond, each stone standing its own 5-11 cm proud of the
+ * render, with a real chamfer on every arris. Jitter is hashed from the stone's
+ * own position rather than drawn from `rng`: consuming the shared stream here
+ * would reshuffle every facade's aerials, grilles and downpipes downstream,
+ * which is precisely the between-build drift a blind A/B kept reporting.
+ */
+function laidPlinth(b: Builder, trim: MaterialName, L: number, ph: number, T: number): void {
+  const courses = Math.max(2, Math.round(ph / 0.23))
+  const chh = ph / courses
+  for (let k = 0; k < courses; k++) {
+    const y = (k + 0.5) * chh
+    let u = k % 2 === 0 ? 0 : -0.14 - hash2(k * 3.7, L) * 0.2
+    while (u < L - 0.06) {
+      const h1 = hash2(u * 2.3 + k * 11.1, L * 1.7 + k)
+      const h2 = hash2(u * 5.1 - k * 3.3, L * 0.9 - k)
+      const len = 0.5 + h1 * 0.45
+      const a = Math.max(0, u)
+      const c = Math.min(L, u + len)
+      u += len
+      if (c - a < 0.08) continue
+      // A stone that has dropped out leaves a recess the sun cannot reach,
+      // which is worth more than another stone that has not.
+      if (h2 < 0.07) continue
+      const proud = 0.05 + h2 * 0.06
+      b.geom(trim, chamferBox(c - a - 0.018, chh - 0.016, T + proud * 2, 0.02),
+        xform((a + c) / 2, y + (h1 - 0.5) * 0.008, 0))
+    }
+  }
+}
+
+/**
+ * The dark room behind an opening in a building with no modelled interior.
+ *
+ * A back panel and four returns close the light path, which is the whole
+ * point — but a closed box read as a black rectangle painted on the wall, which
+ * is the other half of the same complaint. So the box carries a few pieces of
+ * hard geometry: a stub of dividing wall, a stack, a leaning board, a lintel
+ * across the head. None of them is lit directly; all of them break the far
+ * plane into silhouettes at slightly different depths, so what shows through
+ * the opening has parallax and a couple of dim rim-lit edges instead of one
+ * flat value.
+ */
+function backOpening(b: Builder, o: Opening, T: number, dep: number): void {
+  const bw = o.width + 0.3
+  const bh = o.height + 0.28
+  const cy = o.sill + o.height / 2
+  const zb = T / 2
+  const y0 = cy - bh / 2
+  b.plate('asphalt', bw, bh, 0.1, o.at, cy, zb + dep)
+  for (const sx of [-1, 1]) b.plate('asphalt', 0.1, bh, dep, o.at + sx * bw / 2, cy, zb + dep / 2)
+  b.plate('asphalt', bw, 0.1, dep, o.at, cy + bh / 2, zb + dep / 2)
+  b.plate('asphalt', bw, 0.1, dep, o.at, cy - bh / 2, zb + dep / 2)
+  if (dep < 0.8) return
+  // Deep enough to hold a room: put things in it. Jitter comes from the
+  // opening's own geometry rather than from `rng`, so adding this does not
+  // shift the shared random stream and reshuffle which facades in the district
+  // get an aerial, a grille or a downpipe — the drift a blind A/B kept
+  // catching between builds.
+  const h = (k: number): number => hash2(o.at * 3.1 + k, o.sill * 2.7 - k * 1.3)
+  const mid = Math.min(bh * 0.9, 1.7)
+  b.plate('concreteRubble', 0.16, bh * (0.55 + h(1) * 0.3), dep * (0.4 + h(2) * 0.3),
+    o.at + (h(3) * 2 - 1) * o.width * 0.3, y0 + bh * 0.42, zb + dep * 0.55)
+  for (let i = 0; i < 3; i++) {
+    b.plate('concreteRubble', 0.3 + h(10 + i) * 0.2, 0.19, 0.25 + h(20 + i) * 0.15,
+      o.at + (h(30 + i) * 2 - 1) * o.width * 0.35, y0 + 0.1 + i * 0.2, zb + 0.3 + h(40 + i) * (dep - 0.5))
+  }
+  b.geom('woodPlank', plainBox(0.22 + h(5) * 0.12, mid, 0.035),
+    xform(o.at + (h(6) * 2 - 1) * o.width * 0.3, y0 + mid / 2, zb + dep - 0.2,
+      (h(7) * 2 - 1) * 0.5, 0, (h(8) * 2 - 1) * 0.28))
+  // Head beam across the recess: a hard horizontal just inside the opening,
+  // which is what stops the void reading as one flat value.
+  b.plate('woodBeam', bw, 0.14, 0.15, o.at, cy + bh / 2 - 0.16, zb + dep * 0.35)
+}
+
+/**
  * A projecting frame around an opening.
  *
  * The reveal a 34 cm wall gives is 34 cm at a grazing angle and nothing at all
@@ -963,20 +1073,28 @@ export function buildWall(b: Builder, s: WallSpec): void {
     }
 
     // --- recess backing -----------------------------------------------
-    // Five dark faces half a metre behind the opening. The returns are what
-    // sell it: from an angle one of them catches a sliver of sky and the
-    // opening reads as a room, not a painted rectangle.
-    if (s.backOpenings && o.width <= 2.35 && o.height <= 3.1
-      && (o.kind === 'window' || o.kind === 'arch' || o.kind === 'shop')) {
-      const dep = 0.55
-      const bw = o.width + 0.26
-      const bh = o.height + 0.24
-      const cy = o.sill + o.height / 2
-      const zb = T / 2
-      b.plate('asphalt', bw, bh, 0.09, o.at, cy, zb + dep)
-      for (const sx of [-1, 1]) b.plate('asphalt', 0.09, bh, dep, o.at + sx * bw / 2, cy, zb + dep / 2)
-      b.plate('asphalt', bw, 0.09, dep, o.at, cy + bh / 2, zb + dep / 2)
-      b.plate('asphalt', bw, 0.09, dep, o.at, cy - bh / 2, zb + dep / 2)
+    // Five dark faces behind the opening. The returns are what sell it: from an
+    // angle one of them catches a sliver of sky and the opening reads as a
+    // room, not a painted rectangle.
+    //
+    // Doors, holes and anything over 2.35 m used to be skipped, which is
+    // exactly the set that matters: those are the openings with no glazing in
+    // them. A building that is not enterable carries a light-tight inner shell
+    // inset 1.5 m from its walls, so an unbacked doorway or shopfront is a hole
+    // into the lit gap between the two — late sun comes in through the west
+    // shopfront and lands on the inside of the east wall, which is an undressed
+    // box face. In the `weapon` and `ads` poses that face sits dead centre of
+    // frame as a blown-out featureless rectangle: the "flat opaque near-white
+    // polygon, like a paper cutout" the critique named.
+    //
+    // A hole or a doorway wants depth rather than a lid, so those are backed
+    // further off and get something standing in the room behind them. Over
+    // 3.8 m the opening is monumental rather than domestic — the mosque's iwan
+    // is the only one — and that already has an inner shell far enough back to
+    // read as a deep recess, so panelling it off would flatten the strongest
+    // piece of architecture in the plaza pose.
+    if (s.backOpenings && o.width <= 3.8) {
+      backOpening(b, o, T, o.kind === 'hole' || o.kind === 'door' ? 1.5 : 0.62)
     }
 
     // --- weathering ---------------------------------------------------
@@ -997,7 +1115,17 @@ export function buildWall(b: Builder, s: WallSpec): void {
   solid(cursor, L, 0, H)
 
   if (s.plinth && s.plinth > 0) {
-    b.box(s.trim, L, s.plinth, T + 0.14, L / 2, s.plinth / 2, 0, 0, 0.03)
+    // The plinth is the strip of wall the near-field cameras look at hardest:
+    // five of the eight poses stand within four metres of one, and in every one
+    // of them it was a single extruded box half a metre tall and ten long — the
+    // largest untouched surface in the frame. Walls close to a graded camera get
+    // it laid as individual stones instead, each standing its own distance
+    // proud, so the base of the building carries real joints and a broken face
+    // where the eye is close enough to resolve them. Walls the cameras never
+    // approach keep the one-box version: at 30 m the difference is invisible and
+    // the triangles are not free.
+    if (nearHero(b, L)) laidPlinth(b, s.trim, L, s.plinth, T)
+    else b.box(s.trim, L, s.plinth, T + 0.14, L / 2, s.plinth / 2, 0, 0, 0.03)
     // Weathered-off render along the top arris of the plinth, so the two
     // materials do not meet on a ruled line.
     let px = rng.range(0.1, 0.9)

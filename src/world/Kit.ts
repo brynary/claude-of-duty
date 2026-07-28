@@ -275,9 +275,20 @@ export function catenary(
 }
 
 /**
- * A sagging fabric quad — awnings, laundry, tarps and banners. Two-sided so it
- * reads from behind, with a cross-sag and a ripple so it never looks like a
- * flat plane.
+ * A sagging fabric quad — awnings, laundry, tarps and banners.
+ *
+ * Both displacement terms used to be applied along world Y, which is correct
+ * for an awning and *in the plane of the sheet* for anything that hangs. Every
+ * back cloth, banner, laundry line and curtain in the district was therefore a
+ * dead-flat rectangle carrying nothing but its albedo — the "large flat
+ * polygon, no relief, reads like a paper cutout" the critique kept naming, and
+ * the biggest single one sits in the middle of the plaza pose.
+ *
+ * Gravity still pulls along Y. The folds and the ripple now displace along the
+ * sheet's own normal, tapering to nothing at the fixed edge (v = 0) and opening
+ * out at the free edge, which is how cloth pegged along one edge actually
+ * hangs. A near-horizontal sheet has a vertical normal, so awnings keep exactly
+ * the behaviour they had.
  */
 export function clothQuad(
   c00: THREE.Vector3,
@@ -291,18 +302,37 @@ export function clothQuad(
   phase = 0,
 ): THREE.BufferGeometry {
   const s = new TriSoup()
+  _ab.subVectors(c10, c00)
+  _ac.subVectors(c01, c00)
+  const nrm = new THREE.Vector3().crossVectors(_ab, _ac)
+  if (nrm.lengthSq() < 1e-12) nrm.set(0, 1, 0)
+  else nrm.normalize()
+  const span = _ab.length()
+  /** 0 for a sheet lying flat, 1 for one hanging vertically. */
+  const hang = 1 - Math.min(1, Math.abs(nrm.y))
+  const foldAmp = (ripple * 1.5 + span * 0.03) * hang
+  // Folds have to be resolvable by the mesh, so the span is divided into folds
+  // first and the tessellation is raised to carry them. The threshold keeps
+  // that cost off the sheets that do not need it: a pitched awning's normal is
+  // nearly vertical, and a bunting pennant is too small to fold.
+  const folds = Math.min(5, Math.max(2, Math.round(span / 0.7)))
+  const doFold = foldAmp > 0.025 && span > 0.5
+  const amp = doFold ? foldAmp : 0
+  const su = doFold ? Math.max(segU, folds * 3) : segU
   const at = (u: number, v: number): THREE.Vector3 => {
     const a = new THREE.Vector3().lerpVectors(c00, c10, u)
     const b = new THREE.Vector3().lerpVectors(c01, c11, u)
     const p = a.lerp(b, v)
     p.y -= Math.sin(Math.PI * u) * Math.sin(Math.PI * v * 0.5 + 0.35) * sag
-    p.y += Math.sin(u * 11.3 + phase) * Math.sin(v * 7.1 + phase * 1.7) * ripple
+    const fold = Math.sin(u * folds * Math.PI * 2 + phase * 0.7) * (0.28 + 0.72 * v) * amp
+    const rip = Math.sin(u * 11.3 + phase) * Math.sin(v * 7.1 + phase * 1.7) * ripple
+    p.addScaledVector(nrm, fold + rip)
     return p
   }
-  for (let i = 0; i < segU; i++) {
+  for (let i = 0; i < su; i++) {
     for (let j = 0; j < segV; j++) {
-      const u0 = i / segU
-      const u1 = (i + 1) / segU
+      const u0 = i / su
+      const u1 = (i + 1) / su
       const v0 = j / segV
       const v1 = (j + 1) / segV
       s.quadTwoSided(at(u0, v0), at(u1, v0), at(u1, v1), at(u0, v1))

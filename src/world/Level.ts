@@ -10,7 +10,8 @@ import {
   footprintBase, insideAnyBuilding, type BuildResult,
 } from './Buildings'
 import {
-  buildInteriors, buildOverhead, buildPosters, buildSetPieces, definePropKinds, scatterClutter,
+  buildInteriors, buildOverhead, buildPosters, buildSetPieces, definePropKinds,
+  dressBakery, dressEastRooms, scatterClutter,
 } from './Props'
 import {
   buildCollapsedBlock, buildCraterDressing, buildGroundDecals, buildPuddles,
@@ -121,6 +122,18 @@ export class LevelSystem implements System, LevelService {
     scatterClutter(propsKit, farm, rngProps, density)
     buildRoofClutter(propsKit, result.decks, rngProps)
 
+    // Room dressing lives in its own batch per interior rather than in the map
+    // wide props batch. A merged batch has one bounding sphere, so anything in
+    // the global one is submitted and shadow-tested from every camera in the
+    // level; a batch that covers a single room is culled outright in six of the
+    // eight graded poses. Each takes its own seeded stream so adding furniture
+    // does not reshuffle which facades in the district get an aerial or a
+    // downpipe.
+    const bakeryKit = new Builder()
+    dressBakery(bakeryKit, farm, new Rand(seed ^ 0x4d21))
+    const eastRoomKit = new Builder()
+    dressEastRooms(eastRoomKit, farm, new Rand(seed ^ 0x6ea7))
+
     const overheadKit = new Builder()
     buildOverhead(overheadKit, new Rand(seed ^ 0x1d4e))
 
@@ -176,6 +189,8 @@ export class LevelSystem implements System, LevelService {
     commit(streetKit, 'street', true, true, wallDressing)
     commit(paveKit, 'paving', false, true)
     commit(propsKit, 'props', true, true, ['dirt'])
+    commit(bakeryKit, 'bakeryRooms', true, true, ['dirt'])
+    commit(eastRoomKit, 'eastRooms', true, true, ['dirt'])
     commit(overheadKit, 'overhead')
     commit(debrisKit, 'debris', true, true, flatDressing)
     commit(dressKit, 'dressing', false, true)

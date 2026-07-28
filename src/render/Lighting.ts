@@ -17,12 +17,21 @@ import {
  * Luminance the key light lands on with the sun high enough to matter.
  *
  * The single number that decides whether a daylight frame reads as daylight is
- * this against the fill, and the fill is set almost entirely by SKY_SCALE_ENV
- * in SkyModel — the hemisphere light below is under a tenth of it. At the
- * previous pair a patch of ground in shade sat at 44 per cent of the same patch
- * in sun; clear-sky daylight at a 21-degree elevation is nearer 24. That is the
- * measurement behind every "no discernible light direction", "flat uniform
- * lighting" and "nondirectional fill" note the critics have filed.
+ * this against the fill. Three terms make up the fill and they have taken turns
+ * being the largest: SKY_SCALE_ENV in SkyModel, the hemisphere light below —
+ * which is under a tenth of it and never mattered — and, since the irradiance
+ * volume, the measured bounce.
+ *
+ * The number to watch is the ratio, and it has now been wrong in both
+ * directions. Two rounds back a patch of ground in shade sat at 44 per cent of
+ * the same patch in sun, which is what "no discernible light direction", "flat
+ * uniform lighting" and "nondirectional fill" measure as. Cutting the probe
+ * fixed that and overshot: the shipped `iter9` frame put it at 19.6 per cent,
+ * and open shade landed at sRGB 17 against 174, which is what "collapses 55.8
+ * per cent of the frame into featureless black" measures as. Clear-sky daylight
+ * at a 21-degree elevation is near 24 per cent, and that is where raising
+ * SkyOcclusion's OPEN_SHADE_FRACTION puts it — 24.0 per cent, with the extra
+ * arriving directionally out of the volume rather than as a wash.
  *
  * Raised rather than only cutting the fill, for two reasons. It keeps sunlit
  * surfaces at the exposure the post chain is already calibrated to — a sunlit

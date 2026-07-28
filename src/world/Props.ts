@@ -1288,6 +1288,419 @@ export function buildInteriors(b: Builder, farm: InstanceFarm, rng: Rand): void 
       xform(17.3 + rng.range(0, 4.8), mY + 0.79, 11.8 + rng.range(0, 8.4)))
   }
 }
+// ---------------------------------------------------------------------------
+// Interior fixtures
+// ---------------------------------------------------------------------------
+
+/**
+ * Open shelving, authored with its back on the local z = 0 plane and running
+ * out to +z.
+ *
+ * A room reads as furnished from its verticals: four uprights and four boards
+ * put eight hard edges and a stack of cast shadows onto a wall that otherwise
+ * carries nothing but albedo. Stock is laid along each board with real gaps —
+ * a shelf packed end to end reads as one more texture, and it is the gaps that
+ * say somebody has been taking things off it.
+ */
+function shelfRack(
+  b: Builder, rng: Rand, w: number, h: number, dep: number, tiers: number,
+): void {
+  const post = 0.055
+  for (const sx of [-1, 1]) {
+    for (const dz of [post / 2, dep - post / 2]) {
+      b.slab('woodPlank', post, h, post, sx * (w / 2 - post / 2), h / 2, dz)
+    }
+  }
+  b.slab('woodPlank', w, 0.04, 0.026, 0, h - 0.1, post / 2)
+  b.geom('woodPlank', plainBox(Math.hypot(w, h) * 0.9, 0.05, 0.022),
+    xform(0, h / 2, post / 2, 0, 0, Math.atan2(h, w)))
+  for (let i = 0; i < tiers; i++) {
+    const y = 0.24 + (i * (h - 0.42)) / Math.max(1, tiers - 1)
+    b.slab('woodPlank', w - 0.015, 0.032, dep, 0, y, dep / 2)
+    let u = -w / 2 + rng.range(0.05, 0.2)
+    while (u < w / 2 - 0.12) {
+      const kind = rng.next()
+      if (kind < 0.32) {
+        const r = rng.range(0.048, 0.082)
+        const hh = rng.range(0.13, 0.27)
+        b.geom(rng.pick<MaterialName>(['metalPainted', 'glassDirty', 'woodPainted']),
+          cylinderGeom(r * rng.range(0.78, 1.0), r, hh, 8),
+          xform(u + r, y + 0.016 + hh / 2, dep * rng.range(0.34, 0.6)))
+        u += r * 2 + rng.range(0.02, 0.11)
+      } else if (kind < 0.58) {
+        const bw = rng.range(0.15, 0.3)
+        const bh = rng.range(0.1, 0.23)
+        b.geom('woodCrate', chamferBox(bw, bh, dep * rng.range(0.5, 0.82), 0.011),
+          xform(u + bw / 2, y + 0.016 + bh / 2, dep * 0.5, rng.spread(0.22)))
+        u += bw + rng.range(0.03, 0.15)
+      } else if (kind < 0.76) {
+        // A short stack of bowls: every one is a lit rim over a shaded underside.
+        const r = rng.range(0.065, 0.1)
+        const n = rng.int(2, 5)
+        for (let k = 0; k < n; k++) {
+          b.geom('metalPainted', cylinderGeom(r, r * 0.88, 0.042, 9),
+            xform(u + r, y + 0.037 + k * 0.042, dep * rng.range(0.4, 0.6)))
+        }
+        u += r * 2 + rng.range(0.05, 0.18)
+      } else {
+        u += rng.range(0.14, 0.42)
+      }
+    }
+  }
+}
+
+/**
+ * Surface pipework climbing a wall whose face is the local z = 0 plane, with
+ * the room at +z: two vertical runs on brackets, a horizontal crossing them and
+ * a stop-cock on it. Three hard lines and a row of cast shadows on a panel that
+ * had none.
+ */
+function wallPipes(
+  b: Builder, rng: Rand, u0: number, u1: number, h: number, crossY: number,
+): void {
+  for (const px of [u0, u1]) {
+    const r = rng.range(0.022, 0.036)
+    b.geom('metalRusted', cylinderGeom(r, r, h, 7), xform(px, h / 2, r + 0.035))
+    for (let k = 0; k < Math.max(2, Math.floor(h / 0.9)); k++) {
+      b.slab('metalRusted', 0.11, 0.04, 0.055, px, 0.45 + k * 0.9, 0.028)
+    }
+  }
+  b.geom('metalPainted', cylinderGeom(0.026, 0.026, Math.abs(u1 - u0), 6),
+    xform((u0 + u1) / 2, crossY, 0.062, 0, 0, Math.PI / 2))
+  const sx = u0 + (u1 - u0) * 0.35
+  b.geom('metalRusted', cylinderGeom(0.05, 0.05, 0.1, 8), xform(sx, crossY, 0.062, 0, 0, Math.PI / 2))
+  b.slab('metalRusted', 0.03, 0.13, 0.03, sx, crossY + 0.11, 0.062)
+  b.geom('dirt', decalQuad(0.14, rng.range(0.6, 1.4), 0.3, u0 * 7 + h),
+    xform(u0, h * 0.3, 0.012))
+}
+
+/**
+ * The lining of a knocked-through opening: a head beam on a plate, jamb boards
+ * down both reveals, a threshold and the broken plaster lip around it.
+ *
+ * The opening the interior pose is composed through is a 2.35 m hole in a
+ * 0.22 m partition. Two hundred millimetres of reveal seen head on is nothing,
+ * so the hole read as a rectangle cut in a card — the biggest single shape in
+ * the frame and the one the whole composition hangs on. Everything here stands
+ * proud of one face or the other, so the frame gets a lit arris on all four
+ * sides and throws a shadow into the room beyond.
+ *
+ * Authored in the caller's frame: the wall lies in the local x = 0 plane, the
+ * opening runs along z, and the room the camera stands in is toward +x.
+ */
+function openingLining(
+  b: Builder, rng: Rand, t: number, span: number, head: number,
+): void {
+  const hs = span / 2
+  b.geom('woodBeam', chamferBox(t + 0.34, 0.28, span + 0.5, 0.02), xform(0, head + 0.14, 0))
+  b.slab('woodBeam', t + 0.42, 0.06, span + 0.62, 0, head + 0.31, 0)
+  for (const sz of [-1, 1]) {
+    b.slab('woodPlank', t + 0.07, head, 0.055, 0, head / 2, sz * (hs + 0.028))
+    // Reveal boards, so the 22 cm return is lined rather than raw.
+    b.slab('woodPlank', t - 0.02, head - 0.05, 0.03, 0, head / 2 - 0.02, sz * (hs - 0.02))
+  }
+  // Threshold, standing 5 cm proud of the boards on either side of it.
+  b.geom('woodBeam', chamferBox(t + 0.3, 0.07, span - 0.06, 0.014), xform(0, 0.035, 0))
+  // Plaster broken back around the head and down both jambs, exposing block.
+  for (let i = 0; i < 7; i++) {
+    b.geom('concreteRubble', chamferBox(t + 0.05, rng.range(0.1, 0.22), rng.range(0.18, 0.4), 0.012),
+      xform(0, head + 0.34 + rng.range(0, 0.2), rng.spread(hs + 0.2), 0, 0, rng.spread(0.14)))
+  }
+  for (const sz of [-1, 1]) {
+    for (let i = 0; i < 4; i++) {
+      b.geom('concreteRubble', chamferBox(t + 0.04, rng.range(0.14, 0.3), rng.range(0.06, 0.13), 0.01),
+        xform(0, rng.range(0.3, head - 0.3), sz * (hs + rng.range(0.07, 0.17))))
+    }
+  }
+}
+
+/**
+ * Two or three lengths of cloth pegged along a rail, hanging at slightly
+ * different depths and lengths.
+ *
+ * `clothQuad` folds along the sheet's own normal, so a hanging drop finally has
+ * relief instead of being a flat card; overlapping drops of unequal length also
+ * give the assembly a hem line, a lap shadow and a broken bottom edge.
+ *
+ * The rail runs from (ax, ay, az) to (cx, ay, cz); the cloth drifts off the
+ * wall along the rail's own perpendicular, so this works on any wall.
+ */
+function hungDrop(
+  b: Builder, rng: Rand, mat: MaterialName,
+  ax: number, ay: number, az: number, cx: number, cz: number,
+  drop: number, phase: number,
+): void {
+  const dx = cx - ax
+  const dz = cz - az
+  const len = Math.hypot(dx, dz)
+  if (len < 0.05) return
+  const ux = dx / len
+  const uz = dz / len
+  // Perpendicular in plan: the direction the sheet swings away from the rail.
+  const px = -uz
+  const pz = ux
+  const n = rng.int(2, 3)
+  let u = 0
+  for (let i = 0; i < n && u < len - 0.1; i++) {
+    const wdt = Math.min(len - u, (len / n) * rng.range(0.95, 1.4))
+    const lay = 0.018 + i * 0.022
+    const swing = lay + rng.range(0.03, 0.09)
+    const d0 = drop * rng.range(0.72, 1.05)
+    const d1 = drop * rng.range(0.72, 1.05)
+    b.geom(mat, clothQuad(
+      new THREE.Vector3(ax + ux * u + px * lay, ay, az + uz * u + pz * lay),
+      new THREE.Vector3(ax + ux * (u + wdt) + px * lay, ay - rng.range(0, 0.05), az + uz * (u + wdt) + pz * lay),
+      new THREE.Vector3(ax + ux * (u + wdt) + px * swing, ay - d1, az + uz * (u + wdt) + pz * swing),
+      new THREE.Vector3(ax + ux * u + px * swing, ay - d0, az + uz * u + pz * swing),
+      rng.range(0.02, 0.06), rng.range(0.025, 0.055), 5, 5, phase + i * 2.3))
+    u += wdt - rng.range(0.02, 0.12)
+  }
+  // The rail itself, oriented along the run rather than assumed axis-aligned.
+  const q = new THREE.Quaternion().setFromUnitVectors(
+    new THREE.Vector3(0, 1, 0), new THREE.Vector3(ux, 0, uz))
+  b.geom('metalRusted', cylinderGeom(0.014, 0.014, len + 0.14, 6),
+    new THREE.Matrix4().compose(
+      new THREE.Vector3(ax + ux * len * 0.5, ay + 0.045, az + uz * len * 0.5),
+      q, new THREE.Vector3(1, 1, 1)))
+}
+
+/**
+ * The bakery interior, dressed for the pose that is graded on it.
+ *
+ * The camera stands at (-14, 1.68, 8) looking due west at the cross wall 2.4 m
+ * in front of it, through a 2.35 m hole into the sunlit far room. Two thirds of
+ * the frame is therefore the near face of that partition, which carried a
+ * skirting, a conduit and two patches of exposed block — "every prop is a
+ * well-textured box floating in uniform grey", as the critique had it, and the
+ * lowest-scoring frame of the eight.
+ *
+ * So the two panels either side of the opening get what an occupied room has
+ * against a wall: shelving with stock on it, a bench with the day's work left
+ * on it, stacked goods, pipework, hung cloth and a ladder. The opening gets a
+ * real lining. The floor between the camera and the wall gets the fallen
+ * plaster, litter and abandoned kit that give the near field something to catch
+ * light on. And the far room gets tall silhouettes standing between the camera
+ * and the windows that light it, so the background reads as layers rather than
+ * as a bright hole.
+ *
+ * Screen left is +z and screen right is −z, so the two dressed bands are
+ * z ∈ [9.2, 11.8] and z ∈ [4.4, 6.8]; nothing outside them is in frame.
+ *
+ * `rng` must be its own stream. Threading this through the shared props stream
+ * would reshuffle every scattered prop and roof aerial in the district, which
+ * is exactly the between-build drift a blind A/B kept catching.
+ */
+export function dressBakery(b: Builder, farm: InstanceFarm, rng: Rand): void {
+  const y0 = footprintBase(-16.5, 5.75, 14, 12.5)
+  /** Top of the board floor. */
+  const fl = y0 + 0.035
+  /** Near face of the cross wall — the plane most of the frame is looking at. */
+  const near = -16.39
+  const hole = 8.0
+
+  // --- the opening the pose is composed through --------------------------
+  b.push(-16.5, fl, hole, 0)
+  openingLining(b, rng, 0.22, 2.35, 2.55)
+  b.pop()
+  // A torn length of sacking still pegged across the top of it. Run north to
+  // south so `hungDrop`'s perpendicular swings the cloth into the room rather
+  // than into the partition behind it.
+  hungDrop(b, rng, 'sandbag', near + 0.06, fl + 2.44, hole + 1.12, near + 0.06, hole - 1.12, 0.7, 4.1)
+
+  // --- near face, screen right: z 4.4 to 6.8 ------------------------------
+  b.push(near, fl, 5.45, Math.PI / 2)
+  shelfRack(b, rng, 1.7, 2.15, 0.4, 4)
+  b.pop()
+  // Pipework flanking the rack, crossing above it.
+  b.push(near, fl, 0, Math.PI / 2)
+  wallPipes(b, rng, -6.45, -4.35, 2.72, 2.44)
+  b.pop()
+  // A cloth hung on the front of the shelves, in front of everything on them.
+  hungDrop(b, rng, 'tarp', near + 0.52, fl + 2.28, 5.5, near + 0.52, 4.6, 0.92, 1.7)
+  // A coil of rope on a nail at the end of the run.
+  b.geom('metalRusted', cylinderGeom(0.012, 0.012, 0.14, 5), xform(near + 0.07, fl + 2.2, 6.72, 0, 0, Math.PI / 2 - 0.2))
+  b.geom('rubber', cylinderGeom(0.085, 0.085, 0.1, 10), xform(near + 0.14, fl + 2.08, 6.72, 0, 0, Math.PI / 2))
+  // A notice board with papers still pinned to it.
+  b.slab('woodPainted', 0.035, 0.6, 0.56, near + 0.018, fl + 1.62, 6.62)
+  for (let i = 0; i < 5; i++) {
+    b.geom('concreteWorn', decalQuad(0.17, 0.22, 0.1, 31 + i * 7),
+      xform(near + 0.042, fl + 1.44 + rng.range(0, 0.36), 6.42 + rng.range(0, 0.4), Math.PI / 2, 0, rng.spread(0.16)))
+  }
+
+  // --- near face, screen left: z 9.2 to 11.8 ------------------------------
+  // Bench under the wall with the day's work left on it, shelving over it.
+  b.push(near + 0.3, fl, 9.95, 0)
+  b.solid('woodPlank', 0.6, 0.06, 1.3, 0, 0.86, 0, 0, 0.012, 'wood')
+  for (const sz of [-0.55, 0.55]) {
+    for (const lx of [-0.21, 0.21]) b.slab('woodBeam', 0.07, 0.83, 0.07, lx, 0.415, sz)
+    b.slab('woodBeam', 0.5, 0.05, 0.05, 0, 0.24, sz)
+  }
+  b.geom('metalPainted', cylinderGeom(0.1, 0.12, 0.16, 10), xform(-0.02, 0.97, -0.38))
+  b.geom('metalRusted', cylinderGeom(0.05, 0.05, 0.46, 7), xform(0.05, 0.91, 0.12, 0, 0, Math.PI / 2))
+  b.geom('woodPainted', chamferBox(0.32, 0.05, 0.24, 0.01), xform(0.0, 0.915, 0.42, 0.3))
+  b.geom('glassDirty', cylinderGeom(0.04, 0.048, 0.22, 8), xform(-0.13, 1.0, 0.52))
+  b.geom('sandbag', decalQuad(0.3, 0.26, 0.24, 57), xform(0.14, 0.896, -0.14, 0.4, -Math.PI / 2))
+  b.pop()
+  b.push(near, fl + 1.24, 9.95, Math.PI / 2)
+  shelfRack(b, rng, 1.3, 1.24, 0.3, 3)
+  b.pop()
+  // A ladder propped against the wall: the strongest single vertical in the
+  // near field, and it breaks the line where the wall meets the floor.
+  {
+    const lean = 0.19
+    const s = Math.sin(lean)
+    const c = Math.cos(lean)
+    const xc = near + 0.62
+    for (const dz of [-0.19, 0.19]) {
+      b.geom('woodBeam', chamferBox(0.05, 2.5, 0.06, 0.008),
+        xform(xc, fl + 1.25, 10.78 + dz, 0, 0, lean))
+    }
+    for (let i = 0; i < 8; i++) {
+      const t = -1.05 + i * 0.3
+      b.geom('woodPlank', plainBox(0.05, 0.032, 0.34), xform(xc - s * t, fl + 1.25 + c * t, 10.78))
+    }
+  }
+  // Stacked goods filling the far corner, and two sacks dumped clear of them so
+  // the corner reads as three depths rather than one wall of boxes. The south
+  // wall's inner face is z = 11.66, which the crate must not run through.
+  farm.place('crateL', near + 0.66, fl + 0.36, 11.12, 0.17)
+  farm.place('crateM', near + 0.6, fl + 0.86, 11.06, 1.52)
+  farm.place('sack', near + 1.28, fl + 0.17, 11.3, 0.9, 1.08)
+  farm.place('sack', near + 1.58, fl + 0.17, 10.55, 2.6, 0.96)
+
+  // --- near field floor ---------------------------------------------------
+  // Fallen plaster is already scattered here; what it lacked was anything with
+  // a silhouette. Everything is under half a metre, so none of it closes the
+  // sightline through the opening.
+  farm.place('bucket', -14.55, fl + 0.14, 6.05, 1.9)
+  farm.place('crateS', -13.6, fl + 0.22, 10.2, 0.7, 1, 1.55, 0.15)
+  farm.place('basket', -15.05, fl + 0.15, 10.85, 2.4, 1.05)
+  farm.place('boardPile', -12.9, fl + 0.06, 6.6, 1.15)
+  farm.place('cableCoil', -15.4, fl + 0.08, 4.85, 0.4)
+  farm.place('rag', -14.2, fl + 0.02, 8.9, 2.2, 1.2)
+  farm.place('rag', -13.1, fl + 0.02, 7.4, 0.6, 1.0)
+  for (let i = 0; i < 9; i++) {
+    farm.place('paper', -15.9 + rng.range(0, 5.4), fl + 0.015, 4.6 + rng.range(0, 6.8),
+      rng.range(0, 3.1), rng.range(0.8, 1.3), rng.spread(0.16), rng.spread(0.16))
+  }
+  for (let i = 0; i < 16; i++) {
+    farm.place(`chunk${rng.int(0, 3)}`, -16.1 + rng.range(0, 5.7), fl + 0.04,
+      4.3 + rng.range(0, 7.4), rng.range(0, 3.1), rng.range(0.55, 1.25))
+  }
+  for (let i = 0; i < 6; i++) {
+    farm.place('brick', -16.2 + rng.range(0, 1.3), fl + 0.035, 4.4 + rng.range(0, 7.2),
+      rng.range(0, 3.1), rng.range(0.9, 1.1), rng.spread(0.25), rng.spread(0.25))
+  }
+  // Plaster dust trodden into the boards along the foot of the wall.
+  b.geom('dirt', decalQuad(1.4, 6.6, 0.16, 91), xform(near + 0.55, fl + 0.012, 8.0, 0, -Math.PI / 2))
+
+  // --- ceiling over the camera --------------------------------------------
+  // The top of the frame was a flat joist grid with nothing crossing it.
+  b.geom('rubber', catenary(
+    new THREE.Vector3(-15.9, fl + 2.52, 5.4), new THREE.Vector3(-10.4, fl + 2.5, 6.1),
+    0.36, 0.011, 8, 4))
+  b.geom('rubber', catenary(
+    new THREE.Vector3(-15.9, fl + 2.5, 10.4), new THREE.Vector3(-11.2, fl + 2.46, 9.5),
+    0.28, 0.009, 8, 4))
+  b.geom('metalPainted', cylinderGeom(0.026, 0.026, 0.62, 6),
+    xform(-13.2, fl + 2.24, 9.05, 0, 0, 0.42))
+  b.geom('metalPainted', cylinderGeom(0.02, 0.02, 0.34, 5), xform(-14.4, fl + 2.36, 6.4, 0, 0.7, 0.9))
+
+  // --- the far room, seen through the opening ------------------------------
+  // The cone through the opening reaches z 3.9 to 12.1 by the time it gets to
+  // the west wall, so everything from the doorway in the north partition to the
+  // south-west corner is in frame. All of it is chosen to stand between the
+  // camera and the windows that light the room.
+  // Both racks stand on the cross walls, never on the west wall: the windows in
+  // that wall are the only key light this room gets and the pose is graded on
+  // it. A 2.3 m rack in front of them would have put the whole background into
+  // its own shadow.
+  b.push(-21.5, fl, 4.26, 0)
+  shelfRack(b, rng, 1.8, 2.25, 0.4, 4)
+  b.pop()
+  b.push(-17.6, fl, 11.66, Math.PI)
+  shelfRack(b, rng, 1.7, 1.9, 0.36, 3)
+  b.pop()
+  // A washing line strung across the room with two cloths over it.
+  b.geom('rubber', catenary(
+    new THREE.Vector3(-22.9, fl + 2.28, 6.6), new THREE.Vector3(-17.2, fl + 2.34, 7.05),
+    0.19, 0.008, 10, 4))
+  hungDrop(b, rng, 'fabricAwning', -21.9, fl + 2.14, 6.63, -20.6, 6.73, 1.05, 2.6)
+  hungDrop(b, rng, 'tarp', -19.4, fl + 2.2, 6.81, -18.2, 6.9, 0.86, 5.3)
+  // A curtain over the doorway in the north partition, half drawn back.
+  hungDrop(b, rng, 'fabricAwning', -20.62, fl + 2.06, 4.44, -19.5, 4.44, 1.65, 3.3)
+  // A stove with its flue climbing to the ceiling — the strongest vertical the
+  // far room has, and it stands hard against the light.
+  b.push(-22.6, fl, 11.25, 0)
+  b.solid('metalRusted', 0.72, 0.78, 0.56, 0, 0.39, 0, 0, 0.02, 'metal')
+  b.box('metalRusted', 0.78, 0.05, 0.62, 0, 0.8, 0, 0, 0.014)
+  b.geom('asphalt', plainBox(0.34, 0.3, 0.03), xform(0, 0.4, -0.29))
+  b.geom('metalRusted', cylinderGeom(0.09, 0.1, 1.95, 9), xform(0.18, 1.79, 0.05))
+  b.geom('metalRusted', cylinderGeom(0.105, 0.105, 0.07, 10), xform(0.18, 1.06, 0.05))
+  b.geom('metalPainted', cylinderGeom(0.11, 0.09, 0.13, 10), xform(-0.2, 0.87, -0.06))
+  b.pop()
+  // Sacks and baskets banked under the windows, breaking the wall/floor line.
+  for (let i = 0; i < 6; i++) {
+    farm.place('sack', -22.8 + rng.spread(0.12), fl + 0.18, 6.4 + i * 0.45 + rng.spread(0.07),
+      rng.range(0, 3.1), rng.range(0.9, 1.2))
+  }
+  farm.place('basket', -22.35, fl + 0.16, 9.05, 1.1, 1.1)
+  farm.place('barrelRust', -19.3, fl + 0.44, 10.9, 0.5)
+  farm.place('crateM', -17.5, fl + 0.31, 5.1, 1.9)
+  farm.place('crateS', -17.6, fl + 0.84, 5.05, 0.4)
+  farm.place('chair', -20.9, fl + 0.2, 5.6, 4.2)
+  // A bulb hanging inside the framed view, so the far room has a source in it.
+  b.geom('metalPainted', cylinderGeom(0.004, 0.004, 0.62, 4), xform(-18.4, fl + 2.32, 8.5))
+  b.geom('metalPainted', cylinderGeom(0.02, 0.026, 0.055, 8), xform(-18.4, fl + 1.99, 8.5))
+  b.geom('glass', sphereGeom(0.05, 8, 6), xform(-18.4, fl + 1.93, 8.5))
+}
+
+/**
+ * The east block's ground floor and the market hall, which the alley and vista
+ * poses look into. Lighter than the bakery: neither is the subject of a graded
+ * frame, but both were empty shells with a crate in them.
+ */
+export function dressEastRooms(b: Builder, farm: InstanceFarm, rng: Rand): void {
+  // Inner faces of the east block: x 9.54 to 15.16, with a cross partition at
+  // z 15.74 to 15.96 that nothing here may run through.
+  const eY = footprintBase(12.35, 13.25, 6.3, 12.5) + 0.02
+  b.push(9.54, eY, 12.4, Math.PI / 2)
+  shelfRack(b, rng, 2.2, 2.1, 0.4, 4)
+  b.pop()
+  b.push(15.16, eY, 13.6, -Math.PI / 2)
+  shelfRack(b, rng, 1.7, 1.55, 0.34, 3)
+  b.pop()
+  b.push(15.16, eY, 0, -Math.PI / 2)
+  wallPipes(b, rng, 9.0, 11.4, 2.5, 2.2)
+  b.pop()
+  hungDrop(b, rng, 'tarp', 9.86, eY + 2.3, 17.9, 9.86, 16.4, 1.2, 6.1)
+  for (let i = 0; i < 4; i++) {
+    farm.place('sack', 10.2 + rng.spread(0.1), eY + 0.17, 8.4 + i * 0.55, rng.range(0, 3.1), rng.range(0.9, 1.15))
+  }
+  farm.place('boardPile', 12.9, eY + 0.06, 14.4, 0.3)
+  farm.place('bucket', 14.4, eY + 0.14, 8.9, 2.6)
+  for (let i = 0; i < 7; i++) {
+    farm.place('paper', 9.9 + rng.range(0, 4.6), eY + 0.015, 8.0 + rng.range(0, 9.6),
+      rng.range(0, 3.1), rng.range(0.8, 1.3), rng.spread(0.16), rng.spread(0.16))
+  }
+
+  // Market hall: cloth hung along the west wall (inner face x 15.8, deck
+  // soffit 2.54 above the floor), and stock under the trestles.
+  const mY = footprintBase(19.75, 16.25, 8.5, 11.5) + 0.02
+  for (let i = 0; i < 3; i++) {
+    hungDrop(b, rng, i % 2 === 0 ? 'fabricAwning' : 'tarp',
+      15.96, mY + 2.36, 13.6 + i * 2.9, 15.96, 12.0 + i * 2.9, 1.15, 2.0 + i * 3.1)
+  }
+  for (let i = 0; i < 5; i++) {
+    farm.place('crateM', 19.6 + rng.spread(0.5), mY + 0.31, 11.6 + i * 1.9, rng.range(0, 3.1))
+  }
+  for (let i = 0; i < 4; i++) {
+    farm.place('sack', 21.9 + rng.spread(0.3), mY + 0.17, 12.4 + i * 1.6, rng.range(0, 3.1), rng.range(0.9, 1.2))
+  }
+  b.push(15.8, mY, 19.4, Math.PI / 2)
+  shelfRack(b, rng, 2.0, 1.8, 0.38, 3)
+  b.pop()
+}
 
 // ---------------------------------------------------------------------------
 // Placement

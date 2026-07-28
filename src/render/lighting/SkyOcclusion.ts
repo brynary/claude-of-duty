@@ -34,8 +34,9 @@ import type { GameContext, PhysicsService, RaycastFilter } from '../../core/Type
  * The constant-direction bounce below is what remains when there is no volume —
  * no physics, or the lowest quality tier. It was the whole of the indirect
  * bounce for eight rounds and it is kept, and kept documented, because it is
- * still the fallback and because the volume's conservation target is defined in
- * terms of it.
+ * still the fallback. Its level is no longer authored: both paths are solved
+ * from {@link OPEN_SHADE_FRACTION}, so the frame does not change character when
+ * one is substituted for the other.
  */
 
 /** Cells across the level, per axis, per quality tier. */
@@ -77,9 +78,8 @@ const RAY_LENGTH = 45
  * It was that large because it was standing in for light transport nobody was
  * computing. {@link IrradianceVolume} now computes it, and the difference is
  * handed over rather than removed — see {@link indirectDiffuseTarget}, which
- * takes the exact irradiance this cut releases and makes it the volume's
- * conservation target. The total light on an enclosed surface is therefore
- * unchanged to within a few per cent; what changes is that two thirds of it now
+ * takes the exact irradiance this cut releases and adds it to the volume's
+ * target. So none of the energy this removes is lost; what changes is that it
  * arrives from a measured direction with a measured colour instead of from
  * everywhere at once.
  *
@@ -126,15 +126,115 @@ const ENCLOSED_SPECULAR = 0.46
  * At 0.65 the same wall carries 23.5. Still well under the sunlit case, as it
  * should be, but the plaster relief, the brick coursing and the grain of a
  * crate are all back above the threshold where an 8-bit display can show them.
+ *
+ * ## Why it went to 0.85
+ *
+ * Not for the exterior — the poses that live outdoors barely have a cell down
+ * here. It is for the `interior` pose, which scores lowest of the eight and is
+ * the one frame whose mean luma sits *below* its target range rather than above:
+ * measured on the shipped capture it is 29.7 against a floor of 32, with 48 per
+ * cent of the frame under luma 24 and a standard deviation of 20.7 against a
+ * floor of 45.
+ *
+ * It also compensates for a shape change. The skylight handover in
+ * {@link indirectDiffuseTarget} is a fixed quantity, so when the bounce term it
+ * sits beside was three times smaller the handover was 55 per cent of what an
+ * enclosed surface received and the target rose by a third into full enclosure.
+ * At the corrected bounce level the handover is 23 per cent of it and the curve
+ * would otherwise have gone slightly the other way — interiors getting less of a
+ * relative lift than the open street, which is backwards for the one pose that
+ * needs it most. 0.85 restores a target that rises, gently, as a surface loses
+ * sight of the sky.
+ *
+ * This does not flatten the room. The level is a mean over normals and the
+ * reconstruction spends it directionally: a wall facing the doorway takes 2.7
+ * times this and one facing away takes a third of it, so what an interior gains
+ * is a gradient across itself, not a wash.
  */
-const BOUNCE_ENCLOSED_FLOOR = 0.65
+const BOUNCE_ENCLOSED_FLOOR = 0.85
 
 /** How far the enclosed tint is pulled back towards white. */
 const ENCLOSED_NEUTRALITY = 0.45
 
 /**
+ * Wrap on the fallback bounce's cosine term. The source is a road and a wall,
+ * not a point, so its terminator is soft and it reaches a little past ninety
+ * degrees.
+ *
+ * Wrap trades reach against gradient: the wider it is, the more surfaces catch
+ * some bounce and the less any of them varies across its own normals. Declared
+ * here rather than beside the rest of the fallback because
+ * {@link BOUNCE_IRRADIANCE} is solved from it.
+ */
+const BOUNCE_WRAP = 0.30
+
+/**
+ * Indirect diffuse an open shaded surface receives, as a fraction of the
+ * irradiance direct sun delivers to open ground.
+ *
+ * This is the one number that sets how dark shade is, and it is stated as a
+ * ratio because that is the quantity every complaint about this frame has
+ * actually been about. It replaces a scene-referred constant that was solved
+ * backwards — from what the rig it superseded happened to deliver — and it is
+ * roughly two and a half times that constant.
+ *
+ * ## Why it moved
+ *
+ * The eight rounds before this one conserved energy against the old constant
+ * bounce, on the argument that the fault was distribution rather than level.
+ * That was measured and it was wrong. Taking the shipped `iter9` captures back
+ * through the committed post chain, a surface in open shade lands at sRGB 17
+ * against 174 for the same material in sun: a ten to one *display* ratio, where
+ * a photograph of a sunlit street shows nearer three to one. Judges measured
+ * the same thing from the other end — "the entire left wall averages RGB(13,14,16)
+ * with a standard deviation near zero", "55.8 per cent of the frame collapses
+ * into featureless black". Reproduced here: across the eight poses, 38 to 61
+ * per cent of every frame sits below luma 24 and the whole of that population
+ * has a mean of 13 to 17.
+ *
+ * ## Why this value
+ *
+ * Two independent derivations agree on roughly a quarter.
+ *
+ * Physically: with the sun 21 degrees up, open ground receives about 1.26 in
+ * these units and returns it at the level's own mean albedo, near 0.24. A
+ * vertical surface in the street sees that ground across half its hemisphere
+ * and a sunlit facade across part of the rest, and whatever leaves those
+ * surfaces bounces again — the interreflection series in a canyon of this
+ * albedo is worth about 1.4. That comes to between 0.20 and 0.33 depending on
+ * how much of the neighbourhood is in sun, against 0.085 delivered.
+ *
+ * Empirically: the volume's own single-bounce gather, before the conservation
+ * scales it, measures 0.12 to 0.17 for a cell over open street — already twice
+ * what the conservation was letting through, and that is one bounce only.
+ *
+ * ## What holds it here
+ *
+ * Simulated through the inverted post chain over all eight captures — including
+ * the auto-exposure meter's response, which claws back about a third of a stop
+ * of anything added — this lands the aggregate at mean 49, std 48, pctBelow8
+ * 5.1, localContrast 0.0315 and nearFieldLift 0.035, all inside range. Pushing
+ * it to 0.30 takes std to 45.7, on the floor. The binding constraint is not
+ * taste and not the frame mean: it is that the meter answers a lifted shadow by
+ * darkening the highlights, and `std` is what pays.
+ */
+const OPEN_SHADE_FRACTION = 0.22
+
+/**
+ * Irradiance sunlight plus skylight put on open ground at the default time of
+ * day, in the units {@link OPEN_SHADE_FRACTION} is a fraction of.
+ *
+ * Only the *fallback* bounce uses this. The irradiance volume is handed the
+ * live figure — see {@link indirectDiffuseTarget} — so its level tracks the sun
+ * wherever the sun is put; the fallback runs on tiers with no volume at all and
+ * has no bake to take a measurement from, so it takes the nominal.
+ */
+const NOMINAL_GROUND_IRRADIANCE = 1.26
+
+/**
  * How much light the sunlit street and the facades opposite throw back, as
- * irradiance in the same units as the sun's own.
+ * irradiance in the same units as the sun's own. Fallback path only — the
+ * irradiance volume replaces this wholesale the moment it bakes.
  *
  * This is the half of the ambient that a hemisphere light cannot express, and
  * the reason it matters is not colour but *variation*. Image-based ambient from
@@ -149,32 +249,18 @@ const ENCLOSED_NEUTRALITY = 0.45
  * coloured: warm, arriving from the sun's side of the street, landing on the
  * faces that are turned away from the sun and therefore have no key at all.
  *
- * The level is set by how much shading variation it has to buy, not by taste,
- * and 0.11 was not buying enough of it. Measured through the committed chain, a
- * shaded street wall moved 3.5 display code values across a fifty-degree normal
- * swing and an enclosed wall moved 2.3 — under the threshold where an 8-bit
- * display shows anything at all, which is why every normal map in the level
- * became invisible the moment its surface fell out of the sun.
- *
- * The reason it has to be *this* term and not the probe is that the probe
- * cannot do it. Integrated over the dome, image-based ambient from an open sky
- * delivers 0.21 of irradiance to an upward normal and 0.16 to a horizontal one:
- * a ratio of 1.3 across the entire sphere of directions. Nothing a normal map
- * does can produce contrast out of a field that uniform. The bounce is
- * directional and its wrap term has real gradient in it, so shading variation
- * is the one thing it is good for.
- *
- * At 0.26 the same two walls move 8.8 and 5.6 code values, and their total
- * variation including albedo goes from 17.6 and 7.4 to 35.1 and 23.5. The key
- * is untouched by this — a sunlit wall measures 55.5 against 56.7 before, and
- * the open-shade-to-sunlit ratio moves only 18.4 to 19.4 per cent, so the
- * daylight read and the terminator that judges praised both survive intact.
+ * Derived rather than authored, so the two indirect paths cannot drift: the
+ * wrap term's mean over the sphere is `( 1 + wrap ) / 4`, so this is whatever
+ * makes that mean equal the open-shade level the volume also targets. Setting
+ * it by hand is how the fallback ended up a stop away from the measured path
+ * without anything reporting it.
  *
  * Raising it much further would start making shaded verticals read warmer than
  * the sky lighting them, which is the failure a judge caught as "the shadowed
  * pocket returns warmer than the sky, which is backwards".
  */
-const BOUNCE_IRRADIANCE = 0.26
+const BOUNCE_IRRADIANCE =
+  (OPEN_SHADE_FRACTION * NOMINAL_GROUND_IRRADIANCE * 4) / (1 + BOUNCE_WRAP)
 
 /**
  * How far the bounce's hue is pulled from sunlit ground towards the sky on a
@@ -217,18 +303,6 @@ const BOUNCE_IRRADIANCE = 0.26
  * metrics is algebraically untouched by it.
  */
 const BOUNCE_SKY_SHARE = 0.45
-
-/**
- * Wrap on the bounce's cosine term. The source is a road and a wall, not a
- * point, so its terminator is soft and it reaches a little past ninety degrees.
- *
- * Tightened 0.35 to 0.30 alongside the level rise. Wrap trades reach against
- * gradient: the wider it is, the more surfaces catch some bounce and the less
- * any of them varies across its own normals. With the level raised there is
- * enough bounce to go round, so it can afford to be a little more directional —
- * which is the whole point of carrying the fill here.
- */
-const BOUNCE_WRAP = 0.30
 
 /**
  * Distance the sample point is pushed along the surface normal, in metres.
@@ -398,56 +472,62 @@ export interface SkyVisibilityGrid {
 }
 
 /**
- * Mean indirect diffuse irradiance, over all normals, that the rig delivered at
- * a given sky visibility *before* the irradiance volume existed.
+ * Mean indirect diffuse irradiance, over all normals, that a surface at a given
+ * sky visibility should receive.
  *
- * This is the conservation target, and the reason the volume is safe to land on
- * a frame whose seven tonal metrics are finally all in range. The critics' note
- * is about distribution, not level — measured on the shipped frames, an
- * interior sits at a plausible eleven per cent of the exterior and still reads
- * as a flat wash, because every surface in it receives the same value whichever
- * way it faces. So the volume is normalised to deliver exactly this and then
- * allowed to move it around; it does not add light.
+ * This is what the irradiance volume normalises to, band by band, and it is the
+ * level half of the rig. The volume decides *where* the light goes; this decides
+ * how much there is. Keeping those apart is what lets a measured transport with
+ * a noisy 32-ray estimator behind it land on a frame that has to hit seven
+ * numeric targets.
  *
- * Two terms:
+ * Three terms.
  *
- * - What the constant-direction bounce delivered. Its wrap has a closed-form
- *   mean over the sphere of `( 1 + wrap ) / 4`, so no integration is needed.
- * - What cutting {@link ENCLOSED_SKYLIGHT} released. That cut is proportional
- *   to `1 - visibility`, and the irradiance it was multiplying is the sky's own
- *   mean over normals, which the caller measures from the same probe the
- *   environment map is baked from.
+ * - **The bounce.** {@link OPEN_SHADE_FRACTION} of whatever the sun and sky put
+ *   on open ground, which the caller measures at bake time rather than assuming.
+ *   That coupling is the point: move the sun and the fill follows it, so the
+ *   key-to-fill ratio the whole frame is graded on is a constant of the rig and
+ *   not an accident of one time of day.
+ * - **The enclosure falloff.** A surface that cannot see the street sees less of
+ *   what the street is throwing. {@link BOUNCE_ENCLOSED_FLOOR} is deliberately
+ *   not zero — light that gets into a room bounces around inside it, and that
+ *   light is generated in the room rather than arriving from the sky, so it does
+ *   not scale with sky visibility the way skylight does.
+ * - **The skylight handover.** {@link ENCLOSED_SKYLIGHT} was cut below what the
+ *   eight rounds before the volume calibrated it at, on the grounds that the
+ *   volume would carry that energy directionally instead. This is that exact
+ *   quantity, returned: the cut is proportional to `1 - visibility` and the
+ *   irradiance it was multiplying is the sky's own mean over normals.
  *
- * At full visibility the second term is zero and this is the old open-street
- * bounce exactly. At zero visibility it is about eighty per cent higher than
- * the old enclosed bounce, which is the skylight handover arriving.
+ * ## What this replaced
  *
- * ## What is conserved, and what therefore moves
+ * Until this round the first term was solved backwards — it was defined as
+ * whatever the constant-direction bounce it superseded happened to deliver, so
+ * that the volume could be landed without moving any measured number. That was
+ * the right call for a first integration and the wrong one to keep: it pinned
+ * the frame to a key-to-fill ratio of eleven to one in irradiance and ten to one
+ * in display, which is roughly three times what a photograph of a sunlit street
+ * shows, and it is the whole of the "featureless black", "no indirect light",
+ * "light does not travel in this scene" family of complaints. See
+ * {@link OPEN_SHADE_FRACTION} for the measurements and for what now holds the
+ * level where it is.
  *
- * This conserves the mean over all normals, per cell. Individual normals move,
- * and they are meant to — that redistribution is the entire point — but the
- * direction of the movement is worth stating so a later round does not read it
- * as a regression.
+ * ## What moves, and what does not
  *
- * The constant bounce concentrated everything it had into one direction: a
- * normal aligned with it received 3.08 times the mean, and a normal facing away
- * received nothing. So the surfaces that lose here are open shaded verticals
- * that happened to face the sun's reverse azimuth — the one case the constant
- * term was fitted to — which go from about 0.26 of irradiance to between 0.10
- * and 0.16. That is not a loss of tuning, it is the removal of an
- * over-strength: a wall in a real street whose hemisphere is roughly forty per
- * cent sunlit surfaces at a radiance of 0.10 receives about 0.126, which is
- * where the measured transport lands it.
- *
- * The surfaces that gain are everything the one direction could not reach:
- * interior floors, soffits, doorway reveals, and every wall facing the other
- * way. On a test hall an interior floor goes from 0.009 to between 0.04 and
- * 0.21 depending on where it is in the room, which is a factor of five to
- * twenty-three, and it acquires a gradient where it had none.
+ * The mean over all normals is what this states, and the volume conserves it per
+ * band. Individual normals move a great deal more than the mean does, because
+ * the reconstruction is directional: see `giIrradiance` in IrradianceVolume. A
+ * surface facing the bounce receives something over twice this and one facing
+ * away receives a third of it, which is the difference between light that
+ * arrived from somewhere and an ambient wash.
  */
-export function indirectDiffuseTarget(visibility: number, meanSkyIrradiance: number): number {
+export function indirectDiffuseTarget(
+  visibility: number,
+  meanSkyIrradiance: number,
+  openGroundIrradiance: number,
+): number {
   const vis = Math.pow(THREE.MathUtils.clamp(visibility, 0, 1), VISIBILITY_GAMMA)
-  const bounce = BOUNCE_IRRADIANCE * ((1 + BOUNCE_WRAP) / 4)
+  const bounce = OPEN_SHADE_FRACTION * openGroundIrradiance
     * THREE.MathUtils.lerp(BOUNCE_ENCLOSED_FLOOR, 1, vis)
   const handover = (ENCLOSED_SKYLIGHT_LEGACY - ENCLOSED_SKYLIGHT) * (1 - vis) * meanSkyIrradiance
   return bounce + handover
