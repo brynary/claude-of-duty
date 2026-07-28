@@ -112,6 +112,12 @@ interface EnemyTrack {
   contactAt: number | null
   /** When contact was last lost, used to end an engagement honestly. */
   lostContactAt: number | null
+  /**
+   * First time this soldier ever opened fire on the player. Reaction time is
+   * only meaningful for a fresh sighting, so this is set once and never
+   * cleared, unlike the per-engagement fields below.
+   */
+  everEngagedAt: number | null
   firstShotAt: number | null
   firstPlayerHitAt: number | null
   engagement: Engagement | null
@@ -225,11 +231,18 @@ export class TelemetrySystem implements System {
 
     e.on('ai:engaged', (p) => {
       const track = this.track(p.id)
-      if (track.firstShotAt === null) {
-        track.firstShotAt = this.t
-        if (track.engagement && track.engagement.enemyReaction === null) {
-          track.engagement.enemyReaction = p.sinceContact
-        }
+      // Only the first sighting in a soldier's whole life counts as a reaction
+      // time. `closeEngagement` used to clear this, so a soldier that lost the
+      // player and re-acquired recorded a second "reaction" — but by then it is
+      // already in a burst cycle, so what got measured was where in that cycle
+      // the re-acquisition happened to land. The AI owner flagged those as
+      // artefacts spanning 0.0-1.9s, which is wide enough to drag the mean
+      // outside the target band in either direction depending on the run.
+      if (track.everEngagedAt !== null) return
+      track.everEngagedAt = this.t
+      track.firstShotAt = this.t
+      if (track.engagement && track.engagement.enemyReaction === null) {
+        track.engagement.enemyReaction = p.sinceContact
       }
     })
 
@@ -323,7 +336,7 @@ export class TelemetrySystem implements System {
   private track(id: number): EnemyTrack {
     let t = this.tracks.get(id)
     if (!t) {
-      t = { id, contactAt: null, lostContactAt: null, firstShotAt: null, firstPlayerHitAt: null, engagement: null }
+      t = { id, contactAt: null, lostContactAt: null, everEngagedAt: null, firstShotAt: null, firstPlayerHitAt: null, engagement: null }
       this.tracks.set(id, t)
     }
     return t
