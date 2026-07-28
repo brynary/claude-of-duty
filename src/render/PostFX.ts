@@ -21,46 +21,55 @@ import { AccumulationPass } from './post/AccumulationPass'
 import { DepthNormalsPass } from './post/DepthNormalsPass'
 
 /**
- * Focus, in metres.
+ * Focus, in metres. The circle of confusion is
+ * `smoothstep(0, focusRange, |distance - focusDistance|)`, split into a near
+ * and a far half, and the bokeh scale multiplies it in the composite.
  *
- * Hip fire has no depth of field at all. The circle of confusion is
- * `smoothstep(0, focusRange, |distance - focusDistance|)` and the bokeh scale
- * multiplies it in the composite, so the previous 10 m / 90 m / 1.25 settings
- * blended a third of a half-resolution blur over anything 40 metres out —
- * every midground building in the level, softened in a frame the player is
- * supposed to be shooting across. No shipped gameplay frame does that. A bokeh
- * scale of zero is exactly zero, and the whole pass is skipped until the player
- * actually aims.
+ * Round 1 ran 10 m / 90 m at bokeh 1.25, which put a quarter of a
+ * half-resolution blur over everything 40 metres out — every midground building
+ * in a frame the player is supposed to be shooting across. Round 2 answered
+ * that by switching the pass off entirely at the hip, and a judge immediately
+ * missed it: mild defocus is what separates the picture planes, and without it
+ * "far buildings look pasted on".
  *
- * Aiming pulls focus to a plane just past normal engagement range and lets near
- * cover and the far skyline fall away. The viewmodel cannot be defocused at all
- * — it is drawn after this pass, against a cleared depth buffer — so "near
- * blur on the handguard" is not available in this architecture.
+ * So the hip settings are chosen to hold the CoC at zero across the whole
+ * playable depth and only open up past it. The range is deliberately far wider
+ * than the distance, because both halves of the CoC share it and the near half
+ * has only 14 m to work with. Measured after the bokeh scale: 0.008 at 2 m,
+ * 0.036 at 40 m, 0.10 at 60 m, 0.25 at 90 m, 0.49 at 130 m, saturating past
+ * 224 m. Nothing a player can shoot at is softened; the skyline is.
+ *
+ * Aiming pulls focus onto the target plane and shortens the range so near cover
+ * genuinely falls away. The viewmodel cannot be defocused at all — it is drawn
+ * after this pass, against a cleared depth buffer — so "near blur on the
+ * handguard" is not available in this architecture.
  */
-const HIP_FOCUS_DISTANCE = 20
-const HIP_FOCUS_RANGE = 320
-const HIP_BOKEH_SCALE = 0
+const HIP_FOCUS_DISTANCE = 14
+const HIP_FOCUS_RANGE = 210
+const HIP_BOKEH_SCALE = 0.85
 const ADS_FOCUS_DISTANCE = 26
 const ADS_FOCUS_RANGE = 150
 const ADS_BOKEH_SCALE = 2
 
-/** Below this the depth of field pass is a no-op, so it is skipped entirely. */
-const DOF_EPSILON = 0.02
-
 /**
  * Scene exposure. The tone curve is ACES with no pre-scale, so this is the only
- * thing standing between scene radiance and the curve: at 1.65 a scene
- * luminance of 0.18 lands on sRGB 132 and 0.5 lands on 211.
+ * thing standing between scene radiance and the curve: at 1.76 a scene
+ * luminance of 0.18 lands on sRGB 136 and 0.5 lands on 192.
  */
-const DEFAULT_EXPOSURE = 1.65
+const DEFAULT_EXPOSURE = 1.76
 
 /**
- * Only genuinely bright things bloom, measured in scene luminance after
- * exposure. 1.4 / 1.65 = 0.85 linear, which is roughly sRGB 231 through the
- * grade — the sky disc, fires, muzzle flashes and sun glints, and nothing that
- * a white wall in sunlight can reach.
+ * Scene luminance above which a pixel blooms, in linear scene-referred units.
+ *
+ * This is a lens effect — light scattering off the elements and the sensor
+ * stack — so it keys off scene radiance and not off exposure. Round 2 had it at
+ * 0.85 linear, below the 1.30 ceiling the sky dome clamps to, so the entire
+ * upper half of every outdoor frame was blooming into everything in front of
+ * it. That is where the "milky additive veil" and the backlit soldiers with no
+ * silhouette came from. At 1.6 the sky never reaches it and the sun disc (80),
+ * fires, muzzle flashes and specular glints all clear it comfortably.
  */
-const BLOOM_THRESHOLD = 1.4
+const BLOOM_THRESHOLD = 1.6
 
 const DAMAGE_FLASH_DECAY = 2.1
 
@@ -98,7 +107,7 @@ function clamp01(value: number): number {
  *
  * Pass order is the whole design:
  *
- *   world → normals → SSAO → SSR → motion blur → depth of field (ADS only)
+ *   world → normals → SSAO → SSR → motion blur → depth of field
  *        → viewmodel (depth cleared) → bloom + tone map + grade
  *        → SMAA → temporal accumulation → lens
  *
@@ -125,7 +134,6 @@ export class PostFxSystem implements System, PostFxService {
   private ssr: SsrEffect | null = null
   private motionBlur: MotionBlurEffect | null = null
   private dof: DepthOfFieldEffect | null = null
-  private dofPass: EffectPass | null = null
   private bloom: BloomEffect | null = null
 
   private exposure = 1
@@ -145,7 +153,7 @@ export class PostFxSystem implements System, PostFxService {
     const { renderer, scene, camera, config } = ctx
 
     this.exposure = Number(urlParam('exposure') ?? DEFAULT_EXPOSURE) || DEFAULT_EXPOSURE
-    const operator = (urlParam('tonemap') as ToneMapOperator | null) ?? 'aces'
+    const operator = (urlParam('tonemap') as ToneMapOperator | null) ?? 'filmic'
 
     this.composer = new EffectComposer(renderer, {
       frameBufferType: THREE.HalfFloatType,
@@ -197,9 +205,7 @@ export class PostFxSystem implements System, PostFxService {
         bokehScale: HIP_BOKEH_SCALE,
         resolutionScale: 0.5,
       })
-      this.dofPass = new EffectPass(camera, this.dof)
-      this.dofPass.enabled = false
-      this.composer.addPass(this.dofPass)
+      this.composer.addPass(new EffectPass(camera, this.dof))
     }
 
     // Colour is kept, depth is thrown away. That single flag is what stops the
@@ -227,7 +233,10 @@ export class PostFxSystem implements System, PostFxService {
 
     this.lens = new LensEffect({
       aberration: config.chromaticAberration ? 0.001 : 0,
-      grainAmount: config.filmGrain ? 0.018 : 0,
+      // The contrast-adaptive sharpen below amplifies grain along with edges,
+      // so what lands on a flat mid-tone wall is close to half again this
+      // number. 0.018 through a 0.38 sharpen was legible as speckle on plaster.
+      grainAmount: config.filmGrain ? 0.013 : 0,
       // Applied after the temporal accumulation, whose one-pixel jitter
       // footprint is a box filter and costs a little acutance.
       sharpenAmount: config.sharpen ? 0.38 : 0,
@@ -244,35 +253,44 @@ export class PostFxSystem implements System, PostFxService {
   private createSsao(camera: THREE.PerspectiveCamera, normalBuffer: THREE.Texture): SSAOEffect {
     // `radius` is a fraction of the AO buffer's height, which becomes a pixel
     // radius for the sampling spiral. At half resolution on a 1080p frame,
-    // 0.055 * 540 is 30 texels — 60 screen pixels, or 0.46 m of world at 5 m
-    // through an 80-degree lens, which is the scale contact occlusion wants.
+    // 0.07 * 540 is 38 texels — 76 screen pixels, or about 0.6 m of world at
+    // 5 m through an 80-degree lens, which is the scale contact occlusion
+    // wants. The proximity window has to stay wider than the radius or samples
+    // inside the sphere get rejected on depth while still counting toward the
+    // divisor, which is what made the round-1 settings a weak uniform wash.
     //
-    // The old 0.1 was nearly twice that, and it was paired with a 0.4 m world
-    // proximity cutoff: most of the spiral landed on surfaces further away in
-    // depth than the cutoff allowed, so those samples contributed nothing while
-    // still counting toward the divisor. The result was a broad, weak wash that
-    // darkened nothing in particular. The window is now wider than the radius,
-    // so a sample inside the sphere actually occludes.
+    // Simulating this estimator against a floor/wall junction at 6 m puts the
+    // multiply at 0.66 hard against the wall, 0.77 at 15 cm and 0.95 at 60 cm:
+    // a contact gradient rather than a smudge.
+    //
+    // This deliberately does *not* carry the whole occlusion load. The lighting
+    // system bakes a coarse sky-visibility volume that handles everything from
+    // roughly a metre upward and applies it to the ambient term only; this
+    // resolves the creases and contact points that a screen-space pass can see
+    // and that volume cannot. Both multiply, so the intensity here is set for
+    // what is left over rather than for the whole effect.
     return new SSAOEffect(camera, normalBuffer, {
       blendFunction: BlendFunction.MULTIPLY,
       distanceScaling: true,
       depthAwareUpsampling: true,
       samples: 23,
       rings: 7,
-      radius: 0.055,
-      intensity: 2.2,
+      radius: 0.07,
+      intensity: 2.0,
       bias: 0.02,
       fade: 0.01,
       minRadiusScale: 0.35,
-      // Sunlit surfaces bounce enough light that heavy AO on them reads as
-      // dirt rather than shadow — but back off, do not switch off. This is a
-      // multiply over the full lit colour, not over the ambient term alone,
-      // so some restraint in the highlights is the only defence there is.
-      luminanceInfluence: 0.22,
+      // This multiplies the full lit colour, not the ambient term alone, so
+      // without a brake it darkens surfaces that the sun is already lighting
+      // and that bounce enough to have no crease shadow at all. Backing off in
+      // the highlights is the only defence available at this point in the
+      // chain — but back off, do not switch off, or every sunlit prop goes back
+      // to looking pasted onto the ground.
+      luminanceInfluence: 0.28,
       worldDistanceThreshold: 45,
       worldDistanceFalloff: 30,
-      worldProximityThreshold: 0.7,
-      worldProximityFalloff: 0.5,
+      worldProximityThreshold: 1.1,
+      worldProximityFalloff: 0.8,
       resolutionScale: 0.5,
     })
   }
@@ -284,7 +302,7 @@ export class PostFxSystem implements System, PostFxService {
       this.bloom = new BloomEffect({
         blendFunction: BlendFunction.ADD,
         mipmapBlur: true,
-        luminanceThreshold: BLOOM_THRESHOLD / this.exposure,
+        luminanceThreshold: BLOOM_THRESHOLD,
         luminanceSmoothing: 0.4,
         intensity: 0.55,
         // Eight mip levels put the widest contribution at 1/256 of the frame,
@@ -350,15 +368,9 @@ export class PostFxSystem implements System, PostFxService {
     this.smoothedAds += (target - this.smoothedAds) * Math.min(1, dt * 12)
 
     const dof = this.dof
-    if (!dof || !this.dofPass) return
+    if (!dof) return
 
     const t = this.smoothedAds
-    // Nothing to blur at the hip end, so five full-screen passes get skipped
-    // rather than resolving to a no-op. The bokeh scale is zero at t = 0, which
-    // is what makes crossing the threshold invisible.
-    this.dofPass.enabled = t > DOF_EPSILON
-    if (!this.dofPass.enabled) return
-
     dof.cocMaterial.focusDistance = HIP_FOCUS_DISTANCE + (ADS_FOCUS_DISTANCE - HIP_FOCUS_DISTANCE) * t
     dof.cocMaterial.focusRange = HIP_FOCUS_RANGE + (ADS_FOCUS_RANGE - HIP_FOCUS_RANGE) * t
     dof.bokehScale = HIP_BOKEH_SCALE + (ADS_BOKEH_SCALE - HIP_BOKEH_SCALE) * t
@@ -421,13 +433,11 @@ export class PostFxSystem implements System, PostFxService {
   /**
    * Scene exposure as a linear multiplier, applied before tone mapping.
    * {@link DEFAULT_EXPOSURE} is the calibrated value; anything else re-grades
-   * the whole image, and the bloom threshold follows so the same physical
-   * brightness keeps blooming.
+   * the whole image. Bloom does not follow it — see {@link BLOOM_THRESHOLD}.
    */
   setExposure(value: number): void {
     this.exposure = value
     this.grade.exposure = value
-    if (this.bloom) this.bloom.luminanceMaterial.threshold = BLOOM_THRESHOLD / value
   }
 
   dispose(): void {

@@ -46,8 +46,14 @@ export const SKY_SCALE_VISIBLE = 0.29
  * What the environment map is generated at. Lower than the visible scale
  * because Preetham has no absolute calibration and pairing its raw radiance
  * with a physically sized sun leaves shadows barely darker than lit ground.
+ *
+ * Together with the lighting system's HEMISPHERE_INTENSITY this sets the frame's
+ * key-to-fill. At 0.112 a wall in open shade sat better than ten to one under
+ * the same wall in sun — a clear sky over dark ground. A dusty street walled in
+ * by sunlit plaster is nearer five to one, and the difference is precisely the
+ * shadow detail a shipped frame keeps and this one was throwing away.
  */
-export const SKY_SCALE_ENV = 0.112
+export const SKY_SCALE_ENV = 0.148
 
 /** Radiance of the sun disc itself. Bounded so half-float buffers survive it. */
 export const SUN_DISC_RADIANCE = 80

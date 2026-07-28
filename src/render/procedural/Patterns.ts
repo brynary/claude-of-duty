@@ -7,6 +7,7 @@ import {
   field,
   saturate,
   smoothstep,
+  warpField,
   type ColorField,
   type Field,
 } from './Fields'
@@ -46,6 +47,17 @@ export interface BrickOptions {
   /** Depth of the mortar bed below the brick face, 0..1. */
   jointDepth: number
   salt?: number
+  /**
+   * Per-texel wander of the joint line, in texels. A machine-straight mortar
+   * line over a whole facade is the single loudest "this is a tiled texture"
+   * signal a brick wall can send; real bedding wanders by several millimetres
+   * from course to course and along each course.
+   */
+  wander?: number
+  /** Field driving the wander, 0..1. Required if `wander` is set. */
+  wanderField?: Field
+  /** Second wander field, for the perpendicular axis. */
+  wanderFieldY?: Field
 }
 
 export function bricks(w: number, h: number, noise: Noise, o: BrickOptions): CellPattern {
@@ -55,30 +67,45 @@ export function bricks(w: number, h: number, noise: Noise, o: BrickOptions): Cel
   const rnd = noise.rand(o.salt ?? 11)
   const ids = new Float32Array(o.rows * o.cols)
   for (let i = 0; i < ids.length; i++) ids[i] = rnd.next()
+  // Each brick sits a shade proud of or behind its neighbours, and each course
+  // is bedded a shade thicker than the one below. Both are independent of the
+  // colour id, so a pale brick is not automatically a proud one.
+  const seat = new Float32Array(o.rows * o.cols)
+  for (let i = 0; i < seat.length; i++) seat[i] = rnd.next()
+  const courseBed = new Float32Array(o.rows)
+  for (let i = 0; i < courseBed.length; i++) courseBed[i] = rnd.range(-1, 1)
 
   const cellW = w / o.cols
   const cellH = h / o.rows
   const half = o.jointPx * 0.5
   const bevel = Math.max(0.5, o.bevelPx)
+  const wander = o.wander ?? 0
+  const wx = o.wanderField
+  const wy = o.wanderFieldY ?? o.wanderField
 
   for (let y = 0; y < h; y++) {
-    const gy = (y / h) * o.rows
-    const ry = Math.floor(gy)
-    const fy = gy - ry
-    const shift = (ry % 2) * o.stagger
     const row = y * w
-    const edgeY = Math.min(fy, 1 - fy) * cellH
     for (let x = 0; x < w; x++) {
-      const gx = (x / w) * o.cols + shift
-      let cx = Math.floor(gx)
-      const fx = gx - cx
-      cx = ((cx % o.cols) + o.cols) % o.cols
+      const i = row + x
+      // The wander is applied to the *sample* position, so the joint, the
+      // bevel and the cell id all bend together and the brick stays whole.
+      const sx = wander > 0 && wx ? x + (wx[i] - 0.5) * wander : x
+      const sy = wander > 0 && wy ? y + (wy[i] - 0.5) * wander : y
+      const gy = (sy / h) * o.rows
+      const ry = ((Math.floor(gy) % o.rows) + o.rows) % o.rows
+      const fy = gy - Math.floor(gy)
+      const edgeY = Math.min(fy, 1 - fy) * cellH
+      const gx = (sx / w) * o.cols + (ry % 2) * o.stagger
+      const fx = gx - Math.floor(gx)
+      const cx = ((Math.floor(gx) % o.cols) + o.cols) % o.cols
       const edgeX = Math.min(fx, 1 - fx) * cellW
       const d = Math.min(edgeX, edgeY)
-      const t = smoothstep(half, half + bevel, d)
-      const cellId = ids[ry * o.cols + cx]
-      const brickTop = 1 - o.heightJitter * cellId
-      const i = row + x
+      // A slightly wider bed joint than perpend, the way a wall is actually
+      // laid, plus a per-course thickness drift.
+      const t = smoothstep(half + courseBed[ry] * half * 0.35, half + bevel, d)
+      const k = ry * o.cols + cx
+      const cellId = ids[k]
+      const brickTop = 1 - o.heightJitter * seat[k]
       face[i] = t
       id[i] = cellId
       height[i] = o.jointDepth + t * (brickTop - o.jointDepth)
@@ -248,6 +275,16 @@ export interface SettOptions {
   joint: number
   /** How much the face of each stone domes up towards its centre, 0..1. */
   crown: number
+  /** Texels of domain warp applied before the cells are read. */
+  warp?: number
+  /** Field driving the warp along U, 0..1. */
+  warpX?: Field
+  /** Field driving the warp along V, 0..1. */
+  warpY?: Field
+  /** Spread of joint width between stones, in cell units. */
+  jointJitter?: number
+  /** How far individual stones settle below or ride above the paving, 0..1. */
+  settle?: number
 }
 
 /**
@@ -259,14 +296,37 @@ export interface SettOptions {
  * and read as loose aggregate; a laid stone surface must not.
  */
 export function setts(w: number, h: number, noise: Noise, o: SettOptions): PebblePattern {
-  const { f1, f2, id } = noise.worley(w, h, o.fx, o.fy, o.salt, o.jitter)
+  const raw = noise.worley(w, h, o.fx, o.fy, o.salt, o.jitter)
+  let f1 = raw.f1
+  let f2 = raw.f2
+  let id = raw.id
+  // Straight Voronoi edges meeting at convex vertices is what makes procedural
+  // paving read as a diagram rather than as stone. Warping the lookup bends
+  // every joint; the id field is warped by the same amount with a nearest
+  // lookup so cell colour stays locked to cell shape.
+  if (o.warp && o.warpX && o.warpY) {
+    f1 = warpField(f1, w, h, o.warpX, o.warpY, o.warp)
+    f2 = warpField(f2, w, h, o.warpX, o.warpY, o.warp)
+    id = warpField(id, w, h, o.warpX, o.warpY, o.warp, true)
+  }
   const height = field(w, h)
   const gap = field(w, h)
+  const jointJitter = o.jointJitter ?? 0
+  const settle = o.settle ?? 0
   for (let i = 0; i < height.length; i++) {
     const edge = f2[i] - f1[i]
-    const face = smoothstep(0, o.joint, edge)
-    const crown = Math.pow(saturate(edge / (o.joint * 5)), 0.6)
-    height[i] = face * (1 - o.crown + o.crown * crown) * (0.86 + 0.14 * id[i])
+    // Joint width varies stone to stone: a paved surface laid by hand has
+    // tight butt joints in one place and a 30 mm gap filled with grit next to it.
+    const joint = o.joint * (1 + jointJitter * (id[i] - 0.5) * 2)
+    const face = smoothstep(0, joint, edge)
+    const crown = Math.pow(saturate(edge / (joint * 5)), 0.6)
+    // Stones ride and settle independently. Without this the whole surface is
+    // one plane with grooves cut in it, and light has nothing to break on.
+    // The settle value is a decorrelated reroll of the id so the palest stone
+    // is not also always the highest one.
+    const r = id[i] * 7.31
+    const sit = 1 - settle * (r - Math.floor(r))
+    height[i] = face * (1 - o.crown + o.crown * crown) * (0.78 + 0.22 * id[i]) * sit
     gap[i] = 1 - face
   }
   return { height, id, gap }

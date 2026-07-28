@@ -3,7 +3,7 @@ import type { MaterialName } from '../render/MaterialNames'
 import type { Rand } from '../core/Rand'
 import {
   Builder, InstanceFarm, catenary, chamferBox, clothQuad, cylinderGeom, decalQuad,
-  hash2, normalizeGeom, plainBox, shiftUv, sphereGeom, valueNoise,
+  groundPatch, hash2, normalizeGeom, plainBox, shiftUv, sphereGeom, valueNoise,
 } from './Kit'
 import { groundHeight, settleHeight, surfaceHeight } from './Terrain'
 import { footprintBase, insideAnyBuilding, xform } from './Buildings'
@@ -92,15 +92,15 @@ function at(g: THREE.BufferGeometry, m: THREE.Matrix4): THREE.BufferGeometry {
  * carcass by its own thickness, so the gaps self-shadow, the silhouette gains
  * a saw-tooth edge and the corner battens catch a specular line.
  */
-function crateGeom(w: number, h: number, d: number, seed = 0): THREE.BufferGeometry {
+function crateGeom(w: number, h: number, d: number, seed = 0, broken = false): THREE.BufferGeometry {
   const bt = 0.021 // board thickness, and therefore the depth of every gap
   const pw = Math.min(0.075, w * 0.14, d * 0.18) // corner batten
-  const parts: THREE.BufferGeometry[] = [chamferBox(w - bt * 2, h - 0.008, d - bt * 2, 0.014)]
+  const parts: THREE.BufferGeometry[] = [chamferBox(w - bt * 2, h - 0.008, d - bt * 2, 0.02)]
   // The battens are the crate's silhouette, so they get the chamfer: a sharp
   // arris on the outermost edge is what makes a prop read as a grey box.
   for (const sx of [-1, 1]) {
     for (const sz of [-1, 1]) {
-      parts.push(at(chamferBox(pw, h, pw, 0.007), xform((sx * (w - pw)) / 2, 0, (sz * (d - pw)) / 2)))
+      parts.push(at(chamferBox(pw, h, pw, 0.013), xform((sx * (w - pw)) / 2, 0, (sz * (d - pw)) / 2)))
     }
   }
   // Boards run horizontally on all four sides and front-to-back on the lid.
@@ -110,20 +110,34 @@ function crateGeom(w: number, h: number, d: number, seed = 0): THREE.BufferGeome
   for (let i = 0; i < rows; i++) {
     const y = -h / 2 + bh / 2 + i * (bh + gap)
     for (const sz of [-1, 1]) {
+      if (broken && hash2(seed + i * 11.3, sz * 3) > 0.76) continue
       const t = bt * (0.78 + 0.5 * hash2(seed + i * 3.7, sz))
-      parts.push(at(plainBox(w - pw * 2, bh, t), xform(0, y, sz * (d / 2 - t / 2))))
+      parts.push(at(chamferBox(w - pw * 2, bh, t, 0.005), xform(0, y, sz * (d / 2 - t / 2))))
     }
     for (const sx of [-1, 1]) {
+      if (broken && hash2(seed - i * 8.1, sx * 7) > 0.82) continue
       const t = bt * (0.78 + 0.5 * hash2(seed - i * 2.9, sx * 5))
-      parts.push(at(plainBox(t, bh, d - pw * 2), xform(sx * (w / 2 - t / 2), y, 0)))
+      parts.push(at(chamferBox(t, bh, d - pw * 2, 0.005), xform(sx * (w / 2 - t / 2), y, 0)))
     }
   }
-  const lid = Math.max(3, Math.round(d / 0.17))
-  const lidW = (d - pw * 2 - gap * (lid - 1)) / lid
-  for (let i = 0; i < lid; i++) {
-    const z = -(d - pw * 2) / 2 + lidW / 2 + i * (lidW + gap)
-    const t = bt * (0.85 + 0.4 * hash2(seed * 1.7 + i, 9))
-    parts.push(at(plainBox(w - pw * 2, t, lidW), xform(0, h / 2 - t / 2, z)))
+  if (broken) {
+    // Lid prised off: two boards left lying askew across the opening and one
+    // splintered stub still nailed to a batten.
+    for (let i = 0; i < 2; i++) {
+      const r = hash2(seed * 2.3 + i, 5) - 0.5
+      parts.push(at(chamferBox(w * 0.92, bt, d * (0.2 + 0.1 * i), 0.005),
+        xform(r * w * 0.12, h / 2 - bt + i * 0.012, r * d * 0.5, r * 0.5, 0, r * 0.14)))
+    }
+    parts.push(at(chamferBox(w * 0.3, bt, d * 0.16, 0.005),
+      xform(w * 0.24, h / 2 + 0.05, -d * 0.3, 0.4, 0.55, 0)))
+  } else {
+    const lid = Math.max(3, Math.round(d / 0.17))
+    const lidW = (d - pw * 2 - gap * (lid - 1)) / lid
+    for (let i = 0; i < lid; i++) {
+      const z = -(d - pw * 2) / 2 + lidW / 2 + i * (lidW + gap)
+      const t = bt * (0.85 + 0.4 * hash2(seed * 1.7 + i, 9))
+      parts.push(at(chamferBox(w - pw * 2, t, lidW, 0.005), xform(0, h / 2 - t / 2, z)))
+    }
   }
   // Diagonal brace across the long faces, nailed over the boards.
   const diag = Math.hypot(w - pw * 2, h - 0.1)
@@ -134,20 +148,25 @@ function crateGeom(w: number, h: number, d: number, seed = 0): THREE.BufferGeome
   return merge(parts)
 }
 
-/** Three interchangeable crates: different board rhythm, grain and wear. */
+/**
+ * Four interchangeable crates: different board rhythm, grain, wear — and one
+ * with its lid prised off and boards missing, so a stack of them never reads
+ * as the same asset repeated.
+ */
 function crateVariants(w: number, h: number, d: number): THREE.BufferGeometry[] {
   return [
     crateGeom(w, h, d, 1),
     shiftUv(crateGeom(w * 1.02, h * 0.96, d, 17), 0.37, 1.13, 1),
     shiftUv(crateGeom(w * 0.97, h * 1.05, d * 1.03, 43), 1.71, 0.42, 2),
+    shiftUv(crateGeom(w * 1.01, h * 0.99, d * 0.98, 71, true), 0.84, 1.62, 3),
   ]
 }
 
 /** Steel ammunition case: ribbed lid, latches and a folded carry handle. */
 function ammoBoxGeom(w: number, h: number, d: number): THREE.BufferGeometry {
   const parts = [
-    at(chamferBox(w, h * 0.72, d, 0.012), xform(0, -h * 0.14, 0)),
-    at(chamferBox(w * 1.03, h * 0.3, d * 1.03, 0.012), xform(0, h * 0.32, 0)),
+    at(chamferBox(w, h * 0.72, d, 0.022), xform(0, -h * 0.14, 0)),
+    at(chamferBox(w * 1.03, h * 0.3, d * 1.03, 0.022), xform(0, h * 0.32, 0)),
   ]
   for (const sx of [-1, 1]) {
     parts.push(at(plainBox(0.05, 0.09, 0.03), xform(sx * w * 0.34, h * 0.12, d / 2 + 0.012)))
@@ -234,10 +253,22 @@ function sandbagGeom(seed: number): THREE.BufferGeometry {
   return shiftUv(normalizeGeom(g), seed * 0.41, seed * 0.73, seed % 2)
 }
 
+/**
+ * Jersey barrier, 1.55 m long, with its length running along local X.
+ *
+ * The profile extrudes along Z, but every call site steps the run along X and
+ * the collider was authored 1.6 m wide on X — so barriers were being laid
+ * broadside with a metre of daylight between them while their collision boxes
+ * overlapped end to end. Turning the geometry to match the placement closes
+ * the line into the continuous chain a checkpoint actually forms, and makes
+ * the collider agree with what the player can see.
+ */
 function jerseyGeom(): THREE.BufferGeometry {
-  return extrudeProfile([
+  const g = extrudeProfile([
     [-0.31, 0], [0.31, 0], [0.31, 0.09], [0.15, 0.34], [0.1, 0.9], [-0.1, 0.9], [-0.15, 0.34], [-0.31, 0.09],
-  ], 1.55, 0.016)
+  ], 1.55, 0.03)
+  g.rotateY(Math.PI / 2)
+  return normalizeGeom(g)
 }
 
 function hescoGeom(): THREE.BufferGeometry {
@@ -297,16 +328,31 @@ function cinderGeom(): THREE.BufferGeometry {
   return merge(parts)
 }
 
+/**
+ * Cable drum lying on its flange rims, hub running along local X.
+ *
+ * The version this replaces built the flanges perpendicular to X but offset
+ * them along Z, then applied two more whole-geometry rotations on top; the
+ * result was a vertical hub with two discs sticking out sideways at its waist,
+ * and because its lowest point ended up 28 cm below the origin against a
+ * 62 cm seat offset, every spool on the map hovered a third of a metre.
+ */
 function spoolGeom(): THREE.BufferGeometry {
+  const R = 0.62
   const parts = [
-    at(cylinderGeom(0.62, 0.62, 0.07, 12), xform(0, 0, 0.3, 0, 0, Math.PI / 2)),
-    at(cylinderGeom(0.62, 0.62, 0.07, 12), xform(0, 0, -0.3, 0, 0, Math.PI / 2)),
-    at(cylinderGeom(0.34, 0.34, 0.56, 10, false), xform(0, 0, 0, 0, 0, Math.PI / 2)),
+    at(cylinderGeom(R, R, 0.07, 14), xform(-0.28, 0, 0, 0, 0, Math.PI / 2)),
+    at(cylinderGeom(R, R, 0.07, 14), xform(0.28, 0, 0, 0, 0, Math.PI / 2)),
+    at(cylinderGeom(0.34, 0.34, 0.5, 12, false), xform(0, 0, 0, 0, 0, Math.PI / 2)),
   ]
-  const g = merge(parts)
-  g.rotateZ(Math.PI / 2)
-  g.rotateY(Math.PI / 2)
-  return normalizeGeom(g)
+  // Cable still wound on the drum, and the plank nailed across the flanges.
+  for (let i = 0; i < 4; i++) {
+    parts.push(at(cylinderGeom(0.4 + i * 0.012, 0.4 + i * 0.012, 0.42 - i * 0.06, 12, false),
+      xform(0, 0, 0, 0, 0, Math.PI / 2)))
+  }
+  for (const sy of [-1, 1]) {
+    parts.push(at(plainBox(0.62, 0.03, 0.12), xform(0, sy * 0.44, 0)))
+  }
+  return merge(parts)
 }
 
 function acUnitGeom(): THREE.BufferGeometry {
@@ -351,16 +397,47 @@ function rebarBundleGeom(): THREE.BufferGeometry {
   return merge(parts)
 }
 
-/** A sheet of litter — newsprint, a flyer, a torn cement bag. */
+/**
+ * A sheet of litter — newsprint, a flyer, a torn cement bag.
+ *
+ * The curl matters. A sheet modelled dead flat on the ground has no silhouette
+ * and no self-shadow, so it reads as a coloured decal painted onto the paving
+ * rather than as an object lying on it; lifting one edge 4-9 cm gives it a lit
+ * face, a shaded face and a shadow of its own.
+ */
 function paperGeom(w: number, h: number, seed: number): THREE.BufferGeometry {
   const r = (i: number) => hash2(seed * 1.7 + i, seed - i) - 0.5
+  const curl = 0.04 + Math.abs(r(9)) * 0.1
   const g = clothQuad(
     new THREE.Vector3(-w / 2, 0.002 + r(1) * 0.01, -h / 2),
-    new THREE.Vector3(w / 2, 0.002 + r(2) * 0.012, -h / 2 + r(3) * 0.05),
-    new THREE.Vector3(w / 2 + r(4) * 0.04, 0.02 + r(5) * 0.02, h / 2),
-    new THREE.Vector3(-w / 2 + r(6) * 0.05, 0.002 + r(7) * 0.01, h / 2),
-    -0.012, 0.008, 3, 3, seed)
+    new THREE.Vector3(w / 2, 0.004 + r(2) * 0.012, -h / 2 + r(3) * 0.05),
+    new THREE.Vector3(w / 2 + r(4) * 0.04, curl * (0.6 + r(5) * 0.5), h / 2),
+    new THREE.Vector3(-w / 2 + r(6) * 0.05, curl, h / 2),
+    -0.02, 0.014, 4, 4, seed)
   return normalizeGeom(g)
+}
+
+/**
+ * A collapsed carton: base panel with one flap folded up and another splayed
+ * out flat. Reads unambiguously as cardboard from a metre away, which the
+ * flat sheet it replaces did not — that one was picking up the blue tarp
+ * material and lying on the cobbles as a saturated unlit rectangle.
+ */
+function cardboardGeom(w: number, d: number, seed: number): THREE.BufferGeometry {
+  const r = (i: number) => hash2(seed * 3.1 + i, seed * 0.7 - i) - 0.5
+  const t = 0.008
+  const parts: THREE.BufferGeometry[] = [
+    at(chamferBox(w, t, d, 0.003), xform(0, t / 2 + 0.002, 0, r(1) * 0.2, 0, r(2) * 0.03)),
+  ]
+  // Folded flap standing up along one edge.
+  const fh = d * (0.35 + Math.abs(r(3)) * 0.25)
+  const lean = 0.6 + r(4) * 0.5
+  parts.push(at(chamferBox(w * 0.94, t, fh, 0.003),
+    xform(r(5) * w * 0.05, t + Math.sin(lean) * fh * 0.5, -d / 2 - Math.cos(lean) * fh * 0.5, 0, lean, 0)))
+  // Second flap dropped flat, overlapping the first.
+  parts.push(at(chamferBox(w * 0.55, t, d * 0.5, 0.003),
+    xform(w * 0.22 + r(6) * 0.05, t * 2.4, d * 0.42, r(7) * 0.9, 0, r(8) * 0.05)))
+  return merge(parts)
 }
 
 /** Crushed drink can, dented along its length. */
@@ -416,12 +493,14 @@ export function definePropKinds(farm: InstanceFarm): void {
   farm.defineVariants('crateM', crateVariants(0.78, 0.62, 0.6), 'woodCrate')
   farm.defineVariants('crateL', crateVariants(1.18, 0.72, 0.78), 'woodCrate')
   farm.define('ammoBox', ammoBoxGeom(0.7, 0.34, 0.36), 'metalPainted')
+  // Litter casts. A scrap that throws no shadow floats however well it is
+  // seated, and these are the props closest to the camera in three poses.
   farm.defineVariants('paper', [
     paperGeom(0.21, 0.29, 3), paperGeom(0.3, 0.22, 11), paperGeom(0.16, 0.24, 29),
-  ], 'plasterWhite', false)
+  ], 'plasterWhite')
   farm.defineVariants('cardboard', [
-    paperGeom(0.5, 0.38, 7), paperGeom(0.62, 0.3, 23),
-  ], 'tarp', false)
+    cardboardGeom(0.5, 0.38, 7), cardboardGeom(0.62, 0.3, 23), cardboardGeom(0.42, 0.46, 51),
+  ], 'woodPlank')
   farm.define('can', canGeom(), 'metalPainted', false)
   farm.defineVariants('boardPile', [boardPileGeom(2), boardPileGeom(31)], 'woodPlank')
   farm.define('cableCoil', cableCoilGeom(), 'rubber')
@@ -486,12 +565,22 @@ export function buildStall(
 ): void {
   const base = settleHeight(x, z, 1.2, 0.05)
   b.push(x, base, z, yaw)
-  const postH = 2.25
+  // Thirteen stalls built from one recipe read as thirteen copies of the same
+  // asset, which is exactly what the plaza pose shows. Height, rake, canvas
+  // corner heights and counter height all vary per stall, one post in five is
+  // out of plumb and one canopy in five has lost half its cover.
+  const postH = 2.25 + rng.spread(0.24)
   const hw = width / 2
   const hd = depth / 2
+  const leaning = rng.int(0, 3)
+  let post = 0
   for (const sx of [-1, 1]) {
     for (const sz of [-1, 1]) {
-      b.solid('woodBeam', 0.09, postH, 0.09, sx * hw, postH / 2, sz * hd, 0, 0.012, 'wood')
+      const lean = post === leaning && rng.bool(0.5) ? rng.spread(0.09) : 0
+      b.geom('woodBeam', chamferBox(0.09, postH, 0.09, 0.012),
+        xform(sx * hw, postH / 2, sz * hd, 0, 0, lean))
+      b.collide(0.12, postH, 0.12, sx * hw, postH / 2, sz * hd, 0, 'wood')
+      post++
     }
   }
   // Chamfered rather than square: a stall's top rails are the closest thing to
@@ -503,52 +592,92 @@ export function buildStall(
 
   // Canvas awning, sagging between the rails and overhanging the front.
   const canvas: MaterialName = rng.pick(['fabricAwning', 'tarp', 'fabricAwning'])
+  const over = rng.range(0.24, 0.5)
+  const torn = rng.bool(0.22)
+  const dropL = rng.range(0.16, 0.34)
+  const dropR = rng.range(0.16, 0.34)
+  const front = torn ? -hd - 0.55 + rng.range(0.35, 0.7) : -hd - 0.55
   b.geom(canvas, clothQuad(
-    new THREE.Vector3(-hw - 0.35, postH + 0.05, -hd - 0.55),
-    new THREE.Vector3(hw + 0.35, postH + 0.05, -hd - 0.55),
-    new THREE.Vector3(hw + 0.35, postH - 0.24, hd + 0.15),
-    new THREE.Vector3(-hw - 0.35, postH - 0.24, hd + 0.15),
-    0.16, 0.045, 8, 4, x * 3 + z))
-  // Scalloped valance along the front edge.
-  b.geom(canvas, clothQuad(
-    new THREE.Vector3(-hw - 0.35, postH + 0.03, -hd - 0.55),
-    new THREE.Vector3(hw + 0.35, postH + 0.03, -hd - 0.55),
-    new THREE.Vector3(hw + 0.35, postH - 0.36, -hd - 0.55),
-    new THREE.Vector3(-hw - 0.35, postH - 0.36, -hd - 0.55),
-    0.06, 0.05, 10, 2, x))
+    new THREE.Vector3(-hw - over, postH + 0.05 - dropL * 0.3, front),
+    new THREE.Vector3(hw + over, postH + 0.05 - dropR * 0.3, front),
+    new THREE.Vector3(hw + over, postH - dropR, hd + 0.15),
+    new THREE.Vector3(-hw - over, postH - dropL, hd + 0.15),
+    rng.range(0.1, 0.26), 0.045, 8, 4, x * 3 + z))
+  if (torn) {
+    // The shredded remains of the front third, still lashed to the rail.
+    b.geom(canvas, clothQuad(
+      new THREE.Vector3(-hw - over, postH + 0.04, -hd - 0.55),
+      new THREE.Vector3(-hw + width * rng.range(0.2, 0.45), postH + 0.02, -hd - 0.5),
+      new THREE.Vector3(-hw + width * 0.3, postH - rng.range(0.5, 1.0), front + 0.1),
+      new THREE.Vector3(-hw - over * 0.6, postH - rng.range(0.3, 0.8), front),
+      0.05, 0.09, 4, 4, z * 7))
+  } else {
+    // Scalloped valance along the front edge.
+    b.geom(canvas, clothQuad(
+      new THREE.Vector3(-hw - over, postH + 0.03, front),
+      new THREE.Vector3(hw + over, postH + 0.03, front),
+      new THREE.Vector3(hw + over, postH - 0.36 - rng.range(0, 0.14), front),
+      new THREE.Vector3(-hw - over, postH - 0.36 - rng.range(0, 0.14), front),
+      0.06, 0.05, 10, 2, x))
+  }
 
   // Counter and goods. The front skirt is boarded, not a single panel.
-  const ch = 0.86
+  const ch = 0.86 + rng.spread(0.09)
   b.solid('woodPlank', width, 0.07, depth * 0.8, 0, ch, 0.05, 0, 0.014, 'wood')
   const boards = Math.max(3, Math.round((ch - 0.1) / 0.16))
   for (let i = 0; i < boards; i++) {
     const bh = (ch - 0.1 - 0.008 * (boards - 1)) / boards
-    b.plate('woodPlank', width + rng.spread(0.03), bh, 0.045 + rng.range(0, 0.012),
+    b.slab('woodPlank', width + rng.spread(0.03), bh, 0.045 + rng.range(0, 0.012),
       rng.spread(0.015), bh / 2 + i * (bh + 0.008), -hd * 0.78)
   }
+  // Goods rest on the measured counter top with their own seat offset scaled
+  // with the instance. The fixed offsets these replace left a basket 7 cm and
+  // a small crate 13 cm clear of the boards — the plaza pose looks straight
+  // down onto this counter from three metres.
+  const deck = ch + 0.035
   for (let i = 0; i < rng.int(3, 6); i++) {
     const gx = rng.spread(hw - 0.28)
     const gz = rng.spread(hd * 0.3)
     const kind = rng.next()
-    if (kind < 0.35) farm.place('basket', x + rot(gx, gz, yaw).x, base + ch + 0.19, z + rot(gx, gz, yaw).z, rng.range(0, 3.1), rng.range(0.8, 1.1))
-    else if (kind < 0.6) farm.place('sack', x + rot(gx, gz, yaw).x, base + ch + 0.2, z + rot(gx, gz, yaw).z, rng.range(0, 3.1), rng.range(0.7, 0.95))
-    else farm.place('crateS', x + rot(gx, gz, yaw).x, base + ch + 0.25, z + rot(gx, gz, yaw).z, rng.range(0, 3.1), rng.range(0.55, 0.8))
+    const w = rot(gx, gz, yaw)
+    if (kind < 0.35) {
+      const sc = rng.range(0.8, 1.1)
+      farm.place('basket', x + w.x, base + deck + 0.15 * sc, z + w.z, rng.range(0, 3.1), sc)
+    } else if (kind < 0.6) {
+      const sc = rng.range(0.7, 0.95)
+      farm.place('sack', x + w.x, base + deck + 0.17 * sc, z + w.z, rng.range(0, 3.1), sc)
+    } else {
+      const sc = rng.range(0.55, 0.8)
+      farm.place('crateS', x + w.x, base + deck + 0.22 * sc, z + w.z, rng.range(0, 3.1), sc)
+    }
   }
   // Produce heaped in the baskets.
   for (let i = 0; i < 12; i++) {
     const gx = rng.spread(hw - 0.3)
     const gz = rng.spread(hd * 0.25)
+    const pr = rng.range(0.045, 0.085)
     b.geom(rng.pick<MaterialName>(['foliage', 'woodPainted', 'fabricAwning']),
-      sphereGeom(rng.range(0.045, 0.085), 6, 4), xform(gx, ch + 0.13, gz))
+      sphereGeom(pr, 6, 4), xform(gx, deck + pr * 0.85, gz))
   }
-  // Hanging cloth at the back, and a bare bulb on a flex.
-  if (rng.bool(0.7)) {
-    b.geom(rng.pick<MaterialName>(['tarp', 'fabricAwning']), clothQuad(
-      new THREE.Vector3(-hw, postH - 0.3, hd),
-      new THREE.Vector3(hw, postH - 0.3, hd),
-      new THREE.Vector3(hw, rng.range(0.3, 0.9), hd + 0.06),
-      new THREE.Vector3(-hw, rng.range(0.3, 0.9), hd + 0.06),
-      0.05, 0.06, 6, 5, z))
+  // Hanging cloth at the back: two or three overlapping lengths pegged to the
+  // rail at different heights, not one panel. A single 3 m rectangle of tarp
+  // is a flat saturated card whatever the material does with it — separate
+  // drops give it a hem line, a lap shadow and an irregular silhouette.
+  if (rng.bool(0.78)) {
+    const drops = rng.int(2, 3)
+    let u = -hw - rng.range(0.0, 0.12)
+    for (let i = 0; i < drops && u < hw - 0.15; i++) {
+      const w1 = Math.min(hw - u, (width / drops) * rng.range(0.9, 1.35))
+      const y0 = postH - rng.range(0.24, 0.46)
+      const y1 = postH - rng.range(0.2, 0.42)
+      b.geom(rng.pick<MaterialName>(['tarp', 'fabricAwning', 'sandbag']), clothQuad(
+        new THREE.Vector3(u, y0, hd + i * 0.012),
+        new THREE.Vector3(u + w1, y1, hd + i * 0.012),
+        new THREE.Vector3(u + w1, rng.range(0.25, 1.0), hd + 0.07 + i * 0.012),
+        new THREE.Vector3(u, rng.range(0.25, 1.0), hd + 0.07 + i * 0.012),
+        rng.range(0.04, 0.11), rng.range(0.05, 0.11), 5, 6, z + i * 3.7))
+      u += w1 - rng.range(0.03, 0.16)
+    }
   }
   b.geom('metalPainted', cylinderGeom(0.006, 0.006, 0.35, 4), xform(rng.spread(0.6), postH - 0.32, 0))
   b.geom('glass', sphereGeom(0.06, 8, 6), xform(0, postH - 0.5, 0))
@@ -565,8 +694,7 @@ export function buildStall(
     seatProp(farm, rng, rng.pick(['paper', 'paper', 'cardboard', 'can']),
       x + p.x, z + p.z, rng.range(0, 3.1), rng.range(0.7, 1.3), rng.spread(0.3), rng.spread(0.3))
   }
-  b.geom('dirt', decalQuad(width + 1.6, depth + 1.6, 0.3, x * 13 + z),
-    xform(x, surfaceHeight(x, z) + 0.018, z, yaw, -Math.PI / 2))
+  b.geom('dirt', groundPatch(x, z, (width + 1.6) / 2, (depth + 1.6) / 2, x * 13 + z, surfaceHeight, 0.018))
 }
 
 /** Rotates a local XZ offset into world space by `yaw` (three's Y convention). */
@@ -793,8 +921,7 @@ export function buildEmplacement(
   b.collide(length + 0.5, rows * 0.175, 0.75, x, base + (rows * 0.175) / 2, z, yaw, 'fabric')
   if (baseY === undefined) {
     // Sand spilled from a split bag, and the dust worn into the firing step.
-    b.geom('sand', decalQuad(length + 0.9, 1.5, 0.26, x * 3 + z),
-      xform(x, base + 0.022, z, yaw, -Math.PI / 2))
+    b.geom('sand', groundPatch(x, z, (length + 0.9) / 2, 0.75, x * 3 + z, surfaceHeight, 0.022))
     for (let i = 0; i < 5; i++) {
       const p = rot(rng.spread(length * 0.55), rng.range(-1.0, -0.4), yaw)
       const px = x + p.x
@@ -985,7 +1112,7 @@ export function buildSign(
 /** Furnishes the three enterable buildings; empty shells read as blockout. */
 export function buildInteriors(b: Builder, farm: InstanceFarm, rng: Rand): void {
   // --- Bakery: the interior pose looks west through the cross-wall opening.
-  const bY = groundHeight(-16.5, 5.75) + 0.04
+  const bY = footprintBase(-16.5, 5.75, 14, 12.5)
   // East room: counter, oven, shelves and sacks of flour.
   b.push(-11.6, bY, 2.4, -Math.PI / 2)
   b.solid('woodPlank', 3.4, 0.94, 0.72, 0, 0.47, 0, 0, 0.02, 'wood')
@@ -1021,7 +1148,7 @@ export function buildInteriors(b: Builder, farm: InstanceFarm, rng: Rand): void 
   b.pop()
 
   // --- West room: the pose's midground and background.
-  const wt = groundHeight(-19.8, 8.2) + 0.04
+  const wt = footprintBase(-16.5, 5.75, 14, 12.5)
   farm.place('table', -19.8, wt, 8.2, 0.18)
   farm.place('chair', -18.7, wt, 8.9, 2.6)
   farm.place('chair', -20.7, wt, 7.1, 5.9)
@@ -1061,7 +1188,7 @@ export function buildInteriors(b: Builder, farm: InstanceFarm, rng: Rand): void 
   }
 
   // --- Apartment: living space above the shop.
-  const aY = groundHeight(-15.75, 25) + 0.04
+  const aY = footprintBase(-15.75, 25, 10.5, 14)
   farm.place('table', -13.6, aY, 27.6, 1.3)
   farm.place('chair', -13.0, aY, 28.6, 3.6)
   farm.place('chair', -14.6, aY, 26.7, 0.4)
@@ -1080,7 +1207,7 @@ export function buildInteriors(b: Builder, farm: InstanceFarm, rng: Rand): void 
   }
 
   // --- East block ground floor: a stripped shop.
-  const eY = groundHeight(12.35, 13.25) + 0.04
+  const eY = footprintBase(12.35, 13.25, 6.3, 12.5)
   b.push(11.4, eY, 9.6, 0)
   b.solid('woodPlank', 2.8, 0.9, 0.62, 0, 0.45, 0, 0, 0.02, 'wood')
   b.pop()
@@ -1095,20 +1222,20 @@ export function buildInteriors(b: Builder, farm: InstanceFarm, rng: Rand): void 
   }
 
   // --- Market hall: trestle tables and produce, lit through the arches.
-  const mY = groundHeight(19.75, 16.25) + 0.04
+  const mY = footprintBase(19.75, 16.25, 8.5, 11.5) + 0.02
   for (let i = 0; i < 4; i++) {
     const tz = 12.2 + i * 2.5
     farm.place('table', 17.8, mY, tz, 0)
     farm.place('table', 21.7, mY, tz, 0)
     for (let k = 0; k < 3; k++) {
-      farm.place('basket', 17.4 + k * 0.42, mY + 0.9, tz + rng.spread(0.2), rng.range(0, 3.1), 0.8)
-      farm.place('basket', 21.3 + k * 0.42, mY + 0.9, tz + rng.spread(0.2), rng.range(0, 3.1), 0.8)
+      farm.place('basket', 17.4 + k * 0.42, mY + 0.74 + 0.12, tz + rng.spread(0.2), rng.range(0, 3.1), 0.8)
+      farm.place('basket', 21.3 + k * 0.42, mY + 0.74 + 0.12, tz + rng.spread(0.2), rng.range(0, 3.1), 0.8)
     }
   }
   for (let i = 0; i < 26; i++) {
     b.geom(rng.pick<MaterialName>(['foliage', 'woodPainted', 'fabricAwning']),
       sphereGeom(rng.range(0.05, 0.09), 6, 4),
-      xform(17.3 + rng.range(0, 4.8), mY + 0.86, 11.8 + rng.range(0, 8.4)))
+      xform(17.3 + rng.range(0, 4.8), mY + 0.79, 11.8 + rng.range(0, 8.4)))
   }
 }
 
@@ -1172,6 +1299,32 @@ export function buildSetPieces(b: Builder, farm: InstanceFarm, rng: Rand): void 
   farm.place('crateS', 16.6, deckTop + 0.22, 20.0, 1.2)
   buildEmplacement(b, farm, rng, 23.6, 28.9, -0.35, 3.4, 4, 0.22) // checkpoint
   buildEmplacement(b, farm, rng, -12.5, -3.4, 0.15, 2.8, 4, 0.2)
+
+  // The overwatch deck, dressed for the elevated pose. A third of that frame
+  // is this roof, and it was a bare slab: these sit either side of the
+  // sightline through the parapet breach so the shot gains a near layer and a
+  // mid layer without anything standing in the middle of it.
+  b.push(21.6, deckTop, 19.2, 0.42)
+  for (const sx of [-1, 1]) {
+    for (const sz of [-1, 1]) b.solid('woodBeam', 0.09, 0.44, 0.09, sx * 0.34, 0.22, sz * 0.34, 0, 0.012, 'wood')
+  }
+  b.slab('woodPlank', 0.9, 0.05, 0.9, 0, 0.465, 0)
+  b.geom('metalRusted', cylinderGeom(0.42, 0.44, 0.86, 14), xform(0, 0.92, 0))
+  b.geom('metalRusted', cylinderGeom(0.44, 0.46, 0.05, 14), xform(0, 1.36, 0))
+  b.geom('metalPainted', cylinderGeom(0.03, 0.03, 0.5, 6), xform(0.36, 0.62, 0.28, 0, 0, 0.25))
+  b.collide(0.95, 1.4, 0.95, 0, 0.7, 0, 0, 'thinMetal')
+  b.pop()
+  farm.place('crateL', 17.3, deckTop + 0.36, 21.0, 0.85)
+  farm.place('crateM', 17.55, deckTop + 0.98, 20.78, 2.1, 1, 0.04, 0.03)
+  farm.place('crateS', 16.7, deckTop + 0.22, 20.6, 1.4, 0.95)
+  farm.place('cableCoil', 20.0, deckTop, 20.4, 0.7)
+  farm.place('bucket', 22.4, deckTop + 0.14, 20.2, 2.3)
+  for (let i = 0; i < 11; i++) {
+    const px = 16.6 + rng.range(0, 6.2)
+    const pz = 18.4 + rng.range(0, 3.2)
+    farm.place(rng.pick(['paper', 'can', 'cardboard', 'paper']), px, deckTop + 0.006, pz,
+      rng.range(0, 3.1), rng.range(0.7, 1.2), rng.spread(0.2), rng.spread(0.2))
+  }
 
   // Awnings over the shopfronts that face the graded cameras. The anchor sits
   // on the wall plane; the canvas projects along the facade's outward normal.
@@ -1331,21 +1484,44 @@ export function scatterClutter(b: Builder, farm: InstanceFarm, rng: Rand, densit
     scraps++
   }
 
-  // Jersey barriers and HESCO in deliberate lines, not scattered.
+  // Jersey barriers in deliberate lines — but laid by hand, not by an array.
+  // Even spacing, one yaw and one scale down a whole run is the single most
+  // recognisable procedural tell in the frame, so every unit walks along the
+  // line by its own amount, one run in three has a barrier dragged out of
+  // position and every run finishes with a toppled one and the spoil around
+  // its base.
   const barrierRuns: [number, number, number, number][] = [
     [2.6, 10.6, -0.25, 3], [8.6, 9.6, 0.2, 2], [-2.4, 16.8, 1.35, 3],
     [21.6, 27.2, -0.349, 4], [26.4, 32.4, -0.349 + Math.PI, 3],
     [-6.0, 12.2, 1.6, 2], [12.6, 22.4, 0.1, 3], [-16.0, -1.8, 0.0, 2],
   ]
   for (const [x, z, yaw, n] of barrierRuns) {
+    let off = -((n - 1) / 2) * 1.66
+    const fallen = rng.int(0, n - 1)
     for (let i = 0; i < n; i++) {
-      const off = (i - (n - 1) / 2) * 1.62
-      const p = rot(off, 0, yaw)
+      const lat = rng.spread(0.16)
+      const p = rot(off, lat, yaw)
       const px = x + p.x
       const pz = z + p.z
       const y = settleHeight(px, pz, 0.8, 0.035)
-      farm.place('jersey', px, y, pz, yaw + rng.spread(0.07))
-      b.collide(1.6, 0.95, 0.62, px, y + 0.45, pz, yaw, 'concrete')
+      const jaw = yaw + rng.spread(0.17)
+      if (i === fallen && n > 2) {
+        // Shunted over onto its side, the way one always is at a checkpoint.
+        farm.place('jersey', px, y + 0.31, pz, jaw + rng.spread(0.5), 1, Math.PI / 2, 0)
+        b.collide(1.62, 0.66, 0.98, px, y + 0.32, pz, jaw, 'concrete')
+      } else {
+        farm.place('jersey', px, y, pz, jaw)
+        b.collide(1.62, 0.95, 0.68, px, y + 0.45, pz, jaw, 'concrete')
+      }
+      // Grit and broken kerb swept up against the foot.
+      for (let k = 0; k < rng.int(1, 4); k++) {
+        const q = rot(off + rng.spread(0.8), lat + rng.range(0.3, 0.62) * (rng.bool() ? 1 : -1), yaw)
+        const cx = x + q.x
+        const cz = z + q.z
+        farm.place(`chunk${rng.int(0, 3)}`, cx, settleHeight(cx, cz, 0.1, 0.03), cz,
+          rng.range(0, 3.1), rng.range(0.5, 1.2), rng.spread(0.6), rng.spread(0.6))
+      }
+      off += rng.range(1.58, 1.92) + (rng.bool(0.18) ? rng.range(0.5, 1.4) : 0)
     }
   }
   for (const [x, z, yaw, n] of [[22.9, 30.2, -0.349, 3], [10.4, 20.0, 0.1, 2]] as [number, number, number, number][]) {
@@ -1368,25 +1544,53 @@ export function scatterClutter(b: Builder, farm: InstanceFarm, rng: Rand, densit
     const y = settleHeight(x, z, 0.75, 0.025)
     const yaw = rng.range(0, Math.PI * 2)
     // Each box is seated on the measured top of the one below with a 12 mm
-    // bite, so the stack has no daylight in it at any scale.
+    // bite, so the stack has no daylight in it at any scale. Boxes above the
+    // base are turned by up to 25 degrees rather than 8: a stack squared up to
+    // within a few degrees is stacked by a loop, not by a person.
     const bite = 0.012
-    farm.place('pallet', x, y + 0.024, z, yaw)
-    let top = y + 0.13
-    const sl = rng.range(0.9, 1.1)
-    farm.place('crateL', x, top + 0.36 * sl - bite, z, yaw + rng.spread(0.14), sl)
+    const onPallet = rng.bool(0.7)
+    if (onPallet) farm.place('pallet', x, y + 0.024, z, yaw)
+    let top = y + (onPallet ? 0.13 : 0.0)
+    const sl = rng.range(0.88, 1.14)
+    farm.place('crateL', x, top + 0.36 * sl - bite, z, yaw + rng.spread(0.44), sl)
     top += 0.72 * sl - bite
     if (rng.bool(0.7)) {
       const sm = rng.range(0.88, 1.12)
-      farm.place('crateM', x + rng.spread(0.22), top + 0.31 * sm - bite, z + rng.spread(0.22),
-        yaw + rng.spread(0.7), sm, rng.spread(0.03), rng.spread(0.03))
+      farm.place('crateM', x + rng.spread(0.26), top + 0.31 * sm - bite, z + rng.spread(0.26),
+        yaw + rng.spread(0.9), sm, rng.spread(0.05), rng.spread(0.05))
       top += 0.62 * sm - bite
       if (rng.bool(0.5)) {
         const ss = rng.range(0.85, 1.15)
-        farm.place('crateS', x + rng.spread(0.28), top + 0.22 * ss - bite, z + rng.spread(0.28),
-          yaw + rng.spread(1.0), ss, rng.spread(0.05), rng.spread(0.05))
+        farm.place('crateS', x + rng.spread(0.3), top + 0.22 * ss - bite, z + rng.spread(0.3),
+          yaw + rng.spread(1.2), ss, rng.spread(0.07), rng.spread(0.07))
       }
     }
-    b.geom('dirt', decalQuad(2.0, 1.8, 0.28, x * 7 + z), xform(x, y + 0.02, z, rng.range(0, 3.1), -Math.PI / 2))
+    // One crate off the pile: either tipped onto its side against the stack or
+    // propped at an angle. This is what breaks the column silhouette.
+    if (rng.bool(0.75)) {
+      const a = rng.range(0, Math.PI * 2)
+      const r = rng.range(0.72, 1.05)
+      const px = x + Math.cos(a) * r
+      const pz = z + Math.sin(a) * r
+      const gy = settleHeight(px, pz, 0.4, 0.02)
+      if (rng.bool(0.5)) {
+        farm.place('crateM', px, gy + 0.3, pz, rng.range(0, 3.1), rng.range(0.9, 1.1), Math.PI / 2, 0)
+      } else {
+        farm.place('crateM', px, gy + 0.33, pz, rng.range(0, 3.1), rng.range(0.9, 1.1),
+          rng.spread(0.1), rng.range(0.28, 0.46) * (rng.bool() ? 1 : -1))
+      }
+      b.collide(0.8, 0.62, 0.8, px, gy + 0.31, pz, 0, 'wood')
+    }
+    // Straw, split boards and swept grit at the foot of the pile.
+    for (let k = 0; k < rng.int(2, 5); k++) {
+      const a = rng.range(0, Math.PI * 2)
+      const r = rng.range(0.6, 1.35)
+      const px = x + Math.cos(a) * r
+      const pz = z + Math.sin(a) * r
+      seatProp(farm, rng, rng.pick(['plank', 'cardboard', 'paper', 'plank']),
+        px, pz, rng.range(0, 3.1), rng.range(0.7, 1.2), rng.spread(0.25), rng.spread(0.25))
+    }
+    b.geom('dirt', groundPatch(x, z, 1.0, 0.9, x * 7 + z, surfaceHeight, 0.018))
     b.collide(1.3, 1.5, 0.95, x, y + 0.75, z, yaw, 'wood')
   }
 

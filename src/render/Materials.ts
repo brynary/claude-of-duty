@@ -2,6 +2,7 @@ import * as THREE from 'three'
 import type { GameContext, System, MaterialService } from '../core/Types'
 import { MATERIAL_NAMES, surfaceOf, type MaterialName } from './MaterialNames'
 import { bakeSurface, type BakedMaps } from './procedural/Bake'
+import { buildDetailNormal } from './procedural/Detail'
 import { Noise } from './procedural/Noise'
 import { RECIPES, type MaterialSpec } from './procedural/Recipes'
 import { applyTriplanar } from './procedural/Triplanar'
@@ -36,6 +37,8 @@ export class MaterialSystem implements System, MaterialService {
   private resolutionScale = 1
   /** Textures whose offsets are scrolled to animate water. */
   private waterMaps: BakedMaps | null = null
+  /** Micro-detail shared by every triplanar surface in the world. */
+  private detailMap: THREE.DataTexture | null = null
 
   init(ctx: GameContext): void {
     ctx.services.materials = this
@@ -44,9 +47,40 @@ export class MaterialSystem implements System, MaterialService {
     this.resolutionScale = ctx.config.quality === 'low' ? 0.5 : 1
 
     const started = performance.now()
+    this.detailMap = this.buildDetailMap()
     for (const name of MATERIAL_NAMES) this.cache.set(name, this.build(name))
     const ms = performance.now() - started
     console.info(`[materials] baked ${MATERIAL_NAMES.length} materials in ${ms.toFixed(0)}ms`)
+  }
+
+  /**
+   * One texture, projected over the whole world at centimetre scale.
+   *
+   * Every material's own bake tops out somewhere around 500 texels per metre —
+   * enough to resolve a brick, not enough to resolve the grit on it. Baking
+   * every surface fine enough to carry that grain would cost sixteen times the
+   * memory for detail that is identical everywhere, so it is generated once and
+   * shared. See `Detail.ts`.
+   */
+  private buildDetailMap(): THREE.DataTexture {
+    const size = this.resolutionScale < 1 ? 256 : 512
+    const tex = new THREE.DataTexture(
+      buildDetailNormal(hashName(this.seed, 'detail'), size),
+      size,
+      size,
+      THREE.RGBAFormat,
+      THREE.UnsignedByteType,
+    )
+    tex.colorSpace = THREE.NoColorSpace
+    tex.wrapS = THREE.RepeatWrapping
+    tex.wrapT = THREE.RepeatWrapping
+    tex.magFilter = THREE.LinearFilter
+    tex.minFilter = THREE.LinearMipmapLinearFilter
+    tex.generateMipmaps = true
+    tex.anisotropy = this.anisotropy
+    tex.flipY = false
+    tex.needsUpdate = true
+    return tex
   }
 
   /**
@@ -126,7 +160,7 @@ export class MaterialSystem implements System, MaterialService {
     if (spec.params) mat.setValues(spec.params)
 
     if (spec.triplanar) {
-      applyTriplanar(mat, {
+      applyTriplanar(mat, this.detailMap ?? this.buildDetailMap(), {
         ...spec.triplanar,
         scale: 1 / spec.worldSize,
         offset: this.projectionOffset(name),
@@ -175,6 +209,8 @@ export class MaterialSystem implements System, MaterialService {
     for (const m of this.cache.values()) m.dispose()
     for (const m of this.instancedCache.values()) m.dispose()
     for (const t of this.textures) t.dispose()
+    this.detailMap?.dispose()
+    this.detailMap = null
     this.cache.clear()
     this.instancedCache.clear()
     this.maps.clear()

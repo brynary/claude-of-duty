@@ -175,11 +175,22 @@ export function makePalette(rng: Rand): Palette {
       : scheme === 1
         ? [new THREE.Color(0x8c8265), new THREE.Color(0xa89b7a), new THREE.Color(0x6b6149)] // desert
         : [new THREE.Color(0x646b55), new THREE.Color(0x7c8468), new THREE.Color(0x4a5040)] // olive
+  // Load-bearing kit is a plain colour from the opposite family to the uniform
+  // — coyote brown over green camo, ranger green over tan — because that is how
+  // real loadouts are issued and because the hue break is what keeps carrier,
+  // pouches, gloves and knee pads from merging into the sleeve once the light
+  // drops. It is matched in value to the camo's own shadow tone rather than
+  // pushed darker: buying the separation with another stop of black is how you
+  // end up with the featureless silhouette this palette exists to avoid.
+  const kit = scheme === 1 ? new THREE.Color(0x585e4c) : new THREE.Color(0x6a5647)
   return {
     camo,
     camoScale: rng.range(11, 15),
-    webbing: new THREE.Color().copy(camo[2]).multiplyScalar(rng.range(0.9, 1.1)),
-    helmet: new THREE.Color().copy(camo[0]).multiplyScalar(0.88),
+    webbing: new THREE.Color().copy(kit).multiplyScalar(rng.range(0.9, 1.1)),
+    // The helmet cover sits between uniform and kit in value so the head reads
+    // as its own shape against the shoulders at gameplay distance. At 0.88 it
+    // was within a fifth of a stop of the uniform and the two ran together.
+    helmet: new THREE.Color().copy(camo[0]).multiplyScalar(0.74),
     boot: new THREE.Color(0x4a4238).multiplyScalar(rng.range(0.88, 1.15)),
     skin: new THREE.Color().setHSL(0.072, rng.range(0.3, 0.44), rng.range(0.4, 0.56)),
     gun: new THREE.Color(0x565a60),

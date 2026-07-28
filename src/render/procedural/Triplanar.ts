@@ -3,26 +3,34 @@ import * as THREE from 'three'
 /**
  * World-space triplanar projection for architectural materials.
  *
- * Four problems this solves at once:
+ * Five problems this solves at once:
  *
  * 1. **Texel density is correct by construction.** The projection is driven by
  *    world position in metres, so a wall is textured at the same scale whether
  *    the level built it from a 12 m box or a 2 m one, and whatever its UVs say.
  *    Stretched textures on stretched boxes are the classic engine-demo tell.
- * 2. **Tiling repetition is broken up.** A world-space value-noise field
- *    modulates albedo and roughness at a much larger scale than the texture
- *    tile, so the eye never locks onto the repeat.
- * 3. **Apparent texel density is multiplied.** A second, rotated, non-integer
- *    octave of the normal map is added on top of the base projection. It costs
- *    three texture fetches and buys detail an order of magnitude finer than the
- *    baked tile, and it self-limits: once the detail octave mips out to flat it
- *    contributes nothing, so it never aliases in the distance.
- * 4. **Surfaces accumulate history.** Dust settles on upward faces, grime
- *    collects in every baked cavity, and splash-back darkens the bottom of
- *    every vertical surface where it meets the ground. All three are driven
- *    from data the projection already has — the world normal, the baked
- *    occlusion channel and the world height — so nothing has to be authored
- *    per surface.
+ * 2. **Surfaces have real depth.** The baked height field rides in the alpha
+ *    channel of the normal map and is parallax-marched per pixel, so mortar
+ *    goes *behind* brick and joints go *under* setts. A normal map alone only
+ *    encodes slope; at the grazing angles that dominate a first-person frame —
+ *    a wall running away down an alley, paving under your feet — slope shading
+ *    collapses and the surface reads as a photograph of relief rather than
+ *    relief. This is the difference.
+ * 3. **Apparent texel density is multiplied.** A shared micro-detail texture is
+ *    projected at a fixed world frequency on top of every material, adding
+ *    grain, gloss breakup and pore cavities an order of magnitude finer than
+ *    any material's own bake. It mips out to flat in the distance, so it costs
+ *    nothing where it cannot be seen and never aliases.
+ * 4. **Light describes the surface.** Roughness is broken up at three separate
+ *    scales — metres, decimetres, millimetres — and the baked occlusion is fed
+ *    back into the *direct* lighting term as micro-shadowing, not just the
+ *    ambient. Occlusion applied only to indirect light is invisible under a
+ *    strong sun, which is exactly when a player is looking at a wall.
+ * 5. **Surfaces accumulate history.** Dust settles on upward faces, grime
+ *    collects in every cavity, and splash-back darkens the bottom of every
+ *    vertical surface where it meets the ground. All three are driven from data
+ *    the projection already has — the world normal, the occlusion channel and
+ *    the world height — so nothing has to be authored per surface.
  *
  * The normal maps are combined with the standard "whiteout" triplanar blend and
  * the result is handed to the shader in view space, which is where three.js
@@ -41,16 +49,30 @@ export interface TriplanarOptions {
   macroAlbedo?: number
   /** Roughness swing of the macro field, +/- fraction. */
   macroRough?: number
+  /** Cycles per metre of the mid-scale roughness field. */
+  mesoScale?: number
+  /** Roughness swing of the mid-scale field, +/- fraction. */
+  mesoRough?: number
   /** Linear RGB of settled dust. */
   dustColor?: THREE.Color
   /** How strongly dust covers upward faces, 0..1. */
   dustAmount?: number
   /** Roughness that dust drags the surface towards. */
   dustRough?: number
-  /** Frequency multiplier of the detail normal octave. */
-  detailScale?: number
-  /** Strength of the detail normal octave. 0 disables the extra fetches' effect. */
+  /** Tiles per metre of the shared micro-detail texture. */
+  detailFreq?: number
+  /** Strength of the micro-detail normal. 0 disables its contribution. */
   detailNormal?: number
+  /** Roughness swing contributed by the micro-detail, absolute. */
+  detailRough?: number
+  /** How much the micro-detail's pore cavities collect grime, 0..1. */
+  detailCavity?: number
+  /** Peak-to-trough depth of the relief, in metres. 0 disables parallax. */
+  parallax?: number
+  /** Metres at which parallax starts and finishes fading out. */
+  parallaxFade?: [number, number]
+  /** How strongly baked occlusion shadows *direct* light, 0..1. */
+  microShadow?: number
   /** Linear RGB of grime — used in cavities and at the foot of walls. */
   grimeColor?: THREE.Color
   /** How strongly baked cavities fill with grime, 0..1. */
@@ -66,17 +88,25 @@ export interface TriplanarOptions {
 const FRAGMENT_HELPERS = /* glsl */ `
 varying vec3 vTriWorldPos;
 varying vec3 vTriWorldNormal;
+uniform sampler2D uDetailMap;
 uniform float uTriScale;
 uniform float uTriSharp;
 uniform vec3 uTriOffset;
 uniform float uMacroScale;
 uniform float uMacroAlbedo;
 uniform float uMacroRough;
+uniform float uMesoScale;
+uniform float uMesoRough;
 uniform vec3 uDustColor;
 uniform float uDustAmount;
 uniform float uDustRough;
-uniform float uDetailScale;
+uniform float uDetailFreq;
 uniform float uDetailNormal;
+uniform float uDetailRough;
+uniform float uDetailCavity;
+uniform float uParallax;
+uniform vec2 uParallaxFade;
+uniform float uMicroShadow;
 uniform vec3 uGrimeColor;
 uniform float uCavityDirt;
 uniform float uGrimeAmount;
@@ -107,15 +137,10 @@ float triValueNoise( vec3 p ) {
 	float x11 = mix( n011, n111, f.x );
 	return mix( mix( x00, x10, f.y ), mix( x01, x11, f.y ), f.z );
 }
-
-// 45 degrees. The detail octave is rotated so that on structural materials —
-// brick courses, ashlar, plank runs — its miniature copy of the pattern crosses
-// the real one instead of ghosting a scaled duplicate on top of it.
-vec2 triRot45( vec2 v ) {
-	return vec2( v.x - v.y, v.x + v.y ) * 0.70710678;
-}
 `
 
+// The height field lives in the normal map's alpha, with 1 at the highest point
+// on the surface, so depth below the reference plane is 1 - alpha.
 const MAP_FRAGMENT = /* glsl */ `
 	vec3 triWorld = vTriWorldPos + uTriOffset;
 	vec3 triN = normalize( vTriWorldNormal ) * ( gl_FrontFacing ? 1.0 : -1.0 );
@@ -125,10 +150,64 @@ const MAP_FRAGMENT = /* glsl */ `
 	vec2 triUvX = triP.zy;
 	vec2 triUvY = triP.xz;
 	vec2 triUvZ = triP.xy;
-	vec3 triD = triP * uDetailScale;
-	vec2 triDvX = triRot45( triD.zy ) + 0.317;
-	vec2 triDvY = triRot45( triD.xz ) + 0.613;
-	vec2 triDvZ = triRot45( triD.xy ) + 0.829;
+
+	// --- Parallax occlusion, on the dominant plane -------------------------
+	// Only the plane the surface most faces is marched. On the box-like
+	// geometry this projection exists to serve, that plane carries almost all
+	// of the blend weight, so marching the other two would triple the cost to
+	// correct an error that is already multiplied by ~0.02.
+	vec3 triToEye = cameraPosition - vTriWorldPos;
+	float triViewDist = length( triToEye );
+	vec3 triV = triToEye / max( triViewDist, 0.0001 );
+	if ( uParallax > 0.0 ) {
+		float triFade = 1.0 - smoothstep( uParallaxFade.x, uParallaxFade.y, triViewDist );
+		if ( triFade > 0.0 ) {
+			vec3 triA = abs( triN );
+			vec2 triBaseUv;
+			vec3 triVt;
+			float triAxis;
+			if ( triA.x >= triA.y && triA.x >= triA.z ) {
+				triBaseUv = triUvX;
+				triVt = vec3( triV.z, triV.y, triV.x * sign( triN.x ) );
+				triAxis = 0.0;
+			} else if ( triA.y >= triA.z ) {
+				triBaseUv = triUvY;
+				triVt = vec3( triV.x, triV.z, triV.y * sign( triN.y ) );
+				triAxis = 1.0;
+			} else {
+				triBaseUv = triUvZ;
+				triVt = vec3( triV.x, triV.y, triV.z * sign( triN.z ) );
+				triAxis = 2.0;
+			}
+			// Offset limiting: dividing by the true cosine is correct but blows
+			// up to a screen-wide smear at the horizon, so the denominator is
+			// floored. Depth is authored in metres and converted to tile units.
+			float triDepth = uParallax * uTriScale * triFade;
+			vec2 triSweep = ( triVt.xy / max( triVt.z, 0.32 ) ) * triDepth;
+			float triSteps = mix( 14.0, 6.0, clamp( triVt.z, 0.0, 1.0 ) );
+			float triLayer = 1.0 / triSteps;
+			vec2 triStepUv = triSweep * triLayer;
+			float triCurLayer = 0.0;
+			vec2 triCurUv = triBaseUv;
+			float triCurDepth = 1.0 - texture2D( normalMap, triCurUv ).a;
+			for ( int i = 0; i < 14; i ++ ) {
+				if ( triCurLayer >= triCurDepth ) break;
+				triCurUv -= triStepUv;
+				triCurLayer += triLayer;
+				triCurDepth = 1.0 - texture2D( normalMap, triCurUv ).a;
+			}
+			// One linear solve between the last two layers. Without it the
+			// silhouette of every joint is quantised into visible stair steps.
+			vec2 triPrevUv = triCurUv + triStepUv;
+			float triAfter = triCurDepth - triCurLayer;
+			float triBefore = ( 1.0 - texture2D( normalMap, triPrevUv ).a ) - ( triCurLayer - triLayer );
+			float triW = clamp( triAfter / max( triAfter - triBefore, 0.0001 ), 0.0, 1.0 );
+			vec2 triOff = mix( triCurUv, triPrevUv, triW ) - triBaseUv;
+			if ( triAxis < 0.5 ) triUvX += triOff;
+			else if ( triAxis < 1.5 ) triUvY += triOff;
+			else triUvZ += triOff;
+		}
+	}
 
 	vec4 triAlbedo = texture2D( map, triUvX ) * triBlend.x
 		+ texture2D( map, triUvY ) * triBlend.y
@@ -137,8 +216,19 @@ const MAP_FRAGMENT = /* glsl */ `
 		+ texture2D( roughnessMap, triUvY ) * triBlend.y
 		+ texture2D( roughnessMap, triUvZ ) * triBlend.z;
 
+	// --- Shared micro-detail ------------------------------------------------
+	// Projected at an absolute world frequency rather than a multiple of the
+	// material's own tile, so grit is the same physical size on a 0.9 m brick
+	// tile and a 3.5 m dirt tile, and never lines up with either.
+	vec3 triDp = ( triWorld + uTriOffset.yzx ) * uDetailFreq;
+	vec4 triDetX = texture2D( uDetailMap, triDp.zy );
+	vec4 triDetY = texture2D( uDetailMap, triDp.xz );
+	vec4 triDetZ = texture2D( uDetailMap, triDp.xy );
+	vec2 triDetBA = triDetX.ba * triBlend.x + triDetY.ba * triBlend.y + triDetZ.ba * triBlend.z;
+
 	float triMacro = triValueNoise( triWorld * uMacroScale ) * 0.62
 		+ triValueNoise( triWorld * uMacroScale * 2.7 + 19.3 ) * 0.38;
+	float triMeso = triValueNoise( triWorld * uMesoScale + 7.13 );
 
 	// Value *and* temperature drift. Weathering shifts hue as well as
 	// brightness, and a slight warm/cool split is what stops a large wall
@@ -149,10 +239,11 @@ const MAP_FRAGMENT = /* glsl */ `
 		triMacro );
 
 	// Grime in every cavity. The baked occlusion channel already knows where
-	// the surface dips below its neighbourhood, so squaring it gives a tight
-	// crease mask for free. Unlike an AO term this darkens albedo, so it still
-	// reads under full sun where ambient occlusion contributes nothing.
-	float triCav = 1.0 - triOrm.r;
+	// the surface dips below its neighbourhood, and the detail map's pore mask
+	// knows where it dips below that; squaring the pair gives a tight crease
+	// mask for free. Unlike an AO term this darkens albedo, so it still reads
+	// under full sun where ambient occlusion contributes nothing.
+	float triCav = max( 1.0 - triOrm.r, triDetBA.y * uDetailCavity );
 	float triCavity = clamp( triCav * triCav * uCavityDirt * ( 0.5 + 1.0 * triMacro ), 0.0, 0.85 );
 	triAlbedo.rgb = mix( triAlbedo.rgb, uGrimeColor * ( 0.55 + 0.8 * triMacro ), triCavity );
 
@@ -178,11 +269,16 @@ const MAP_FRAGMENT = /* glsl */ `
 `
 
 const ROUGHNESS_FRAGMENT = /* glsl */ `
+	// Three decades of gloss variation. One is a pattern, two is a texture,
+	// three is a surface: metres of weathering drift, decimetres of wet/dry
+	// patchiness, millimetres of grain.
 	float roughnessFactor = roughness * triOrm.g;
 	roughnessFactor *= mix( 1.0 - uMacroRough, 1.0 + uMacroRough, triMacro );
+	roughnessFactor *= mix( 1.0 - uMesoRough, 1.0 + uMesoRough, triMeso );
+	roughnessFactor += ( triDetBA.x - 0.5 ) * uDetailRough;
 	roughnessFactor = mix( roughnessFactor, 0.95, triFilth );
 	roughnessFactor = mix( roughnessFactor, uDustRough, triDust );
-	roughnessFactor = clamp( roughnessFactor, 0.04, 1.0 );
+	roughnessFactor = clamp( roughnessFactor, 0.06, 1.0 );
 `
 
 const METALNESS_FRAGMENT = /* glsl */ `
@@ -194,13 +290,13 @@ const NORMAL_FRAGMENT = /* glsl */ `
 	vec3 triTnY = texture2D( normalMap, triUvY ).xyz * 2.0 - 1.0;
 	vec3 triTnZ = texture2D( normalMap, triUvZ ).xyz * 2.0 - 1.0;
 	// UDN-style detail blend: only the tangential components are summed, so the
-	// detail octave adds slope without ever cancelling the base normal out.
-	// The branch is on a uniform, so it is coherent across the whole draw and
-	// the three extra fetches cost nothing on materials that opt out.
+	// micro-detail adds slope without ever cancelling the base normal out. The
+	// branch is on a uniform, so it is coherent across the whole draw and the
+	// materials that opt out pay nothing.
 	if ( uDetailNormal > 0.0 ) {
-		triTnX.xy += ( texture2D( normalMap, triDvX ).xy * 2.0 - 1.0 ) * uDetailNormal;
-		triTnY.xy += ( texture2D( normalMap, triDvY ).xy * 2.0 - 1.0 ) * uDetailNormal;
-		triTnZ.xy += ( texture2D( normalMap, triDvZ ).xy * 2.0 - 1.0 ) * uDetailNormal;
+		triTnX.xy += ( triDetX.xy * 2.0 - 1.0 ) * uDetailNormal;
+		triTnY.xy += ( triDetY.xy * 2.0 - 1.0 ) * uDetailNormal;
+		triTnZ.xy += ( triDetZ.xy * 2.0 - 1.0 ) * uDetailNormal;
 	}
 	triTnX.xy *= normalScale;
 	triTnY.xy *= normalScale;
@@ -213,6 +309,7 @@ const NORMAL_FRAGMENT = /* glsl */ `
 	normal = normalize( ( viewMatrix * vec4( triWorldNormal, 0.0 ) ).xyz );
 `
 
+// Runs after the lighting loops, so `reflectedLight` is fully accumulated.
 const AO_FRAGMENT = /* glsl */ `
 	float ambientOcclusion = ( triOrm.r - 1.0 ) * aoMapIntensity + 1.0;
 	reflectedLight.indirectDiffuse *= ambientOcclusion;
@@ -225,6 +322,23 @@ const AO_FRAGMENT = /* glsl */ `
 	#if defined( USE_ENVMAP ) && defined( STANDARD )
 		float dotNV = saturate( dot( geometryNormal, geometryViewDir ) );
 		reflectedLight.indirectSpecular *= computeSpecularOcclusion( dotNV, ambientOcclusion, material.roughness );
+	#endif
+	#if NUM_DIR_LIGHTS > 0
+		// Micro-shadowing (Chan, "Material Advances in Call of Duty: WWII").
+		// Occlusion applied only to the ambient term is invisible the moment a
+		// surface is in direct sun, which is precisely when a player is close
+		// enough to read its relief. Treating the baked occlusion as a cone
+		// aperture and testing the sun against it puts the mortar joints, the
+		// pitting and the pores back into the lit half of the frame.
+		//
+		// Floored well above zero: this is here to describe surfaces, not to
+		// manufacture more black. A crevice reading 55% of its neighbour is
+		// legible; one reading 5% is a hole.
+		float triNdl = dot( normal, directionalLights[ 0 ].direction );
+		float triAperture = 2.0 * ambientOcclusion * ambientOcclusion;
+		float triMicro = mix( 1.0, max( saturate( triNdl + triAperture - 1.0 ), 0.45 ), uMicroShadow );
+		reflectedLight.directDiffuse *= triMicro;
+		reflectedLight.directSpecular *= triMicro;
 	#endif
 `
 
@@ -253,29 +367,42 @@ const VERTEX_NORMAL = /* glsl */ `
 	vTriWorldNormal = transpose( mat3( viewMatrix ) ) * normalize( transformedNormal );
 `
 
-const CACHE_KEY = 'cod-triplanar-v2'
+const CACHE_KEY = 'cod-triplanar-v3'
 
 /** True once `applyTriplanar` has patched this material. */
 export function isTriplanar(material: THREE.Material): boolean {
   return material.userData.triplanar === true
 }
 
-export function applyTriplanar(material: THREE.MeshStandardMaterial, options: TriplanarOptions): void {
+export function applyTriplanar(
+  material: THREE.MeshStandardMaterial,
+  detailMap: THREE.Texture,
+  options: TriplanarOptions,
+): void {
   const offset = options.offset ?? new THREE.Vector3()
   const dust = options.dustColor ?? new THREE.Color(0.26, 0.22, 0.17)
   const grime = options.grimeColor ?? new THREE.Color(0.05, 0.044, 0.035)
+  const fade = options.parallaxFade ?? [9, 22]
   const uniforms = {
+    uDetailMap: { value: detailMap },
     uTriScale: { value: options.scale },
     uTriSharp: { value: options.sharpness ?? 6 },
     uTriOffset: { value: offset },
     uMacroScale: { value: options.macroScale ?? 0.055 },
     uMacroAlbedo: { value: options.macroAlbedo ?? 0.16 },
     uMacroRough: { value: options.macroRough ?? 0.14 },
+    uMesoScale: { value: options.mesoScale ?? 0.85 },
+    uMesoRough: { value: options.mesoRough ?? 0.16 },
     uDustColor: { value: dust },
     uDustAmount: { value: options.dustAmount ?? 0 },
     uDustRough: { value: options.dustRough ?? 0.94 },
-    uDetailScale: { value: options.detailScale ?? 4.7 },
+    uDetailFreq: { value: options.detailFreq ?? 1.6 },
     uDetailNormal: { value: options.detailNormal ?? 0 },
+    uDetailRough: { value: options.detailRough ?? 0.22 },
+    uDetailCavity: { value: options.detailCavity ?? 0.5 },
+    uParallax: { value: options.parallax ?? 0 },
+    uParallaxFade: { value: new THREE.Vector2(fade[0], fade[1]) },
+    uMicroShadow: { value: options.microShadow ?? 0.85 },
     uGrimeColor: { value: grime },
     uCavityDirt: { value: options.cavityDirt ?? 0.5 },
     uGrimeAmount: { value: options.grimeAmount ?? 0.55 },

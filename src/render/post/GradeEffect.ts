@@ -2,7 +2,7 @@ import * as THREE from 'three'
 import { BlendFunction, Effect } from 'postprocessing'
 import { createGradeLut, FILMIC_GRADE, type GradeLut, type GradeSettings } from './ColorGrade'
 
-export type ToneMapOperator = 'agx' | 'aces' | 'neutral'
+export type ToneMapOperator = 'filmic' | 'agx' | 'aces' | 'neutral'
 
 /**
  * Exposure, tone mapping and the colour grade, in one pass.
@@ -12,13 +12,13 @@ export type ToneMapOperator = 'agx' | 'aces' | 'neutral'
  * radiance into [0,1] and before anything else touches the pixel. Splitting
  * this across effects means round-tripping the colour space twice.
  *
- * ACES is the default operator. AgX holds highlight hue better — it does not
- * shear a muzzle flash toward yellow-white the way ACES does — but its log
- * encoding spans 16.5 stops, and this scene only ever occupies about five of
- * them. Measured on the same grade at matched mid-grey, AgX put scene luminance
- * 0.02 at sRGB 19 and 0.57 at 186; ACES put them at 13 and 212. That extra
- * spread at both ends is worth more here than highlight hue on the handful of
- * pixels bright enough to shear.
+ * `filmic` is the default: the ACES curve, which has the range this scene
+ * wants, driven from the brightest channel so hue survives it. Per-channel ACES
+ * rolls each primary on its own, and on a sunset frame that measured as a sun
+ * core at RGB 0.987/0.972/0.960 — neutral white in the middle of an amber sky.
+ * AgX would also have fixed the hue but its log encoding spans 16.5 stops
+ * against this scene's five, and it lands correspondingly flat; both are kept
+ * behind `?tonemap=` for comparison.
  *
  * Output is display-referred and sRGB-encoded rather than linear. Everything
  * downstream — SMAA, temporal accumulation, grain, vignette — behaves better
@@ -62,10 +62,49 @@ vec3 toneMapAgx(const in vec3 linearColor) {
   return clamp(rec2020ToSrgb * c, 0.0, 1.0);
 }
 
+float acesCurve(const in float v) {
+  float a = v * (v + 0.0245786) - 0.000090537;
+  float b = v * (0.983729 * v + 0.4329510) + 0.238081;
+  return a / b;
+}
+
 vec3 acesFit(const in vec3 v) {
   vec3 a = v * (v + 0.0245786) - 0.000090537;
   vec3 b = v * (0.983729 * v + 0.4329510) + 0.238081;
   return a / b;
+}
+
+/**
+ * How fast a bright colour bleaches toward white, as an exponent on the
+ * tone-mapped peak. Higher holds hue for longer. At 3.5, scene radiance below
+ * about 0.7 keeps essentially all of its chroma, a horizon sky at 1.3 lands on
+ * sRGB 232,211,191 rather than paper white, and only a genuine emitter — the
+ * sun disc, a muzzle flash core — bleaches to flat white the way it should.
+ */
+const float HIGHLIGHT_CROSSTALK = 3.5;
+
+/**
+ * The ACES curve applied to the brightest channel, with the colour rescaled
+ * around it so hue and saturation ride through unchanged, then a deliberate
+ * bleed to white on top.
+ *
+ * This is the "highlight hue path" an ACES variant needs. Per-channel ACES
+ * shears saturated highlights because each primary crosses the shoulder at a
+ * different scene value; driving one scalar curve from the peak cannot do that.
+ * Film does eventually desaturate as it bleaches, which is what the crosstalk
+ * term restores — smoothly and under one knob, rather than as a side effect of
+ * where the shoulder happens to sit.
+ *
+ * On neutrals this is identical to {@link toneMapAces}: both ACES matrices are
+ * row-normalised, so grey passes through them untouched and the exposure
+ * calibration is shared between the two operators.
+ */
+vec3 toneMapFilmic(const in vec3 linearColor) {
+  float peak = max(max(linearColor.r, linearColor.g), max(linearColor.b, 1e-5));
+  vec3 ratio = linearColor / peak;
+  float mapped = acesCurve(peak);
+  ratio = mix(ratio, vec3(1.0), pow(clamp(mapped, 0.0, 1.0), HIGHLIGHT_CROSSTALK));
+  return clamp(ratio * mapped, 0.0, 1.0);
 }
 
 // Stephen Hill's fit of the ACES RRT+ODT. Note there is no 1/0.6 pre-scale
@@ -114,7 +153,8 @@ function buildFragmentShader(operator: ToneMapOperator): string {
   const call =
     operator === 'agx' ? 'toneMapAgx(scene)'
       : operator === 'neutral' ? 'toneMapNeutral(scene)'
-        : 'toneMapAces(scene)'
+        : operator === 'aces' ? 'toneMapAces(scene)'
+          : 'toneMapFilmic(scene)'
 
   return /* glsl */ `
 uniform mediump sampler3D lut;
@@ -148,7 +188,7 @@ export class GradeEffect extends Effect {
   private readonly lut: GradeLut
 
   constructor({
-    operator = 'aces',
+    operator = 'filmic',
     exposure = 1,
     lutStrength = 1,
     lutSize = 41,

@@ -25,8 +25,18 @@ export const PARAPET_H = 1.1
 export const WALL_T = 0.34
 export const SLAB_T = 0.3
 export const KERB_H = 0.13
-/** Default chamfer. Sharp 90 degree edges catch no light and read as fake. */
-export const CHAMFER = 0.028
+/**
+ * Default chamfer. Sharp 90 degree edges catch no light and read as fake.
+ *
+ * 4 cm rather than the 2.8 cm this used to be: a chamfer only earns its cost
+ * when it is wide enough to hold a specular line at gameplay distance. At 10 m
+ * and 1080p, 2.8 cm covers 2.6 px and disappears into the anti-aliasing; 4 cm
+ * covers a little under 4 px and reads as a lit arris. `chamferBox` clamps to
+ * 85% of the smallest half-extent, so small members are unaffected.
+ */
+export const CHAMFER = 0.04
+/** Chamfer for small members — battens, mullions, boards, slats. */
+export const ARRIS = 0.006
 
 export const UP = new THREE.Vector3(0, 1, 0)
 
@@ -334,6 +344,51 @@ export function decalQuad(w: number, h: number, jitter = 0.12, seed = 1): THREE.
 }
 
 /**
+ * An irregular patch that follows the ground it lies on, in world space.
+ *
+ * A flat quad tilted onto uneven paving is the loudest decal artefact there is:
+ * one corner buries, the opposite corner lifts, and the whole thing reads as a
+ * card someone dropped on the scene. Sampling the drawn surface at every vertex
+ * keeps a puddle or a stain welded to the stones under it, and tapering the
+ * lift to almost nothing at the rim means the edge never shows a lit sliver.
+ *
+ * Returns geometry already in world coordinates — add it with no transform.
+ */
+export function groundPatch(
+  cx: number, cz: number, rx: number, rz: number, seed: number,
+  height: (x: number, z: number) => number,
+  lift = 0.014, rings = 2, segs = 14,
+): THREE.BufferGeometry {
+  const s = new TriSoup()
+  s.setInside(cx, height(cx, cz) - 1.5, cz)
+  // Two octaves of wobble so the outline is lobed rather than an ellipse.
+  const edge = (i: number): number => {
+    const a = (i / segs) * Math.PI * 2
+    return 1
+      + 0.26 * Math.sin(a * 3 + seed * 1.7)
+      + 0.13 * Math.sin(a * 5 - seed * 0.9)
+      + 0.07 * Math.sin(a * 8 + seed * 2.3)
+  }
+  const pt = (i: number, ring: number): THREE.Vector3 => {
+    const a = (i / segs) * Math.PI * 2
+    const t = ring / rings
+    const e = edge(i % segs) * t
+    const x = cx + Math.cos(a) * rx * e
+    const z = cz + Math.sin(a) * rz * e
+    // Lift tapers to nothing at the rim so the patch feathers into the surface.
+    return new THREE.Vector3(x, height(x, z) + lift * (1 - t * t * 0.94), z)
+  }
+  const centre = new THREE.Vector3(cx, height(cx, cz) + lift, cz)
+  for (let i = 0; i < segs; i++) {
+    s.tri(centre, pt(i, 1), pt(i + 1, 1))
+    for (let r = 1; r < rings; r++) {
+      s.quad(pt(i, r), pt(i + 1, r), pt(i + 1, r + 1), pt(i, r + 1))
+    }
+  }
+  return s.toGeometry()
+}
+
+/**
  * Rotates and shifts a geometry's UVs in place.
  *
  * Instanced props share one geometry, so they also share one set of UVs: every
@@ -485,6 +540,28 @@ export class Builder {
     this.tmpQ.setFromAxisAngle(UP, yaw)
     this.tmpM.compose(this.tmpP.set(x, y, z), this.tmpQ, this.tmpS.set(1, 1, 1))
     this.geom(name, plainBox(w, h, d), this.tmpM)
+  }
+
+  /**
+   * A thin member with a chamfer scaled to its own thickness — boards, slats,
+   * copings, counter tops, treads.
+   *
+   * `plate` is cheaper but leaves a razor arris, and on anything the player
+   * walks past at a metre (crate boards, a stall counter, a step nosing) that
+   * arris is exactly what makes the prop read as untextured blockout. The
+   * chamfer here is a fifth of the smallest dimension, capped at `ARRIS`, so a
+   * 2 cm board gets 4 mm and a 12 cm coping gets the full 6 mm.
+   */
+  slab(
+    name: MaterialName,
+    w: number, h: number, d: number,
+    x: number, y: number, z: number,
+    yaw = 0,
+  ): void {
+    const c = Math.min(ARRIS, Math.min(w, h, d) * 0.2)
+    this.tmpQ.setFromAxisAngle(UP, yaw)
+    this.tmpM.compose(this.tmpP.set(x, y, z), this.tmpQ, this.tmpS.set(1, 1, 1))
+    this.geom(name, chamferBox(w, h, d, c), this.tmpM)
   }
 
   /** Chamfered box plus a matching oriented box collider. */

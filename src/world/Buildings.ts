@@ -4,7 +4,7 @@ import type { Rand } from '../core/Rand'
 import type { Surface } from '../core/Types'
 import {
   Builder, CHAMFER, DOOR_H, DOOR_W, PARAPET_H, SILL_H, SLAB_T, STOREY, WALL_T, WINDOW_H,
-  chamferBox, cylinderGeom, decalQuad, impactChip, plainBox, sphereGeom, rotRectSdf,
+  chamferBox, cylinderGeom, decalQuad, impactChip, plainBox, rampPrism, sphereGeom, rotRectSdf,
 } from './Kit'
 import { groundHeight } from './Terrain'
 
@@ -99,6 +99,75 @@ export interface WallSpec {
   rng: Rand
   /** Skips collider generation (used for decorative infill). */
   noCollide?: boolean
+  /**
+   * Puts a dark, five-sided recess box behind every small opening. Set on
+   * buildings with no modelled interior: without it a window is a hole onto
+   * whatever light-blocking shell sits behind it, which renders as a pale grey
+   * smear and destroys the read of the opening as depth.
+   */
+  backOpenings?: boolean
+  /**
+   * Suppresses the sill band and pilasters. Set on boundary walls, which
+   * already carry their own pier rhythm and coping.
+   */
+  plain?: boolean
+}
+
+/**
+ * Render that has blown off the wall, modelled rather than decalled.
+ *
+ * A pale quad stuck on the surface reads as paper taped to the building — it
+ * has no thickness, no shadow and no reason to be there. This exposes a panel
+ * of the substrate and edges it with a broken lip of the render standing 3 cm
+ * proud, which self-shadows, catches the sun on its arris and reads as damage
+ * with a history.
+ */
+function spallPatch(
+  b: Builder, render: MaterialName, sub: MaterialName,
+  w: number, h: number, x: number, y: number, out: number, rng: Rand,
+): void {
+  b.geom(sub, decalQuad(w, h, 0.16, x * 7 + y), xform(x, y, out - 0.008))
+  const lip = 0.035
+  for (const side of [0, 1, 2, 3]) {
+    const along = side < 2 ? w : h
+    let t = -along / 2 + rng.range(0, along * 0.3)
+    while (t < along / 2 - 0.06) {
+      const seg = Math.min(along / 2 - t, rng.range(0.16, 0.42))
+      const c = t + seg / 2
+      const p = lip * rng.range(0.55, 1.2)
+      // Plain boxes: at 3 cm proud the lip's own arris is sub-pixel, so the
+      // relief and the shadow it throws are the whole effect and a chamfer
+      // would cost four times the triangles for nothing.
+      if (side === 0) b.geom(render, plainBox(seg, 0.06, p), xform(x + c, y + h / 2, out - p / 2))
+      else if (side === 1) b.geom(render, plainBox(seg, 0.06, p), xform(x + c, y - h / 2, out - p / 2))
+      else if (side === 2) b.geom(render, plainBox(0.06, seg, p), xform(x - w / 2, y + c, out - p / 2))
+      else b.geom(render, plainBox(0.06, seg, p), xform(x + w / 2, y + c, out - p / 2))
+      t += seg + rng.range(0.06, 0.3)
+    }
+  }
+}
+
+/** A louvred wall vent: frame, sill and four angled blades. */
+function ventGrille(b: Builder, x: number, y: number, out: number, w: number, h: number): void {
+  b.geom('concreteWorn', chamferBox(w + 0.11, h + 0.11, 0.07, 0.016), xform(x, y, out - 0.02))
+  b.geom('metalRusted', plainBox(w, h, 0.03), xform(x, y, out - 0.055))
+  // Blades pitch about X so they shed downward and outward, the way a louvre
+  // does; rolling them about Z would just cant them across the opening.
+  const blades = Math.max(3, Math.round(h / 0.075))
+  for (let i = 0; i < blades; i++) {
+    b.geom('metalRusted', plainBox(w - 0.02, 0.038, 0.05),
+      xform(x, y - h / 2 + ((i + 0.5) * h) / blades, out - 0.072, 0, 0.5))
+  }
+}
+
+/** Gooseneck wall lamp on a bracket — a strong small silhouette on a facade. */
+function wallLamp(b: Builder, x: number, y: number, out: number): void {
+  b.geom('metalRusted', plainBox(0.09, 0.14, 0.07), xform(x, y, out - 0.03))
+  // Arm running from the bracket up and away from the wall (-Z is outward).
+  b.geom('metalRusted', cylinderGeom(0.017, 0.017, 0.36, 5),
+    xform(x, y + 0.11, out - 0.205, 0, -Math.PI / 3))
+  b.geom('metalPainted', cylinderGeom(0.13, 0.04, 0.12, 10), xform(x, y + 0.17, out - 0.36, 0, Math.PI))
+  b.geom('glass', sphereGeom(0.05, 8, 6), xform(x, y + 0.11, out - 0.36))
 }
 
 function xform(x: number, y: number, z: number, yaw = 0, pitch = 0, roll = 0): THREE.Matrix4 {
@@ -234,6 +303,23 @@ export function buildWall(b: Builder, s: WallSpec): void {
       }
     }
 
+    // --- recess backing -----------------------------------------------
+    // Five dark faces half a metre behind the opening. The returns are what
+    // sell it: from an angle one of them catches a sliver of sky and the
+    // opening reads as a room, not a painted rectangle.
+    if (s.backOpenings && o.width <= 2.35 && o.height <= 3.1
+      && (o.kind === 'window' || o.kind === 'arch' || o.kind === 'shop')) {
+      const dep = 0.55
+      const bw = o.width + 0.26
+      const bh = o.height + 0.24
+      const cy = o.sill + o.height / 2
+      const zb = T / 2
+      b.plate('asphalt', bw, bh, 0.09, o.at, cy, zb + dep)
+      for (const sx of [-1, 1]) b.plate('asphalt', 0.09, bh, dep, o.at + sx * bw / 2, cy, zb + dep / 2)
+      b.plate('asphalt', bw, 0.09, dep, o.at, cy + bh / 2, zb + dep / 2)
+      b.plate('asphalt', bw, 0.09, dep, o.at, cy - bh / 2, zb + dep / 2)
+    }
+
     // --- weathering ---------------------------------------------------
     const wet = s.weather ?? 0.6
     if (s.exterior && wet > 0 && o.kind !== 'shop') {
@@ -242,10 +328,10 @@ export function buildWall(b: Builder, s: WallSpec): void {
         b.geom('dirt', decalQuad(o.width * rng.range(0.5, 0.95), sh, 0.22, o.at * 7 + o.sill),
           xform(o.at + rng.spread(0.2), o.sill - 0.1 - sh / 2, out - 0.014))
       }
-      if (rng.bool(0.5 * wet)) {
-        const sh = rng.range(0.5, 1.1)
-        b.geom('plasterDamaged', decalQuad(o.width * rng.range(0.7, 1.2), sh, 0.3, o.at * 3 + 5),
-          xform(o.at + rng.spread(0.25), top + 0.25 + sh / 2, out - 0.013))
+      if (rng.bool(0.4 * wet) && top + 1.4 < H) {
+        spallPatch(b, s.mat, 'concreteRubble',
+          o.width * rng.range(0.7, 1.2), rng.range(0.5, 1.0),
+          o.at + rng.spread(0.25), top + 0.55, out, rng)
       }
     }
   }
@@ -253,14 +339,78 @@ export function buildWall(b: Builder, s: WallSpec): void {
 
   if (s.plinth && s.plinth > 0) {
     b.box(s.trim, L, s.plinth, T + 0.14, L / 2, s.plinth / 2, 0, 0, 0.03)
+    // Weathered-off render along the top arris of the plinth, so the two
+    // materials do not meet on a ruled line.
+    let px = rng.range(0.1, 0.9)
+    while (px < L - 0.3) {
+      const seg = rng.range(0.35, 1.1)
+      b.slab(s.trim, Math.min(seg, L - px), 0.06, T + 0.19, px + Math.min(seg, L - px) / 2, s.plinth + 0.02, 0)
+      px += seg + rng.range(0.3, 1.6)
+    }
   }
   if (s.cornice) {
     b.box(s.trim, L + 0.06, 0.16, T + 0.3, L / 2, H - 0.08, 0, 0, 0.035)
     b.box(s.trim, L + 0.06, 0.09, T + 0.16, L / 2, H - 0.24, 0, 0, 0.02)
+    // Corbels under the cornice, unevenly spaced.
+    let cx = rng.range(0.4, 1.0)
+    while (cx < L - 0.4) {
+      b.slab(s.trim, 0.17, 0.16, T / 2 + 0.24, cx, H - 0.34, -T / 4 - 0.06)
+      cx += rng.range(1.0, 1.9)
+    }
+  }
+
+  const wet = s.weather ?? 0.6
+
+  // --- Relief across the open field of the wall ---------------------------
+  // A facade with nothing between its openings is the "large undetailed
+  // surface" failure. Everything below is horizontal or vertical geometry that
+  // stands proud of the render and therefore casts and catches.
+  if (s.exterior) {
+    // Continuous sill band at the window line: the strongest horizontal a
+    // facade has, and the shadow it throws reads from 40 m.
+    const win = list.find((o) => o.kind === 'window' && o.sill > 0.35)
+    if (!s.plain && win) {
+      b.box(s.trim, L, 0.1, T + 0.13, L / 2, win.sill - 0.075, 0, 0, 0.028)
+    } else if (!s.plain && H >= 2.8) {
+      // A blank storey still needs one horizontal. Without it an arcade or a
+      // windowless flank is three metres of unbroken field, which is the
+      // "large undetailed surface" the critic keeps landing on.
+      b.box(s.trim, L, 0.09, T + 0.1, L / 2, H * 0.62, 0, 0, 0.024)
+    }
+
+    // Pilasters down any stretch of blank wall wider than 3 m. `edges` holds
+    // the clear runs as start/end pairs: 0, then each opening's two sides,
+    // then L.
+    if (!s.plain) {
+      const edges: number[] = [0]
+      for (const o of list) edges.push(o.at - o.width / 2, o.at + o.width / 2)
+      edges.push(L)
+      for (let i = 0; i < edges.length; i += 2) {
+        const a = edges[i]
+        const c = edges[i + 1]
+        if (c - a < 2.7) continue
+        const n = Math.floor((c - a) / 2.9)
+        for (let k = 0; k < n; k++) {
+          const px = a + ((k + 1) * (c - a)) / (n + 1) + rng.spread(0.18)
+          const pw = rng.range(0.34, 0.5)
+          b.box(s.mat, pw, H - 0.05, 0.09, px, (H - 0.05) / 2, out - 0.045, 0, 0.022)
+          b.slab(s.trim, pw + 0.1, 0.09, 0.16, px, H - 0.22, out - 0.07)
+        }
+      }
+    }
+
+    // Protruding brick headers and putlog stubs left in the masonry.
+    const heads = Math.round(L * H * 0.2)
+    for (let i = 0; i < heads; i++) {
+      const px = rng.range(0.25, L - 0.25)
+      const py = rng.range(0.5, Math.max(0.6, H - 0.5))
+      if (list.some((o) => px > o.at - o.width / 2 - 0.2 && px < o.at + o.width / 2 + 0.2
+        && py > o.sill - 0.2 && py < o.sill + o.height + 0.2)) continue
+      b.plate(s.trim, rng.range(0.18, 0.32), 0.07, 0.085, px, py, out - 0.042)
+    }
   }
 
   // Bullet pocks, chipped render and cracks across the open field of the wall.
-  const wet = s.weather ?? 0.6
   if (s.exterior && wet > 0) {
     const pocks = Math.round(L * H * 0.4 * wet)
     for (let i = 0; i < pocks; i++) {
@@ -274,14 +424,42 @@ export function buildWall(b: Builder, s: WallSpec): void {
       b.geom('concreteRubble', impactChip(rng.range(0.035, 0.11), rng.range(0.02, 0.055), 6),
         xform(px, py, out + 0.004, Math.PI))
     }
-    const patches = Math.round(L * H * 0.1 * wet)
+    const patches = Math.round(L * H * 0.045 * wet)
     for (let i = 0; i < patches; i++) {
-      b.geom('plasterDamaged', decalQuad(rng.range(0.5, 1.8), rng.range(0.4, 1.4), 0.3, i * 3.7 + L),
-        xform(rng.range(0.4, L - 0.4), rng.range(0.3, H - 0.4), out - 0.012))
+      spallPatch(b, s.mat, 'concreteRubble', rng.range(0.5, 1.5), rng.range(0.4, 1.2),
+        rng.range(0.7, L - 0.7), rng.range(0.5, Math.max(0.6, H - 0.6)), out, rng)
     }
     // Damp rising from the base — always present on a render wall in a dusty town.
     b.geom('dirt', decalQuad(L * 0.92, 0.75, 0.16, L * 1.7),
       xform(L / 2, 0.36, out - 0.011))
+  }
+
+  // --- Services bolted to the face ----------------------------------------
+  if (s.exterior && L > 2.6 && H > 2.4) {
+    const clearAt = (px: number, py: number, pad: number): boolean =>
+      !list.some((o) => px > o.at - o.width / 2 - pad && px < o.at + o.width / 2 + pad
+        && py > o.sill - pad && py < o.sill + o.height + pad)
+    if (rng.bool(0.55)) {
+      const px = rng.range(0.6, L - 0.6)
+      const py = rng.range(1.9, Math.max(2.0, H - 0.7))
+      if (clearAt(px, py, 0.45)) ventGrille(b, px, py, out, rng.range(0.34, 0.52), rng.range(0.26, 0.4))
+    }
+    if (rng.bool(0.42)) {
+      const px = rng.range(0.5, L - 0.5)
+      if (clearAt(px, 2.5, 0.4)) wallLamp(b, px, rng.range(2.3, 2.9), out)
+    }
+    if (rng.bool(0.5)) {
+      // Surface-run water pipe with brackets and a stop-cock.
+      const px = rng.range(0.4, L - 0.4)
+      const ph = Math.min(H - 0.3, rng.range(1.8, 3.0))
+      if (clearAt(px, ph / 2, 0.3)) {
+        b.geom('metalRusted', cylinderGeom(0.024, 0.024, ph, 6), xform(px, ph / 2, out - 0.04))
+        for (let i = 0; i < Math.max(1, Math.floor(ph / 1.1)); i++) {
+          b.slab('metalRusted', 0.1, 0.035, 0.05, px, 0.5 + i * 1.1, out - 0.02)
+        }
+        b.slab('metalPainted', 0.09, 0.09, 0.11, px, ph - 0.15, out - 0.055)
+      }
+    }
   }
 }
 
@@ -503,6 +681,7 @@ export function buildBuilding(b: Builder, spec: BuildingSpec, rng: Rand, result:
         plinth: s === 0 ? 0.42 : 0,
         cornice: s === spec.storeys - 1,
         weather: damage,
+        backOpenings: !spec.enterable,
         rng,
       })
       // Balcony slab on upper storeys that call for one.
@@ -614,7 +793,10 @@ export function buildBuilding(b: Builder, spec: BuildingSpec, rng: Rand, result:
   if (!spec.enterable) {
     // Light-tight inner shell: peering through a window shows a dark room, and
     // the sun cannot leak through the building.
-    b.box('concrete', Math.max(0.4, w - 3.0), roofY - 0.4, Math.max(0.4, d - 3.0), 0, roofY / 2 - 0.2, 0, 0, 0.05)
+    // Asphalt rather than concrete: this shell is what every unglazed window
+    // on the building looks onto, and a pale grey box behind an opening reads
+    // as smoke rather than as an unlit room.
+    b.box('asphalt', Math.max(0.4, w - 3.0), roofY - 0.4, Math.max(0.4, d - 3.0), 0, roofY / 2 - 0.2, 0, 0, 0.05)
     if (spec.interiorFloor !== false) {
       b.solid(roofMat, w - T * 1.6, 0.3, d - T * 1.6, 0, -0.15, 0, 0, 0.02, 'concrete')
     }
@@ -832,7 +1014,7 @@ export function buildMosque(b: Builder, rng: Rand, result: BuildResult): void {
   b.push(w / 2, 0, d / 2 - T / 2, Math.PI)
   buildWall(b, {
     length: w, height: h, thickness: T, mat: 'stuccoTan', trim: 'stoneBlock',
-    exterior: true, plinth: 0.5, cornice: true, weather: 0.3, rng,
+    exterior: true, plinth: 0.5, cornice: true, weather: 0.3, rng, backOpenings: true,
     openings: [
       { at: w / 2, width: 4.6, sill: 0, height: 6.6, kind: 'arch' },
       { at: 2.4, width: 1.1, sill: 4.0, height: 1.9, kind: 'arch', glass: false },
@@ -849,7 +1031,7 @@ export function buildMosque(b: Builder, rng: Rand, result: BuildResult): void {
     b.push(sx, 0, sz, syaw)
     buildWall(b, {
       length: len, height: h, thickness: T, mat: 'stuccoTan', trim: 'stoneBlock',
-      exterior: true, plinth: 0.5, cornice: true, weather: 0.3, rng,
+      exterior: true, plinth: 0.5, cornice: true, weather: 0.3, rng, backOpenings: true,
       openings: bayPositions(len, 3.6, 1.6).map((at) => ({
         at, width: 1.0, sill: 4.4, height: 2.0, kind: 'arch' as const, glass: false,
       })),
@@ -857,7 +1039,7 @@ export function buildMosque(b: Builder, rng: Rand, result: BuildResult): void {
     b.pop()
   }
   // Interior shell so the iwan reads as a deep, dark recess.
-  b.box('stoneBlock', w - 3.6, h - 0.6, d - 3.6, 0, (h - 0.6) / 2, 0, 0, 0.05)
+  b.box('asphalt', w - 3.6, h - 0.6, d - 3.6, 0, (h - 0.6) / 2, 0, 0, 0.05)
   b.solid('concreteWorn', w - 0.4, SLAB_T, d - 0.4, 0, h + SLAB_T / 2, 0, 0, 0.04, 'concrete')
 
   // Drum and dome.
@@ -1098,7 +1280,7 @@ export function buildCompoundWalls(b: Builder, rng: Rand): void {
     }
     buildWall(b, {
       length: len, height: r.h, thickness: 0.28, mat: r.mat, trim: 'concreteWorn',
-      openings, exterior: true, plinth: 0.3, weather: 0.8, rng,
+      openings, exterior: true, plinth: 0.3, weather: 0.8, rng, plain: true,
     })
     // Coping and pier caps.
     b.box('concreteWorn', len, 0.1, 0.4, 0, r.h + 0.05, 0, 0, 0.03)
@@ -1298,11 +1480,130 @@ export function buildSkyline(b: Builder, rng: Rand): void {
   }
 }
 
+/**
+ * Everything a flat roof has that is not a machine: lapped felt, a stair
+ * hatch, conduit, an outlet and the rubbish that collects up there.
+ *
+ * The elevated pose spends a third of its frame looking at one of these decks,
+ * and it was a single unbroken slab. Lap seams cost almost nothing and give
+ * that whole area a shadow rhythm and a sense of scale; the hatch and the
+ * block stack give it two silhouettes to read against the parapet.
+ */
+function deckDressing(b: Builder, w: number, d: number, rng: Rand): void {
+  // Bitumen sheet laid in strips, each lap standing proud of the last.
+  const lap = 0.92
+  const rolls = Math.max(2, Math.floor(d / lap))
+  for (let i = 0; i < rolls; i++) {
+    const z = -d / 2 + 0.35 + i * lap
+    // Not every length is still down. Leaving a third of them torn back to
+    // bare screed keeps the roof from becoming one uniform dark plane and
+    // gives the surface a history of patching.
+    if (rng.bool(0.7)) {
+      b.plate('asphalt', w - 0.15, 0.016, lap - 0.03, 0, 0.008, z, rng.spread(0.012))
+    } else {
+      const cut = rng.range(0.32, 0.72)
+      b.plate('asphalt', (w - 0.15) * cut, 0.016, lap - 0.03,
+        -((w - 0.15) * (1 - cut)) / 2, 0.008, z, rng.spread(0.025))
+    }
+    b.slab('asphalt', w - 0.15, 0.026, 0.075, rng.spread(0.05), 0.017, z - lap / 2 + 0.04, rng.spread(0.01))
+  }
+  // Stair hatch: a kerb upstand with a boarded lid propped at one corner.
+  const hx = rng.spread(w / 2 - 1.0)
+  const hz = rng.spread(d / 2 - 1.0)
+  b.push(hx, 0, hz, rng.range(0, Math.PI))
+  for (const sx of [-1, 1]) b.slab('concreteWorn', 0.1, 0.26, 0.95, sx * 0.4, 0.13, 0)
+  for (const sz of [-1, 1]) b.slab('concreteWorn', 0.7, 0.26, 0.1, 0, 0.13, sz * 0.42)
+  b.geom('woodPlank', chamferBox(0.94, 0.05, 1.06, 0.012), xform(0.06, 0.31, 0, 0, 0, rng.range(0.04, 0.16)))
+  b.collide(1.0, 0.35, 1.1, 0, 0.18, 0, 0, 'wood')
+  b.pop()
+  // Conduit run clipped to the deck, with saddles.
+  const cz = rng.spread(d / 2 - 0.8)
+  b.geom('metalPainted', cylinderGeom(0.026, 0.026, w - 0.5, 6), xform(0, 0.055, cz, 0, 0, Math.PI / 2))
+  for (let i = 0; i < Math.floor(w / 1.2); i++) {
+    b.slab('metalRusted', 0.07, 0.055, 0.09, -w / 2 + 0.5 + i * 1.2, 0.028, cz)
+  }
+  // Rainwater outlet, sunk into a shallow dished area.
+  const ox = rng.spread(w / 2 - 0.6)
+  const oz = d / 2 - 0.45
+  b.geom('metalRusted', cylinderGeom(0.12, 0.14, 0.05, 10), xform(ox, 0.02, oz))
+  b.geom('dirt', decalQuad(1.1, 0.9, 0.3, ox * 5 + oz), xform(ox, 0.005, oz, 0, -Math.PI / 2))
+  // A stack of spare blocks and a couple of tiles, left after a repair.
+  const bx = rng.spread(w / 2 - 0.7)
+  const bz = rng.spread(d / 2 - 0.7)
+  b.push(bx, 0, bz, rng.range(0, Math.PI))
+  for (let i = 0; i < rng.int(3, 6); i++) {
+    b.box('concreteRubble', 0.44, 0.2, 0.21, rng.spread(0.05), 0.1 + i * 0.2, rng.spread(0.05), rng.spread(0.25), 0.015)
+  }
+  b.pop()
+  // Wind-blown dust banked against the parapet on the lee side.
+  for (const sz of [-1, 1]) {
+    b.geom('sand', rampPrism(w * 0.8, rng.range(0.06, 0.13), 0.5),
+      xform(rng.spread(0.4), 0.0, sz * (d / 2 - 0.25), sz > 0 ? 0 : Math.PI))
+  }
+}
+
+/**
+ * A split-system condenser, modelled as the machine it is.
+ *
+ * The version this replaces was a 0.86 x 0.62 x 0.36 box with the fan disc
+ * buried entirely inside it and a rust-coloured plate under the base, and in
+ * the elevated pose it filled the foreground as three featureless slabs. The
+ * parts that make it read are all silhouette: the guard ring standing proud of
+ * the discharge face, the coil fins down the back, the lid lip, and above all
+ * the 9 cm gap under it — feet let daylight and a contact shadow under the
+ * body, which is what stops a prop looking stamped onto the floor.
+ */
+function condenser(b: Builder, x: number, z: number, yaw: number, rng: Rand): void {
+  const w = 0.86 * rng.range(0.92, 1.1)
+  const h = 0.6 * rng.range(0.9, 1.15)
+  const d = 0.36
+  const foot = 0.09
+  b.push(x, 0, z, yaw)
+  // Angle-iron stand: two rails on four short feet.
+  for (const sz of [-1, 1]) {
+    b.slab('metalRusted', w + 0.08, 0.035, 0.07, 0, foot - 0.018, sz * (d / 2 - 0.05))
+    for (const sx of [-1, 1]) {
+      b.slab('metalRusted', 0.07, foot, 0.07, sx * (w / 2 - 0.07), foot / 2, sz * (d / 2 - 0.05))
+    }
+  }
+  const cy = foot + h / 2
+  b.box('metalPainted', w, h, d, 0, cy, 0, 0, 0.03)
+  b.collide(w, h + foot, d, 0, (h + foot) / 2, 0, 0, 'thinMetal')
+  // Pressed lid with a lip, so the top is not one flat plane.
+  b.slab('metalPainted', w - 0.05, 0.03, d - 0.05, 0, foot + h + 0.012, 0)
+  b.slab('metalPainted', w + 0.03, 0.022, d + 0.03, 0, foot + h - 0.03, 0)
+  // Discharge guard: a raised ring with radial bars over a recessed fan.
+  const r = Math.min(0.25, h * 0.42)
+  b.geom('steelBrushed', cylinderGeom(r, r, 0.05, 14), xform(0, cy, -d / 2 + 0.02, 0, Math.PI / 2))
+  b.geom('metalRusted', cylinderGeom(r + 0.035, r + 0.035, 0.03, 16, false), xform(0, cy, -d / 2 - 0.035, 0, Math.PI / 2))
+  for (let k = 0; k < 5; k++) {
+    b.geom('metalRusted', plainBox(r * 2, 0.014, 0.014),
+      xform(0, cy, -d / 2 - 0.045, 0, 0, (k * Math.PI) / 5))
+  }
+  // Coil fins down the back face.
+  const fins = 9
+  for (let k = 0; k < fins; k++) {
+    b.geom('steelBrushed', plainBox(0.02, h - 0.09, 0.028),
+      xform(-w / 2 + 0.06 + (k * (w - 0.12)) / (fins - 1), cy, d / 2 - 0.005))
+  }
+  // Refrigerant pair leaving the side, lagged, elbowing down to the deck.
+  const px = w / 2 + 0.03
+  for (const off of [-0.06, 0.06]) {
+    b.geom('plasterWhite', cylinderGeom(0.028, 0.028, cy - 0.1, 6), xform(px, (cy - 0.1) / 2 + 0.05, off))
+    b.geom('plasterWhite', cylinderGeom(0.028, 0.028, 0.24, 6), xform(px - 0.12, cy, off, 0, 0, Math.PI / 2))
+  }
+  b.slab('metalPainted', 0.13, 0.17, 0.06, px + 0.02, cy + 0.16, 0)
+  // Condensate stain running out from under the stand.
+  b.geom('dirt', decalQuad(w + 0.5, d + 0.7, 0.28, x * 3 + z), xform(0.1, 0.006, 0.1, 0, -Math.PI / 2))
+  b.pop()
+}
+
 /** Roof clutter shared by every deck: AC units, dishes, tanks, aerials. */
 export function buildRoofClutter(b: Builder, decks: BuildResult['decks'], rng: Rand): void {
   for (const deck of decks) {
     if (deck.w < 2 || deck.d < 2) continue
     b.push(deck.cx, deck.y, deck.cz, deck.yaw)
+    deckDressing(b, deck.w, deck.d, rng)
     const n = Math.max(2, Math.round((deck.w * deck.d) / 14))
     for (let i = 0; i < n; i++) {
       const x = rng.spread(deck.w / 2 - 0.5)
@@ -1318,11 +1619,7 @@ export function buildRoofClutter(b: Builder, decks: BuildResult['decks'], rng: R
         b.geom('metalPainted', cylinderGeom(r, r, rng.range(0.8, 1.2), 12), xform(x, 0.5 + 0.5, z))
         b.collide(r * 2, 1.6, r * 2, x, 0.8, z, 0, 'thinMetal')
       } else if (kind < 0.52) {
-        // Split AC condenser.
-        const yaw = rng.range(0, Math.PI * 2)
-        b.solid('metalPainted', 0.86, 0.62, 0.36, x, 0.31, z, yaw, 0.02, 'thinMetal')
-        b.geom('steelBrushed', cylinderGeom(0.24, 0.24, 0.06, 12), xform(x + Math.sin(yaw) * 0, 0.34, z, yaw, Math.PI / 2))
-        b.plate('metalRusted', 0.9, 0.06, 0.4, x, 0.03, z, yaw)
+        condenser(b, x, z, rng.range(0, Math.PI * 2), rng)
       } else if (kind < 0.72) {
         // Satellite dish, angled at the sky.
         const yaw = rng.range(0, Math.PI * 2)

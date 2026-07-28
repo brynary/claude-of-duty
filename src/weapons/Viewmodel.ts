@@ -168,10 +168,19 @@ export class Viewmodel {
   private scopeMask!: THREE.Mesh
   private scopeMaskMat!: THREE.MeshBasicMaterial
   private keyLight!: THREE.DirectionalLight
+  private sunRim!: THREE.DirectionalLight
   private studioEnv: THREE.Texture | null = null
+  private studioTarget: THREE.WebGLRenderTarget | null = null
   private aimLocalInv = new THREE.Matrix4()
   private adsPos = new THREE.Vector3()
   private adsQuat = new THREE.Quaternion()
+
+  // Sun-tracking rim scratch. Hoisted: syncToSun runs every frame.
+  private readonly keyWarm = new THREE.Color(0xfff2e2)
+  private readonly rimWarm = new THREE.Color(0xffd7a4)
+  private readonly focusPoint = new THREE.Vector3(0.11, -0.10, -0.62)
+  private readonly sunLocal = new THREE.Vector3()
+  private readonly rigInv = new THREE.Quaternion()
 
   init(ctx: GameContext, mats: WeaponMaterials): void {
     this.ctx = ctx
@@ -186,36 +195,46 @@ export class Viewmodel {
 
   // -- setup ---------------------------------------------------------------
 
+  /**
+   * A dedicated three-point studio for the viewmodel, plus its own probe.
+   *
+   * The viewmodel is the only object in the frame the player looks at every
+   * single second, so shipped shooters light it separately and hold it at a
+   * constant exposure whatever the world is doing. Round 2 had the right idea
+   * and the wrong geometry: the key sat at +X, and because the weapon is held
+   * to the right of screen centre the camera sees its *left* flank, which got
+   * nothing but a 1.1-intensity rim. Every visible face of the rifle was lit
+   * by the weakest light in the rig, which is why it measured five stops under
+   * the scene.
+   *
+   * The rule the rig now follows: the key must light the faces the camera can
+   * see. Its direction has a positive component along +Z (back toward the eye)
+   * and -X (the flank we look at), and the fill and rim take the two
+   * complementary quadrants so no visible face is left with only the probe.
+   */
   private setupLighting(): void {
     const ctx = this.ctx
     const shadows = ctx.config.quality === 'high' || ctx.config.quality === 'ultra'
 
-    // The lighting system also parents a key/fill/rim rig into this scene. Two
-    // full rigs stacked is what blew the top rail to white, so measure what is
-    // already here and take whatever share is left.
-    let foreign = 0
-    ctx.viewmodelScene.traverse((o) => {
-      const l = o as THREE.Light
-      if (l.isLight) foreign += l.intensity
-    })
-    const share = foreign > 3 ? 0.42 : 1
+    // One shared aim point in the middle of the posed weapon. The viewmodel
+    // sits 0.25-1.1m ahead of the eye, so aiming lights at the rig origin
+    // points them past it.
+    const focus = new THREE.Object3D()
+    focus.position.copy(this.focusPoint)
+    this.rig.add(focus)
 
-    // View-space key light: the weapon always reads well regardless of where
-    // the player is looking, which is what shipped shooters do.
-    const key = new THREE.DirectionalLight(0xfff0dd, 3.1 * share)
-    key.position.set(0.55, 0.85, 0.35)
-    // Aimed at the middle of the posed weapon, not at the rig origin: the
-    // viewmodel now sits 0.25-1.1m ahead of the eye.
-    const target = new THREE.Object3D()
-    target.position.set(0.10, -0.10, -0.62)
-    this.rig.add(target)
-    key.target = target
+    // Warm key, up and to the camera's left, angled back toward the eye.
+    // Direction works out at roughly (0.48, -0.63, -0.61): 0.48 on the left
+    // flank, 0.63 on the top faces, 0.61 on everything facing the camera.
+    const key = new THREE.DirectionalLight(0xfff2e2, 3.2)
+    key.position.set(-1.05, 1.40, 0.85)
+    key.target = focus
     if (shadows) {
       key.castShadow = true
       key.shadow.mapSize.set(1024, 1024)
       const cam = key.shadow.camera
-      cam.left = -0.8; cam.right = 0.8; cam.top = 0.8; cam.bottom = -0.8
-      cam.near = 0.05; cam.far = 4.0
+      cam.left = -0.75; cam.right = 0.75; cam.top = 0.75; cam.bottom = -0.75
+      cam.near = 0.4; cam.far = 5.0
       cam.updateProjectionMatrix()
       key.shadow.bias = -0.0006
       key.shadow.normalBias = 0.0025
@@ -224,66 +243,93 @@ export class Viewmodel {
     this.rig.add(key)
     this.keyLight = key
 
-    // Rim from behind the shoulder separates the weapon from the world. Kept
-    // near-neutral: a saturated blue rim on a near-black metal is indistinguish-
-    // able from the weapon being blue.
-    const rim = new THREE.DirectionalLight(0xa8b6cc, 1.1 * share)
-    rim.position.set(-0.7, 0.35, 0.6)
-    const rimTarget = new THREE.Object3D()
-    rimTarget.position.set(0.08, -0.09, -0.58)
-    this.rig.add(rimTarget)
-    rim.target = rimTarget
+    // Cool fill from the opposite quadrant: camera-right and slightly below,
+    // so the shadow flank and the undersides of the handguard and magazine
+    // keep readable texture instead of blocking up. This is the light that
+    // decides whether the rifle has form in shade or is a cut-out.
+    const fill = new THREE.DirectionalLight(0x9fb6d6, 1.25)
+    fill.position.set(1.30, -0.35, 0.95)
+    fill.target = focus
+    this.rig.add(fill)
+
+    // Rim from above and beyond the muzzle. Draws the top edge of the
+    // receiver, rail and barrel against whatever is behind them, which is what
+    // stops the weapon merging with a dark wall.
+    const rim = new THREE.DirectionalLight(0xc6d8f2, 1.9)
+    rim.position.set(0.55, 1.30, -2.20)
+    rim.target = focus
     this.rig.add(rim)
 
-    // Sky/ground bounce. World oriented, so it flips as the player looks around.
-    const fill = new THREE.HemisphereLight(0x94a3b5, 0x2a241c, 0.42 * share)
-    ctx.viewmodelScene.add(fill)
+    // Second rim, steered onto the real sun direction every frame. A weapon
+    // backlit by a low sun with no edge highlight is the tell that the
+    // viewmodel is lit by a rig that does not know where it is standing.
+    const sunRim = new THREE.DirectionalLight(0xffd7a4, 1.5)
+    sunRim.position.set(0, 2, -2)
+    sunRim.target = focus
+    this.rig.add(sunRim)
+    this.sunRim = sunRim
+
+    // Diffuse floor for the cloth and glove, which the probe alone leaves flat.
+    // World oriented on purpose: its position *is* its up axis in three, so it
+    // cannot be parented to a rig that rotates.
+    const bounce = new THREE.HemisphereLight(0x9db2cb, 0x3a3025, 0.55)
+    ctx.viewmodelScene.add(bounce)
 
     // Weapon space gets its own probe, always. Handing the sky PMREM to a
     // metalness-0.9 surface makes the weapon a mirror of the sky, and no amount
     // of albedo tuning fixes it: at that metalness the albedo *is* the tint on
-    // a reflection of whatever the probe contains. A dark studio box with one
-    // bright lobe gives controlled specular that reads as gunmetal from every
-    // camera angle, which the sky probe can never do.
+    // a reflection of whatever the probe contains.
     this.studioEnv = this.makeStudioEnvironment()
-    this.ctx.viewmodelScene.environment = this.studioEnv
-    this.ctx.viewmodelScene.environmentIntensity = 0.75
+    this.mats.setEnvironment(this.studioEnv)
+    ctx.viewmodelScene.environment = this.studioEnv
+    ctx.viewmodelScene.environmentIntensity = 1
   }
 
   /**
-   * Neutral studio probe: dark surround, one warm key lobe high and to the
-   * right, a dim cool bounce opposite it, and a dark floor.
+   * Studio probe: an elevation-only gradient — warm bright band at the
+   * horizon, cool bright zenith, dark warm ground.
+   *
+   * Two properties matter more than the colours. First, it carries real
+   * energy: at metalness 0.88 the probe, not the lights, supplies most of what
+   * the eye reads as the finish, and round 2's near-black box contributed
+   * about 0.1% of the frame's linear value. Second, it is invariant about the
+   * vertical axis. The probe is sampled in world space, so any bright lobe at
+   * a fixed azimuth sweeps across the weapon as the player turns and the
+   * rifle appears to change finish mid-turn. A gradient that only varies with
+   * elevation cannot do that, and it also gives every horizontal face — the
+   * rail ladder above all — a brighter reflection than the vertical flanks,
+   * which is the specular line that describes the weapon's spine.
    */
   private makeStudioEnvironment(): THREE.Texture | null {
     try {
       const pmrem = new THREE.PMREMGenerator(this.ctx.renderer)
       const scene = new THREE.Scene()
-      const panel = (color: number, intensity: number, pos: [number, number, number], size: [number, number, number]) => {
-        const m = new THREE.Mesh(
-          new THREE.BoxGeometry(size[0], size[1], size[2]),
-          new THREE.MeshBasicMaterial({ color, side: THREE.BackSide }),
-        )
-        m.material.color.multiplyScalar(intensity)
-        m.position.set(pos[0], pos[1], pos[2])
-        scene.add(m)
+      const geom = new THREE.SphereGeometry(10, 48, 32)
+      const pos = geom.getAttribute('position')
+      const col = new Float32Array(pos.count * 3)
+      for (let i = 0; i < pos.count; i++) {
+        // -1 straight down, +1 straight up.
+        const t = pos.getY(i) / 10
+        const up = Math.max(0, t)
+        // 1 at and above the horizon, falling to 0 at the nadir.
+        const ground = 1 - Math.max(0, -t)
+        // Warm haze band hugging the horizon, gone within ~20 degrees of it.
+        const band = Math.exp(-(t * t) / 0.045)
+        col[i * 3] = 0.045 + 0.115 * ground + 0.60 * up * up + band * 0.200
+        col[i * 3 + 1] = 0.040 + 0.120 * ground + 0.66 * up * up + band * 0.155
+        col[i * 3 + 2] = 0.035 + 0.130 * ground + 0.80 * up * up + band * 0.105
       }
-      // Surround: near-black neutral. This is what most of the weapon reflects.
-      panel(0x2b2b2c, 0.55, [0, 0, 0], [20, 20, 20])
-      // Key lobe, warm, above and to the shooter's right.
-      panel(0xfff0d6, 2.4, [5.5, 6.5, -2.5], [4.5, 2.6, 4.5])
-      // Cool bounce opposite, kept dim so it tints rather than colours.
-      panel(0x93a6c0, 0.42, [-6.5, 1.5, 3.0], [4, 5, 4])
-      // Floor: warm dirt bounce, darker than the surround.
-      panel(0x1e1a15, 0.5, [0, -8, 0], [20, 2, 20])
-      const rt = pmrem.fromScene(scene, 0.02)
+      geom.setAttribute('color', new THREE.BufferAttribute(col, 3))
+      const mesh = new THREE.Mesh(
+        geom,
+        new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide }),
+      )
+      scene.add(mesh)
+      const rt = pmrem.fromScene(scene, 0.04)
       pmrem.dispose()
-      scene.traverse((o) => {
-        const mesh = o as THREE.Mesh
-        if (mesh.isMesh) {
-          mesh.geometry.dispose()
-          ;(mesh.material as THREE.Material).dispose()
-        }
-      })
+      geom.dispose()
+      ;(mesh.material as THREE.Material).dispose()
+      this.studioTarget = rt
       return rt.texture
     } catch {
       return null
@@ -485,6 +531,11 @@ export class Viewmodel {
 
     const step = dt > 0 ? dt : 1 / 240
     const settling = dt <= 0
+
+    // The rig follows the camera, so the sun rim has to be re-solved into rig
+    // space every frame. Everything it touches is hoisted; this allocates
+    // nothing.
+    this.syncToSun()
 
     // --- blends -----------------------------------------------------------
     const sprintTarget = drive.sprint > 0.5 && drive.ads < 0.5 && this.reloadT < 0 ? 1 : 0
@@ -803,15 +854,41 @@ export class Viewmodel {
     this.rig.updateMatrixWorld(true)
   }
 
-  /** Tints the key light toward the world sun so the weapon matches the scene. */
+  /**
+   * Ties the fixed studio rig to the world it is standing in.
+   *
+   * Only colour and the sun rim's *direction* follow the world; intensity is
+   * deliberately constant. Modulating the rig by scene brightness is what
+   * produced a black rifle in the alley, and a viewmodel that dims with the
+   * environment is the one thing the reference games never do.
+   */
   syncToSun(): void {
     const lighting = this.ctx.services.lighting
     if (!lighting?.sun) return
-    this.keyLight.color.copy(lighting.sun.color).lerp(new THREE.Color(0xfff0dd), 0.45)
+    this.keyLight.color.copy(lighting.sun.color).lerp(this.keyWarm, 0.5)
+    this.sunRim.color.copy(lighting.sun.color).lerp(this.rimWarm, 0.3)
+
+    // World sun direction into rig (camera) space, so a backlit weapon rims on
+    // the side the sun is actually on.
+    const dir = lighting.sunDirection
+    if (dir.lengthSq() < 1e-6) return
+    this.rigInv.copy(this.rig.quaternion).invert()
+    this.sunLocal.copy(dir).applyQuaternion(this.rigInv).normalize()
+    this.sunRim.position.copy(this.sunLocal).multiplyScalar(2.4).add(this.focusPoint)
+    // Fades out rather than swinging under the weapon once the sun sets.
+    const elev = Math.min(1, Math.max(0, (dir.y + 0.04) / 0.18))
+    // -Z is forward, so a negative local z means the player is looking into the
+    // sun and the weapon is backlit -- the case that needs the edge. Facing
+    // away, the same light would land on the camera side and act as a second
+    // key, so it is held down to a trim. The weapon's overall exposure stays
+    // put while the sun still tells you which way it is coming from.
+    const backlit = Math.min(1, Math.max(0, -this.sunLocal.z))
+    this.sunRim.intensity = 1.5 * elev * elev * (3 - 2 * elev) * (0.35 + 0.65 * backlit)
   }
 
   dispose(): void {
-    this.studioEnv?.dispose()
+    this.studioTarget?.dispose()
+    this.studioTarget = null
     this.studioEnv = null
     for (const model of this.models.values()) {
       model.root.traverse((o) => {

@@ -172,10 +172,24 @@ export function resampleField(src: Field, sw: number, sh: number, dw: number, dh
  *
  * `strength` is resolution independent: it is scaled by `size / 256` so a
  * recipe looks the same whether it bakes at 256 or 512.
+ *
+ * The **alpha channel carries the height field itself**, normalised so that 1
+ * is the highest point on the surface. A normal map only encodes slope, and
+ * slope alone cannot make a brick wall look like it has depth when you are
+ * looking along it — the mortar has to actually go *behind* the brick. Shipping
+ * the height alongside the normal, in a channel that was being wasted on a
+ * constant 255, is what lets the triplanar shader parallax-march it.
  */
 export function heightToNormalRGBA(h: Field, w: number, ht: number, strength: number): Uint8Array {
   const out = new Uint8Array(w * ht * 4)
   const k = strength * (w / 256)
+  let lo = Infinity
+  let hi = -Infinity
+  for (let i = 0; i < h.length; i++) {
+    if (h[i] < lo) lo = h[i]
+    if (h[i] > hi) hi = h[i]
+  }
+  const hScale = 255 / (hi - lo || 1e-6)
   for (let y = 0; y < ht; y++) {
     const ym = ((y - 1 + ht) % ht) * w
     const yp = ((y + 1) % ht) * w
@@ -197,7 +211,49 @@ export function heightToNormalRGBA(h: Field, w: number, ht: number, strength: nu
       out[o] = ((nx * 0.5 + 0.5) * 255) | 0
       out[o + 1] = ((ny * 0.5 + 0.5) * 255) | 0
       out[o + 2] = ((nz * 0.5 + 0.5) * 255) | 0
-      out[o + 3] = 255
+      out[o + 3] = ((h[yc + x] - lo) * hScale) | 0
+    }
+  }
+  return out
+}
+
+/**
+ * Resamples a field through a per-texel offset taken from two noise fields.
+ *
+ * Cellular patterns are the fastest way to build stone, and the fastest way to
+ * give away that you built it from a cellular pattern: Voronoi cells meet along
+ * dead-straight lines radiating from perfectly convex vertices, which no laid
+ * or quarried stone ever does. Pushing the lookup around with a couple of
+ * octaves of noise before the pattern is read bends every one of those edges,
+ * and because the same offset is applied to every channel of the pattern the
+ * cell ids stay registered with the joints.
+ *
+ * `nearest` keeps cell-id fields piecewise constant; interpolating an id field
+ * would smear a false gradient across every joint.
+ */
+export function warpField(
+  src: Field,
+  w: number,
+  h: number,
+  dx: Field,
+  dy: Field,
+  amount: number,
+  nearest = false,
+): Field {
+  const out = field(w, h)
+  for (let y = 0; y < h; y++) {
+    const row = y * w
+    for (let x = 0; x < w; x++) {
+      const i = row + x
+      const u = x + (dx[i] - 0.5) * amount
+      const v = y + (dy[i] - 0.5) * amount
+      if (nearest) {
+        const xi = ((Math.round(u) % w) + w) % w
+        const yi = ((Math.round(v) % h) + h) % h
+        out[i] = src[yi * w + xi]
+      } else {
+        out[i] = bilinearWrap(src, w, h, u, v)
+      }
     }
   }
   return out
@@ -214,11 +270,25 @@ export function aoFromHeight(h: Field, w: number, ht: number, strength = 1, scal
   const weights = [0.4, 0.3, 0.2, 0.1]
   const ao = field(w, ht, 1)
   const px = Math.max(1, w / 256) * scale
+  // The two broad scales carry no detail finer than their own blur radius, so
+  // they are evaluated on a half-size copy where a hundred-texel box blur costs
+  // a quarter as much. On a 1024 hero surface that is most of the AO bake.
+  const hw = w >> 1
+  const hh = ht >> 1
+  const coarse = w >= 512 ? resampleField(h, w, ht, hw, hh) : null
   for (let s = 0; s < radii.length; s++) {
     const r = Math.max(1, Math.round(radii[s] * px))
     if (r >= Math.min(w, ht) / 2) continue
-    const blurred = boxBlur(h, w, ht, r, 2)
     const k = weights[s] * strength * 2.2
+    if (coarse && radii[s] >= 12) {
+      const blurred = boxBlur(coarse, hw, hh, Math.max(1, r >> 1), 2)
+      const dip = field(hw, hh)
+      for (let i = 0; i < dip.length; i++) dip[i] = Math.max(0, blurred[i] - coarse[i])
+      const up = resampleField(dip, hw, hh, w, ht)
+      for (let i = 0; i < ao.length; i++) ao[i] -= up[i] * k
+      continue
+    }
+    const blurred = boxBlur(h, w, ht, r, 2)
     for (let i = 0; i < ao.length; i++) {
       const d = blurred[i] - h[i]
       if (d > 0) ao[i] -= d * k

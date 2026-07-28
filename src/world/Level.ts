@@ -66,6 +66,10 @@ export class LevelSystem implements System, LevelService {
 
     // Buildings are merged per 26 m cell so frustum culling still does work
     // while the draw-call count stays low.
+    // Grime, damp courses and exposed substrate are painted onto the facades
+    // as flat sheets; nothing structural is ever authored in these materials,
+    // so excluding them from casting costs no real shadow.
+    const wallDressing: MaterialName[] = ['dirt', 'concreteRubble']
     const zones = new Map<string, Builder>()
     const zoneOf = (x: number, z: number): Builder => {
       const key = `${Math.floor(x / 26)}_${Math.floor(z / 26)}`
@@ -114,15 +118,21 @@ export class LevelSystem implements System, LevelService {
     buildOverhead(overheadKit, new Rand(seed ^ 0x1d4e))
 
     const debrisKit = new Builder()
+    // Stains, tags, soot and standing water are flat sheets a centimetre off
+    // the surface they dress. Letting them cast prints a hard-edged rectangle
+    // of their own silhouette onto that surface, which reads as a lightmap
+    // seam rather than as dirt. They live in their own batch so the whole
+    // class is excluded from the shadow pass in one place.
+    const dressKit = new Builder()
     const rngDebris = new Rand(seed ^ 0x3ae7)
     buildSandDrift(debrisKit, rngDebris)
     buildCollapsedBlock(debrisKit, farm, rngDebris)
     buildRubblePiles(debrisKit, farm, rngDebris)
     buildCraterDressing(debrisKit, farm, rngDebris)
-    buildGroundDecals(debrisKit, rngDebris)
-    buildPuddles(debrisKit, rngDebris)
-    buildWallGrime(debrisKit, rngDebris)
-    buildWallMarks(debrisKit, rngDebris)
+    buildGroundDecals(dressKit, rngDebris)
+    buildPuddles(dressKit, rngDebris)
+    buildWallGrime(dressKit, rngDebris)
+    buildWallMarks(dressKit, rngDebris)
     buildStructures(debrisKit, rngDebris)
 
     // --- Foliage -----------------------------------------------------------
@@ -142,7 +152,7 @@ export class LevelSystem implements System, LevelService {
       g.name = `block_${key}`
       g.matrixAutoUpdate = false
       this.root.add(g)
-      bl.merge(g, mats, physics, { name: `block${key}` })
+      bl.merge(g, mats, physics, { name: `block${key}`, noCast: wallDressing })
     }
     const commit = (bl: Builder, name: string, cast = true, receive = true, noCast?: MaterialName[]): void => {
       const g = new THREE.Group()
@@ -155,11 +165,12 @@ export class LevelSystem implements System, LevelService {
     // surface they sit on. Letting them cast would print their own silhouette
     // back onto that surface, so they light but never shadow.
     const flatDressing: MaterialName[] = ['dirt', 'water', 'plasterDamaged']
-    commit(landmarks, 'landmarks')
-    commit(streetKit, 'street')
+    commit(landmarks, 'landmarks', true, true, wallDressing)
+    commit(streetKit, 'street', true, true, wallDressing)
     commit(propsKit, 'props', true, true, ['dirt'])
     commit(overheadKit, 'overhead')
     commit(debrisKit, 'debris', true, true, flatDressing)
+    commit(dressKit, 'dressing', false, true)
     commit(foliageKit, 'foliage')
 
     const skyGroup = new THREE.Group()

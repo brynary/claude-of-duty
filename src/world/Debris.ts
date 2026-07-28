@@ -2,7 +2,7 @@ import * as THREE from 'three'
 import type { MaterialName } from '../render/MaterialNames'
 import type { Rand } from '../core/Rand'
 import {
-  Builder, InstanceFarm, chamferBox, cylinderGeom, decalQuad, rampPrism, catenary,
+  Builder, InstanceFarm, chamferBox, cylinderGeom, decalQuad, groundPatch, rampPrism, catenary,
 } from './Kit'
 import { POTHOLES, groundHeight, settleHeight, surfaceHeight } from './Terrain'
 import { BUILDINGS, footprintBase, xform } from './Buildings'
@@ -158,8 +158,7 @@ export function buildRubblePiles(b: Builder, farm: InstanceFarm, rng: Rand): voi
         rng.range(0, 3.1), rng.range(0.8, 1.2), rng.spread(0.5), rng.spread(0.5))
     }
     // Dust washed out from the heap, so it does not stop at a hard edge.
-    b.geom('dirt', decalQuad(r * 3.0, r * 3.0 * stretch, 0.3, x * 11 + z),
-      xform(x, surfaceHeight(x, z) + 0.02, z, rng.range(0, 3.1), -Math.PI / 2))
+    b.geom('dirt', groundPatch(x, z, r * 1.5, r * 1.5 * stretch, x * 11 + z, surfaceHeight, 0.02))
     // Twisted rebar emerging from the heap.
     for (let i = 0; i < 3; i++) {
       const a = rng.range(0, Math.PI * 2)
@@ -190,10 +189,11 @@ export function buildGroundDecals(b: Builder, rng: Rand): void {
     [22.0, 24.0, 3.2, 'dirt'],
   ]
   for (const [x, z, r, mat] of stains) {
-    // Seated on the drawn surface: near a crater lip the analytic field runs
-    // up to 17 cm above the mesh, which buries a 2 cm decal outright.
-    b.geom(mat, decalQuad(r, r * rng.range(0.75, 1.25), 0.2, x * 3 + z),
-      xform(x, surfaceHeight(x, z) + 0.018, z, rng.range(0, 3.1), -Math.PI / 2))
+    // Welded to the drawn surface vertex by vertex. A flat quad up to 7.5 m
+    // across, tilted onto paving that undulates by tens of centimetres, buries
+    // one corner and lifts the other clear — which is precisely the "unlit
+    // card lying on the cobblestone" read.
+    b.geom(mat, groundPatch(x, z, r * 0.5, r * rng.range(0.38, 0.62), x * 3 + z, surfaceHeight, 0.018))
   }
   // Tyre tracks worn into the dust along the routes.
   const tracks: [number, number, number, number][] = [
@@ -249,34 +249,37 @@ export function buildCraterDressing(b: Builder, farm: InstanceFarm, rng: Rand): 
  * happened rather than a surface that was generated.
  */
 export function buildPuddles(b: Builder, rng: Rand): void {
-  const seat = (x: number, z: number, r: number): number => {
-    // Water finds the lowest point it covers, so sample the dish rather than
-    // the centre — otherwise the sheet clips through one lip of the hollow.
+  // Water lies in a dish, so its surface is level: sample the hollow and pour
+  // to a fixed height rather than following the paving.
+  const pour = (x: number, z: number, r: number, fill: number) => {
     let lo = surfaceHeight(x, z)
     for (let i = 0; i < 6; i++) {
       const a = (i / 6) * Math.PI * 2
       lo = Math.min(lo, surfaceHeight(x + Math.cos(a) * r * 0.6, z + Math.sin(a) * r * 0.6))
     }
-    return lo
+    return lo + fill
+  }
+  const sheet = (x: number, z: number, rx: number, rz: number, y: number, seed: number): void => {
+    b.geom('water', groundPatch(x, z, rx, rz, seed, () => y, 0, 2, 16))
   }
   for (const p of POTHOLES) {
-    const r = p.r * rng.range(0.55, 0.85)
-    const y = seat(p.x, p.z, r) + p.depth * rng.range(0.24, 0.42)
-    b.geom('water', decalQuad(r * 1.8, r * 1.5, 0.24, p.x * 7 + p.z),
-      xform(p.x, y, p.z, rng.range(0, 3.1), -Math.PI / 2))
-    // A damp halo so the water does not meet dry dust at a hard line.
-    b.geom('asphaltCracked', decalQuad(r * 2.6, r * 2.2, 0.26, p.z * 5 + 3),
-      xform(p.x, y - 0.004, p.z, rng.range(0, 3.1), -Math.PI / 2))
+    const r = p.r * rng.range(0.5, 0.78)
+    const y = pour(p.x, p.z, r, p.depth * rng.range(0.24, 0.42))
+    sheet(p.x, p.z, r * 0.9, r * 0.78, y, p.x * 7 + p.z)
+    // Damp ground fanning out from the rim, welded to the paving under it.
+    b.geom('asphaltCracked', groundPatch(p.x, p.z, r * 1.35, r * 1.15, p.z * 5 + 3, surfaceHeight, 0.014))
   }
   // Seepage down the shaded sides of the two routes and under the gateway.
+  // Only where a wall or an overhang keeps the sun off — standing water in the
+  // middle of a sunlit square is the tell that made these read as blue cards.
   const slicks: [number, number, number][] = [
     [6.4, 16.8, 1.1], [7.6, 23.2, 0.9], [6.9, 33.4, 1.3], [-9.6, 24.0, 1.2],
-    [-4.0, 30.6, 1.5], [-19.4, 6.2, 0.9], [11.6, 12.0, 1.0], [-13.4, -8.0, 1.2],
+    [-4.0, 30.6, 1.5], [-19.4, 6.2, 0.9], [11.6, 12.0, 1.0],
   ]
   for (const [x, z, r] of slicks) {
-    const y = seat(x, z, r)
-    b.geom('water', decalQuad(r * 1.7, r * 1.1, 0.3, x * 3 + z), xform(x, y + 0.012, z, rng.range(0, 3.1), -Math.PI / 2))
-    b.geom('dirt', decalQuad(r * 2.7, r * 1.9, 0.3, x - z), xform(x, y + 0.008, z, rng.range(0, 3.1), -Math.PI / 2))
+    const y = pour(x, z, r, 0.012)
+    sheet(x, z, r * 0.8, r * 0.55, y, x * 3 + z)
+    b.geom('dirt', groundPatch(x, z, r * 1.35, r * 0.98, x - z, surfaceHeight, 0.01))
   }
 }
 
@@ -305,8 +308,10 @@ export function buildWallMarks(b: Builder, rng: Rand): void {
     const y = groundHeight(x, z) + rng.range(1.25, 1.75)
     const ink = rng.pick(inks)
     b.push(x, y, z, yaw)
-    // Backing haze from the overspray.
-    b.geom('plasterDamaged', decalQuad(2.0 * s, 0.95 * s, 0.32, x * 5 + z), xform(0, 0, -0.013))
+    // Backing haze from the overspray. Grime, not fresh plaster, and barely
+    // wider than the tag: a pale 2 m panel behind every piece of graffiti was
+    // covering a ninth of the alley frame in flat cards.
+    b.geom('dirt', decalQuad(1.25 * s, 0.62 * s, 0.34, x * 5 + z), xform(0, 0, -0.013))
     let cx = -0.85 * s
     while (cx < 0.85 * s) {
       const w = rng.range(0.12, 0.3) * s
@@ -338,8 +343,20 @@ export function buildWallMarks(b: Builder, rng: Rand): void {
   for (const [x, z, yaw, w, cy, h] of scorch) {
     const y = groundHeight(x, z)
     b.push(x, y, z, yaw)
-    b.geom('rubber', decalQuad(w, h, 0.34, x * 9 + z), xform(rng.spread(0.3), cy, -0.016))
-    b.geom('plasterDamaged', decalQuad(w * 1.35, h * 0.6, 0.3, z * 3), xform(rng.spread(0.4), cy - 0.6, -0.014))
+    // A plume, not a rectangle. One 1.8 x 2.6 m tyre-rubber quad was reading
+    // as a roller shutter bolted to the alley wall — five soft lobes that
+    // narrow at the source and fan out as they rise read as fire damage.
+    const lobes = 6
+    for (let i = 0; i < lobes; i++) {
+      const t = i / (lobes - 1)
+      const lw = w * (0.34 + 0.62 * t) * rng.range(0.8, 1.15)
+      const lh = h * 0.34 * rng.range(0.75, 1.2)
+      b.geom(i < 2 ? 'rubber' : 'dirt',
+        decalQuad(lw, lh, 0.4, x * 9 + z + i * 3.1),
+        xform(rng.spread(w * 0.22 * t), cy - h * 0.34 + t * h * 0.72, -0.016 - i * 0.0012))
+    }
+    // Scorched, spalled render at the mouth of the opening itself.
+    b.geom('concreteRubble', decalQuad(w * 0.5, h * 0.22, 0.34, z * 3), xform(rng.spread(0.2), cy - h * 0.4, -0.013))
     b.pop()
   }
 }
@@ -374,8 +391,12 @@ export function buildWallGrime(b: Builder, rng: Rand): void {
         const wx = spec.cx + lx * c + lz * s + ox * proud
         const wz = spec.cz - lx * s + lz * c + oz * proud
         const base = groundHeight(wx, wz)
-        b.geom('dirt', decalQuad(along / n + rng.range(0, 0.8), rng.range(0.5, 1.15), 0.28, wx * 3 + wz),
-          xform(wx, base + rng.range(0.25, 0.5), wz, face))
+        // Kept to the bottom half-metre. Run any taller and the band stops
+        // reading as splash-back off the paving and starts reading as a
+        // painted dado — and it was the largest single element in the alley
+        // frame by area.
+        b.geom('dirt', decalQuad(along / n + rng.range(0, 0.6), rng.range(0.34, 0.72), 0.3, wx * 3 + wz),
+          xform(wx, base + rng.range(0.16, 0.34), wz, face))
         if (rng.bool(0.3)) {
           b.geom('metalRusted', decalQuad(rng.range(0.1, 0.26), rng.range(0.9, 2.4), 0.3, wz * 7 + 1),
             xform(wx + oz * rng.spread(along * 0.3), base + rng.range(1.8, 3.4), wz - ox * rng.spread(along * 0.3), face))

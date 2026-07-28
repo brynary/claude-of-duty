@@ -194,6 +194,8 @@ void main() {
 
 const MAX_SHAFTS: Record<string, number> = { low: 0, medium: 3, high: 5, ultra: 6 }
 const MOTES_PER_SHAFT = 90
+/** Mote brightness as a multiple of the beam density they hang in. */
+const MOTE_BRIGHTNESS = 2.4
 
 export class LightShafts {
   /** Bounce fill positions the lighting system turns into interior lamps. */
@@ -276,7 +278,7 @@ export class LightShafts {
       this.materials.push(material)
     }
 
-    this.buildMotes(ctx, specs, color)
+    this.buildMotes(ctx, specs, color, density)
   }
 
   /**
@@ -468,7 +470,7 @@ export class LightShafts {
     return specs
   }
 
-  private buildMotes(ctx: GameContext, specs: ShaftSpec[], color: THREE.Color): void {
+  private buildMotes(ctx: GameContext, specs: ShaftSpec[], color: THREE.Color, density: number): void {
     const total = specs.length * MOTES_PER_SHAFT
     if (total === 0) return
     const rand = new Rand(ctx.config.seed ^ 0x2fd3)
@@ -524,9 +526,12 @@ export class LightShafts {
         uTime: { value: 0 },
         uProjScale: { value: 600 },
         uColor: { value: new THREE.Vector3(color.r, color.g, color.b) },
-        // Just at the bloom threshold at their brightest, so a mote reads as a
-        // lit speck of dust rather than acquiring a halo of its own.
-        uIntensity: { value: 1.1 },
+        // Scaled off the beam the motes live inside rather than set absolutely.
+        // A mote is dust catching the shaft, so it can never be brighter than
+        // the shaft: pinned at a fixed value it survived every exposure change
+        // the frame went through and ended up reading as a scatter of flat
+        // white cutouts against shadow.
+        uIntensity: { value: density * MOTE_BRIGHTNESS },
       },
       vertexShader: MOTE_VERTEX,
       fragmentShader: MOTE_FRAGMENT,
@@ -571,6 +576,7 @@ export class LightShafts {
     for (let i = 0; i < this.materials.length; i++) {
       this.materials[i].uniforms.uDensity.value = density * this.specs[i].strength
     }
+    if (this.moteMaterial) this.moteMaterial.uniforms.uIntensity.value = density * MOTE_BRIGHTNESS
   }
 
   setVisible(visible: boolean): void {

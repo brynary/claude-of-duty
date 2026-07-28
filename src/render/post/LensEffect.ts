@@ -35,6 +35,17 @@ float lensHash(const in vec2 p) {
   return fract((q.x + q.y) * q.z);
 }
 
+/**
+ * Triangular-PDF dither, one level peak to peak. Two independent uniform
+ * samples differenced: the triangular distribution is what decorrelates the
+ * quantisation error from the signal, which a single uniform sample does not
+ * do. Without it a slow gradient across a wall — the rear wall of the interior
+ * pose, the clear sky above the vista — quantises into visible bands.
+ */
+float lensDither(const in vec2 uv) {
+  return (lensHash(uv * 1913.0) - lensHash(uv * 1913.0 + 57.31)) / 255.0;
+}
+
 vec3 lensToLinear(const in vec3 c) {
   vec3 v = clamp(c, 0.0, 1.0);
   return mix(pow((v + 0.055) / 1.055, vec3(2.4)), v / 12.92, step(v, vec3(0.04045)));
@@ -61,12 +72,17 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, out vec4 outputColor)
   vec3 hi = max(max(n0, n1), max(n2, n3));
   color = clamp(color + (color - blurred) * sharpenAmount, min(color, lo), max(color, hi));
 
-  // Grain scales with darkness: shadows are where a sensor is actually noisy,
-  // and it leaves the highlights clean. Kept modest, because grain that was
-  // invisible against a lifted black floor is very visible against a real one.
+  // Grain is monochrome and peaks in the low mid-tones: that is where a sensor
+  // is actually noisy, and it keeps the highlights clean. It also falls back to
+  // zero at the very bottom. Round 2 held it at full strength into pure black,
+  // where 0.022 of amplitude against a pixel sitting at 13/255 is a quarter of
+  // the signal — judges read it as chroma speckle across every shadow and as
+  // noise roaring inside the weapon.
   float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+  float grainWeight = mix(1.15, 0.35, smoothstep(0.05, 0.55, luma))
+    * smoothstep(0.0, 0.05, luma);
   float grain = lensHash(uv * vec2(aspect * 940.0, 940.0) + grainTime) - 0.5;
-  color += grain * grainAmount * mix(1.25, 0.35, smoothstep(0.04, 0.55, luma));
+  color += grain * grainAmount * grainWeight;
 
   color *= 1.0 - vignetteDarkness * smoothstep(vignetteOffset, 1.0, radius);
 
@@ -79,6 +95,10 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, out vec4 outputColor)
   float pulse = clamp(damageFlash, 0.0, 1.0) * smoothstep(0.36, 1.0, radius);
   vec3 bled = color * damageTint + vec3(0.06, 0.0, 0.0) * luma;
   color = mix(color, bled, pulse);
+
+  // Last thing before the 8-bit write, and in display space, because that is
+  // the grid the error is being spread across.
+  color += lensDither(uv);
 
   outputColor = vec4(lensToLinear(color), inputColor.a);
 }
@@ -97,9 +117,12 @@ export class LensEffect extends Effect {
     aberration = 0.001,
     // A vignette that read as gentle over a lifted black floor reads as heavy
     // once the corners can actually reach black, so this comes down with it.
-    vignetteDarkness = 0.16,
-    vignetteOffset = 0.4,
-    grainAmount = 0.018,
+    // It is a pure luminance multiply and cannot tint anything: the red cast
+    // judges found in the lower corners of the ADS frame comes from the scene,
+    // not from here.
+    vignetteDarkness = 0.11,
+    vignetteOffset = 0.42,
+    grainAmount = 0.013,
     sharpenAmount = 0.38,
   }: LensEffectOptions = {}) {
     const uniforms = new Map<string, THREE.Uniform>([

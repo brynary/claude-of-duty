@@ -47,19 +47,31 @@ const RAY_LENGTH = 45
  * Fraction of the open-sky ambient a fully enclosed surface keeps. Not zero:
  * light that gets into a room bounces around it, and a black void fails the
  * "interiors lit believably" bar as surely as an unoccluded one fails the
- * grounding bar. Roughly three stops down from open shade.
+ * grounding bar.
+ *
+ * Three stops down was too far. An enclosed surface still has to carry its
+ * material — plaster relief, brick coursing, the grain of a crate — and below
+ * about two stops that information is gone rather than dim. Note this is a
+ * *fraction of ambient*, so it lifts shadow midtones and leaves the black point
+ * where it is: the darkest pixels in a frame are set by the tone curve's toe,
+ * not by this.
  */
-const ENCLOSED_BOUNCE = 0.115
+const ENCLOSED_BOUNCE = 0.24
 
 /** How far the enclosed tint is pulled back towards white. */
 const ENCLOSED_NEUTRALITY = 0.45
 
 /**
  * Distance the sample point is pushed along the surface normal, in metres.
- * Roughly a third of a cell: far enough to escape the wall the fragment sits
- * on, near enough not to sample across the room.
+ *
+ * Pushing along the normal is the only thing that buys directionality out of a
+ * scalar field, and it has to clear the cell the surface itself sits in or the
+ * trilinear fetch is dominated by the solid the fragment is standing on. Cells
+ * here are about 2.7 m across, so a one metre push left every street-facing
+ * facade reading as half-enclosed. Half a cell escapes the wall without
+ * reaching across a room.
  */
-const NORMAL_PUSH = 1.0
+const NORMAL_PUSH = 1.35
 
 /**
  * Visibility is raised to this power before use. Raw hemisphere fractions fall
@@ -67,7 +79,7 @@ const NORMAL_PUSH = 1.0
  * of the sky does not look 60% darker than open ground — so the mid range is
  * lifted while zero stays zero.
  */
-const VISIBILITY_GAMMA = 0.75
+const VISIBILITY_GAMMA = 0.62
 
 /** How much of the diffuse occlusion also applies to glossy reflections. */
 const SPECULAR_SHARE = 0.75

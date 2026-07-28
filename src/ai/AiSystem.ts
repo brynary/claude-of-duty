@@ -24,6 +24,25 @@ const CORPSE_LIFETIME = 12
 const MAX_LIVE = 10
 const FLASH_LIGHTS = 3
 
+/**
+ * Muzzle-flash light, sized against the sun (2.1) and the interior fills (5.2)
+ * in Lighting.ts.
+ *
+ * The light sits in the plume ahead of the barrel, not on the muzzle itself.
+ * At the muzzle the shooter's own support hand is 0.30m away and his plate
+ * carrier 0.49m, so inverse-square turns any intensity useful at scene range
+ * into 50-140x sunlight on his own body: the soldier clips to a featureless
+ * white mannequin and blooms, which is exactly what iteration 2 shipped.
+ * Offsetting forward puts the nearest part of the shooter 0.70m out and drops
+ * the near-field by ~5x, so the flash reads as a hot rim on the gloves and the
+ * near side of the carrier while a wall 2m in front still takes about 0.6 of a
+ * sun's worth of warm bounce. Range is short for the same reason — a rifle
+ * flash lights the couple of metres around the shooter, not the whole plaza.
+ */
+const FLASH_LIGHT_INTENSITY = 5
+const FLASH_LIGHT_RANGE = 6.5
+const FLASH_LIGHT_OFFSET = 0.4
+
 export class AiSystem implements System, AiService {
   readonly name = 'ai'
 
@@ -68,19 +87,23 @@ export class AiSystem implements System, AiService {
     for (let i = 0; i < 3; i++) this.assets.push(buildSoldierAsset(mats, ctx.config.seed + i * 977))
 
     this.flashGeometry = buildMuzzleFlash()
+    // No `toneMapped: false` here: the Engine leaves renderer tone mapping off
+    // and the ACES curve runs as a post effect over the whole buffer, so the
+    // flag would be a no-op that reads like an unlit escape hatch. The card is
+    // meant to go through the same curve as everything else and bloom off its
+    // own core.
     this.flashMaterial = new THREE.MeshBasicMaterial({
       vertexColors: true,
       blending: THREE.AdditiveBlending,
       transparent: true,
       depthWrite: false,
-      toneMapped: false,
       side: THREE.DoubleSide,
     })
 
     // Lights are created up front and only ever change intensity: adding or
     // removing one at runtime forces every material in the scene to recompile.
     for (let i = 0; i < FLASH_LIGHTS; i++) {
-      const l = new THREE.PointLight(0xffcf8c, 0, 11, 2)
+      const l = new THREE.PointLight(0xffcf8c, 0, FLASH_LIGHT_RANGE, 2)
       l.castShadow = false
       ctx.scene.add(l)
       this.lights.push(l)
@@ -345,8 +368,8 @@ export class AiSystem implements System, AiService {
       if (used >= FLASH_LIGHTS) break
       if (!s.alive || !s.isFlashing) continue
       const l = this.lights[used++]
-      l.position.copy(s.muzzleWorld)
-      l.intensity = 26
+      l.position.copy(s.muzzleWorld).addScaledVector(s.muzzleDir, FLASH_LIGHT_OFFSET)
+      l.intensity = FLASH_LIGHT_INTENSITY
     }
     for (let i = used; i < FLASH_LIGHTS; i++) this.lights[i].intensity = 0
   }

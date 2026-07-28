@@ -437,6 +437,7 @@ export function discGeom(radius: number, segments = 32): THREE.BufferGeometry {
 export type WeaponMatKey =
   | 'gunmetal' | 'phosphate' | 'steel' | 'polymer' | 'polymerTan' | 'rubber'
   | 'glass' | 'glassFront' | 'glove' | 'sleeve' | 'brass' | 'dark' | 'anodised'
+  | 'rail' | 'magPolymer'
 
 interface WearParams {
   color: number
@@ -456,6 +457,15 @@ interface WearParams {
  */
 export class WeaponMaterials {
   private cache = new Map<string, THREE.Material>()
+  /**
+   * Viewmodel studio probe. It must be assigned to `material.envMap` rather
+   * than left to `scene.environment`: when a material has no `envMap` of its
+   * own the renderer overwrites `envMapIntensity` with the scene's single
+   * `environmentIntensity`, and every per-material weighting below is silently
+   * discarded. Metal on this weapon gets most of its value from the probe, so
+   * that weighting is the difference between a rifle and a black cut-out.
+   */
+  private env: THREE.Texture | null = null
   readonly metalNormal: THREE.DataTexture
   readonly metalRough: THREE.DataTexture
   readonly metalAlbedo: THREE.DataTexture
@@ -719,6 +729,7 @@ export class WeaponMaterials {
       envMapIntensity: p.envIntensity,
       dithering: true,
     })
+    m.envMap = this.env
     if (maps.map) m.map = maps.map
     if (maps.roughnessMap) m.roughnessMap = maps.roughnessMap
     if (maps.normalMap) {
@@ -747,6 +758,21 @@ export class WeaponMaterials {
     return m
   }
 
+  /**
+   * Points every weapon material at the viewmodel studio probe. Called once,
+   * before the first model is built, so nothing has to recompile.
+   */
+  setEnvironment(env: THREE.Texture | null): void {
+    this.env = env
+    for (const m of this.cache.values()) {
+      const s = m as THREE.MeshStandardMaterial
+      if (s.isMeshStandardMaterial && s.envMap !== env) {
+        s.envMap = env
+        s.needsUpdate = true
+      }
+    }
+  }
+
   get(key: WeaponMatKey): THREE.Material {
     const hit = this.cache.get(key)
     if (hit) return hit
@@ -756,82 +782,112 @@ export class WeaponMaterials {
       // ~0.9 the map value *is* the reflectance. A parkerised or anodised
       // finish is a dull conversion coating, so F0 lands near 0.05-0.08 linear
       // and roughness in the 0.55-0.75 band. Nothing on a service rifle is a
-      // mirror except a bare-worn edge.
+      // mirror except a bare-worn edge. Those F0 values are physically right
+      // and are left alone; the subassemblies are separated by *roughness* and
+      // probe weighting instead, which is how a real rifle separates too --
+      // the rail and the receiver are the same alloy with different finishes.
       case 'gunmetal':
         mat = this.wearMaterial(key, {
           color: 0x585b5a, roughness: 0.64, metalness: 0.88,
           wearColor: 0x8b9096, wearAlbedo: 0.45, wearRough: 0.40, wearMetal: 1,
-          envIntensity: 0.55, normalScale: 0.35,
+          envIntensity: 0.85, normalScale: 0.35,
         }, { map: this.metalAlbedo, roughnessMap: this.metalRough, normalMap: this.metalNormal })
         break
       case 'anodised':
         mat = this.wearMaterial(key, {
           color: 0x4a4d50, roughness: 0.58, metalness: 0.86,
           wearColor: 0x878c92, wearAlbedo: 0.42, wearRough: 0.36, wearMetal: 1,
-          envIntensity: 0.50, normalScale: 0.30,
+          envIntensity: 0.82, normalScale: 0.30,
+        }, { map: this.metalAlbedo, roughnessMap: this.metalRough, normalMap: this.metalNormal })
+        break
+      // Type III hard anodise on a rail is glassier than the receiver flats it
+      // sits on. The tight lobe turns the ladder tops into a broken specular
+      // line along the spine of the weapon, which is the single strongest
+      // silhouette cue a first person rifle has.
+      case 'rail':
+        mat = this.wearMaterial(key, {
+          color: 0x4a4d50, roughness: 0.30, metalness: 0.92,
+          wearColor: 0x9298a0, wearAlbedo: 0.5, wearRough: 0.20, wearMetal: 1,
+          envIntensity: 1.25, normalScale: 0.22,
         }, { map: this.metalAlbedo, roughnessMap: this.metalRough, normalMap: this.metalNormal })
         break
       case 'phosphate':
         mat = this.wearMaterial(key, {
-          color: 0x3a3d3c, roughness: 0.75, metalness: 0.82,
+          color: 0x3a3d3c, roughness: 0.78, metalness: 0.82,
           wearColor: 0x74797e, wearAlbedo: 0.40, wearRough: 0.42, wearMetal: 1,
-          envIntensity: 0.42, normalScale: 0.45,
+          envIntensity: 0.62, normalScale: 0.45,
         }, { map: this.metalAlbedo, roughnessMap: this.metalRough, normalMap: this.metalNormal })
         break
       case 'steel':
         mat = this.wearMaterial(key, {
           color: 0x9aa0a5, roughness: 0.40, metalness: 1,
           wearColor: 0xc4cad0, wearAlbedo: 0.45, wearRough: 0.30, wearMetal: 1,
-          envIntensity: 0.80, normalScale: 0.25,
+          envIntensity: 1.20, normalScale: 0.25,
         }, { map: this.metalAlbedo, roughnessMap: this.metalRough, normalMap: this.metalNormal })
         break
       case 'dark':
         mat = this.wearMaterial(key, {
-          color: 0x101112, roughness: 0.86, metalness: 0.25,
+          color: 0x161819, roughness: 0.88, metalness: 0.25,
           wearColor: 0x5c6065, wearAlbedo: 0.28, wearRough: 0.52, wearMetal: 0.5,
-          envIntensity: 0.25, normalScale: 0.45,
+          envIntensity: 0.30, normalScale: 0.45,
         }, { roughnessMap: this.metalRough, normalMap: this.metalNormal })
         break
+      // Dielectric albedos below are the one place round 2 was measurably
+      // wrong rather than merely under-lit: 0x24262a is 1.8% linear, and glass
+      // filled nylon furniture measures 4-6%. Corrected to the real number,
+      // which is also what makes the furniture read lighter and flatter than
+      // the receiver instead of disappearing into it.
       case 'polymer':
         mat = this.wearMaterial(key, {
-          color: 0x24262a, roughness: 0.70, metalness: 0.02,
-          wearColor: 0x4c5054, wearAlbedo: 0.35, wearRough: 0.50, wearMetal: 0.04,
-          envIntensity: 0.42, normalScale: 0.70,
+          color: 0x3d4045, roughness: 0.80, metalness: 0.02,
+          wearColor: 0x585c61, wearAlbedo: 0.35, wearRough: 0.58, wearMetal: 0.04,
+          envIntensity: 0.70, normalScale: 0.70,
         }, { roughnessMap: this.polymerRough, normalMap: this.polymerNormal })
         break
       case 'polymerTan':
         mat = this.wearMaterial(key, {
-          color: 0x5d5240, roughness: 0.76, metalness: 0.02,
-          wearColor: 0x8b7c60, wearAlbedo: 0.40, wearRough: 0.56, wearMetal: 0.04,
-          envIntensity: 0.40, normalScale: 0.70,
+          color: 0x6b6049, roughness: 0.82, metalness: 0.02,
+          wearColor: 0x968769, wearAlbedo: 0.40, wearRough: 0.60, wearMetal: 0.04,
+          envIntensity: 0.68, normalScale: 0.70,
+        }, { roughnessMap: this.polymerRough, normalMap: this.polymerNormal })
+        break
+      // The magazine is the one large block that must not share a value with
+      // the lower receiver it hangs off, or the two merge into a single slab.
+      // A moulded, unpainted mag really is darker and flatter than a grip that
+      // has been polished by a hand.
+      case 'magPolymer':
+        mat = this.wearMaterial(key, {
+          color: 0x2c2e32, roughness: 0.90, metalness: 0.02,
+          wearColor: 0x4a4e53, wearAlbedo: 0.30, wearRough: 0.66, wearMetal: 0.04,
+          envIntensity: 0.50, normalScale: 0.80,
         }, { roughnessMap: this.polymerRough, normalMap: this.polymerNormal })
         break
       case 'rubber':
         mat = this.wearMaterial(key, {
-          color: 0x1b1d1e, roughness: 0.94, metalness: 0.0,
-          wearColor: 0x3a3c3e, wearAlbedo: 0.25, wearRough: 0.80, wearMetal: 0,
-          envIntensity: 0.22, normalScale: 0.95,
+          color: 0x2b2d2f, roughness: 0.95, metalness: 0.0,
+          wearColor: 0x46484a, wearAlbedo: 0.25, wearRough: 0.82, wearMetal: 0,
+          envIntensity: 0.34, normalScale: 0.95,
         }, { roughnessMap: this.polymerRough, normalMap: this.polymerNormal })
         break
       case 'brass':
         mat = this.wearMaterial(key, {
           color: 0xa8813a, roughness: 0.38, metalness: 1,
           wearColor: 0xd8b878, wearAlbedo: 0.5, wearRough: 0.24, wearMetal: 1,
-          envIntensity: 0.70, normalScale: 0.35,
+          envIntensity: 1.0, normalScale: 0.35,
         }, { roughnessMap: this.metalRough, normalMap: this.metalNormal })
         break
       case 'glove':
         mat = this.wearMaterial(key, {
-          color: 0x282a2c, roughness: 0.82, metalness: 0.0,
-          wearColor: 0x4a453f, wearAlbedo: 0.30, wearRough: 0.66, wearMetal: 0,
-          envIntensity: 0.32, normalScale: 0.85,
+          color: 0x36383b, roughness: 0.84, metalness: 0.0,
+          wearColor: 0x55504a, wearAlbedo: 0.30, wearRough: 0.68, wearMetal: 0,
+          envIntensity: 0.55, normalScale: 0.85,
         }, { roughnessMap: this.polymerRough, normalMap: this.gloveNormal })
         break
       case 'sleeve':
         mat = this.wearMaterial(key, {
           color: 0xb4b4b4, roughness: 0.94, metalness: 0.0,
           wearColor: 0x8a8574, wearAlbedo: 0.22, wearRough: 0.88, wearMetal: 0,
-          envIntensity: 0.28, normalScale: 0.65,
+          envIntensity: 0.45, normalScale: 0.65,
         }, { map: this.camoAlbedo, roughnessMap: this.polymerRough, normalMap: this.fabricNormal })
         break
       case 'glass':
@@ -845,7 +901,8 @@ export class WeaponMaterials {
           metalness: 0.0,
           transparent: true,
           opacity: key === 'glass' ? 0.10 : 0.16,
-          envMapIntensity: 0.9,
+          envMap: this.env,
+          envMapIntensity: 1.1,
           depthWrite: false,
           side: THREE.DoubleSide,
         })
@@ -1077,18 +1134,18 @@ function tubeBetween(
  * so grazing light breaks across them.
  */
 function addRail(
-  b: PartBuilder, mat: WeaponMatKey, x: number, yBase: number,
+  b: PartBuilder, x: number, yBase: number,
   z0: number, z1: number, width = 0.0212, wear = 0.2,
 ): void {
   const zMin = Math.min(z0, z1)
   const zMax = Math.max(z0, z1)
   const len = zMax - zMin
-  b.box(mat, [width, 0.0042, len], [x, yBase + 0.0021, (zMin + zMax) * 0.5], { c: 0.0006, uv: 40, wear: 0.1 })
+  b.box('rail', [width, 0.0042, len], [x, yBase + 0.0021, (zMin + zMax) * 0.5], { c: 0.0006, uv: 40, wear: 0.1 })
   const pitch = 0.0102
   const count = Math.max(1, Math.floor(len / pitch))
   const start = zMin + (len - count * pitch) * 0.5 + pitch * 0.5
   for (let i = 0; i < count; i++) {
-    b.box(mat, [width, 0.0054, 0.0056], [x, yBase + 0.0068, start + i * pitch], { c: 0.0011, uv: 40, wear })
+    b.box('rail', [width, 0.0054, 0.0056], [x, yBase + 0.0068, start + i * pitch], { c: 0.0011, uv: 40, wear })
   }
 }
 
@@ -1122,7 +1179,7 @@ function addMagazine(b: PartBuilder, o: MagOpts = {}): number {
   const d = o.depth ?? 0.045
   const len = o.sliceLen ?? 0.028
   const curve = o.curve ?? 0.031
-  const body = o.body ?? 'polymer'
+  const body = o.body ?? 'magPolymer'
   const m = new THREE.Matrix4()
   const step = new THREE.Matrix4()
   const rot = new THREE.Matrix4()
@@ -1154,7 +1211,7 @@ function addMagazine(b: PartBuilder, o: MagOpts = {}): number {
   pm.identity()
   for (let k = 0; k < slices; k++) pm.multiply(spin).multiply(new THREE.Matrix4().makeTranslation(0, -len, 0))
   pm.multiply(new THREE.Matrix4().makeTranslation(0, 0.001, 0))
-  b.addGeom('polymer', plate, pm, 0.45, 30)
+  b.addGeom(body, plate, pm, 0.45, 30)
   return lowest
 }
 
@@ -1171,7 +1228,12 @@ export function buildMagDropMesh(mats: WeaponMaterials, o: MagOpts = {}): THREE.
   }
   const geom = mergeChunks(merged)
   geom.center()
-  const mesh = new THREE.Mesh(geom, mats.get(o.body ?? 'polymer'))
+  // The dropped magazine lands in the world scene, so it must not carry the
+  // viewmodel's studio probe. Clearing envMap hands it back to whichever
+  // scene draws it, which is the world sky.
+  const worldMat = (mats.get(o.body ?? 'magPolymer') as THREE.MeshStandardMaterial).clone()
+  worldMat.envMap = null
+  const mesh = new THREE.Mesh(geom, worldMat)
   mesh.castShadow = true
   mesh.receiveShadow = true
   mesh.userData.surface = 'thinMetal'
@@ -1582,7 +1644,7 @@ function buildRifle(mats: WeaponMaterials): WeaponModel {
   b.tube('dark', 0.0036, 0.0036, 0.010, [-0.026, 0.004, -0.424], { axis: 'x', seg: 10, uv: 40 })
 
   // Continuous top rail from the receiver to the handguard front.
-  addRail(b, 'anodised', 0, railBase, -0.440, 0.100)
+  addRail(b, 0, railBase, -0.440, 0.100)
   addFoldedSights(b, railTop, -0.400, 0.062)
 
   // --- muzzle device ------------------------------------------------------
@@ -1693,7 +1755,7 @@ function buildSmg(mats: WeaponMaterials): WeaponModel {
 
   b.into(s.mag)
   s.mag.position.set(0, -0.026, -0.026)
-  addMagazine(b, { slices: 6, width: 0.024, depth: 0.038, sliceLen: 0.027, curve: 0.018, body: 'polymer' })
+  addMagazine(b, { slices: 6, width: 0.024, depth: 0.038, sliceLen: 0.027, curve: 0.018 })
   b.into(root)
 
   // Short barrel and shrouded handguard.
@@ -1702,7 +1764,7 @@ function buildSmg(mats: WeaponMaterials): WeaponModel {
   b.tube('anodised', 0.0268, 0.0268, 0.012, [0, 0, -0.132], { seg: 8, faceted: true, uv: 30, wear: 0.5 })
   addSlots(b, 0.0234, -0.006, -0.262, -0.150, 0.028, 0.012, [0.006, 0.012, 0])
   addSlots(b, -0.0234, -0.006, -0.262, -0.150, 0.028, 0.012, [0.006, 0.012, 0])
-  addRail(b, 'anodised', 0, railBase, -0.270, 0.072, 0.0206)
+  addRail(b, 0, railBase, -0.270, 0.072, 0.0206)
 
   // Angled foregrip.
   b.box('polymer', [0.026, 0.058, 0.034], [0, -0.048, -0.212], { rot: [0.38, 0, 0], c: 0.005, uv: 30, wear: 0.35 })
@@ -1794,7 +1856,7 @@ function buildSniper(mats: WeaponMaterials): WeaponModel {
   b.tube('anodised', 0.0225, 0.0225, 0.230, [0, 0.002, -0.055], { seg: 14, faceted: true, caps: false, uv: 26 })
   b.box('anodised', [0.046, 0.026, 0.230], [0, -0.018, -0.055], { c: 0.003, uv: 26, wear: 0.1 })
   b.box('anodised', [0.038, 0.014, 0.230], [0, 0.0245, -0.055], { c: 0.0025, uv: 30, wear: 0.15 })
-  addRail(b, 'anodised', 0, railBase, -0.170, 0.060, 0.0212)
+  addRail(b, 0, railBase, -0.170, 0.060, 0.0212)
   // Ejection port.
   b.box('dark', [0.007, 0.026, 0.060], [0.0212, 0.008, -0.020], { c: 0.0012, uv: 34 })
 

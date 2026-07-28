@@ -5,9 +5,10 @@ import { ShadowCascade } from './lighting/ShadowCascade'
 import { LightPool, type LightLease } from './lighting/LightPool'
 import { LightShafts } from './lighting/LightShafts'
 import { SkyOcclusion } from './lighting/SkyOcclusion'
+import { AerialPerspective } from './lighting/AerialPerspective'
 import {
   DEFAULT_TIME_OF_DAY, SKY_PARAMS, SKY_SCALE_VISIBLE,
-  luminance, skyColor, sunBeamColor, sunDirectionFor,
+  betaMie, betaRayleigh, luminance, skyColor, sunBeamColor, sunDirectionFor, sunIntensity,
 } from './lighting/SkyModel'
 
 /**
@@ -15,10 +16,12 @@ import {
  *
  * This and HEMISPHERE_INTENSITY together set the single number that decides
  * whether a daylight frame reads as daylight: the ratio between a surface in
- * the sun and the same surface in shade. Hard afternoon sun in a dry climate
- * runs four to five stops, so a mid-albedo wall wants to sit near sRGB 210 lit
- * and near sRGB 65 shaded. Anything flatter packs the whole frame into a
- * midtone band and looks like an overcast render of a sunny scene.
+ * the sun and the same surface in shade. Two and a half to three stops, so a
+ * mid-albedo wall sits near sRGB 210 lit and near sRGB 95 shaded. Flatter and
+ * the whole frame packs into a midtone band and looks like an overcast render
+ * of a sunny scene; wider and the shaded half stops carrying its material,
+ * which is the more expensive failure of the two — a black wall tells you
+ * nothing about what it is made of.
  *
  * The absolute value is scene-referred and is only meaningful next to the post
  * chain's exposure — see SKY_SCALE_VISIBLE in SkyModel for the full
@@ -26,32 +29,66 @@ import {
  * the whole frame.
  */
 const SUN_TARGET_LUMINANCE = 2.1
-/** Sky-bounce fill, deliberately a small fraction of the key. */
-const HEMISPHERE_INTENSITY = 0.075
+/**
+ * Sky-bounce fill, deliberately a small fraction of the key.
+ *
+ * The number that matters is the ratio to SUN_TARGET_LUMINANCE, because that is
+ * the key-to-fill of the whole frame. At 0.075 it was better than sixteen to
+ * one before occlusion and past thirty to one after it, which is a clear
+ * high-altitude sky over black ground — not a dusty street walled in by sunlit
+ * plaster throwing light back at everything. Fill only ever raises the shadow
+ * *midtones*: the darkest pixels in the frame are at the curve's toe and stay
+ * there, so this buys readable texture in shade without touching the black
+ * point.
+ */
+const HEMISPHERE_INTENSITY = 0.135
 
 /**
  * Warm bounce standing in for the light a sunlit floor throws back into a room
  * the sun never reaches. Short range and unshadowed: it is fill, not a key.
  */
 const INTERIOR_FILL_INTENSITY = 5.2
-const INTERIOR_FILL_RANGE = 12
+const INTERIOR_FILL_RANGE = 14
 
 const POOL_SIZE: Record<string, number> = { low: 3, medium: 4, high: 5, ultra: 5 }
-const INTERIOR_FILLS: Record<string, number> = { low: 0, medium: 3, high: 4, ultra: 4 }
 /**
- * Aerial perspective only. Halved from the value that milked out every frame —
- * at the old density a facade sixty metres away was already a tenth of the way
- * to fog colour and the horizon was half gone, which flattens depth instead of
- * describing it.
+ * Kept tight on purpose. Three compiles the point light count into every lit
+ * material and walks the whole array per fragment however many of them are
+ * idling at zero, and this system is not the only one holding a pool — the
+ * effects and AI systems have their own. What was actually broken about
+ * interiors was the allocation below, not the count.
  */
-const FOG_DENSITY: Record<string, number> = { low: 0.0034, medium: 0.0032, high: 0.0030, ultra: 0.0030 }
+const INTERIOR_FILLS: Record<string, number> = { low: 0, medium: 4, high: 5, ultra: 5 }
+
+/**
+ * Fraction of the interior fills a shaft-lit room may take. Sunlit rooms are
+ * the pretty ones and sort to the front, but they are also the rooms that least
+ * need help; leaving them the whole budget is what left every unlit interior a
+ * black void. See `placeInteriorFills`.
+ */
+const LIT_ROOM_FILL_SHARE = 0.4
+
+/**
+ * Residual `FogExp2` density.
+ *
+ * Distance haze on the lit world is done properly by {@link AerialPerspective},
+ * which replaces this fog wholesale on every material the cascade registers.
+ * `scene.fog` stays set for two reasons: it is what turns on the `USE_FOG`
+ * define and the view-depth varying that pass is built on, and unlit extras —
+ * particle cards, decals — still want *some* distance cue. Small, because a
+ * squared-exponential is the wrong curve and this is only its remainder.
+ */
+const RESIDUAL_FOG_DENSITY = 0.0016
 
 /**
  * Fog radiance rolls off towards this rather than being hard-clipped, so haze
  * into a low sun stays visibly brighter and warmer than haze away from it
- * instead of both landing on the same near-white.
+ * instead of both landing on the same near-white. Kept equal to the aerial
+ * pass's own ceiling so `fogColor`, which this system advertises as the current
+ * haze colour and the particle shaders read, is the colour the world is
+ * actually fading towards.
  */
-const FOG_ROLLOFF = 0.44
+const FOG_ROLLOFF = 0.26
 
 /**
  * Sun, sky, image-based ambient, the shadow cascade, volumetric shafts and the
@@ -89,8 +126,9 @@ export class LightingSystem implements System, LightingService {
   private pool!: LightPool
   private shafts!: LightShafts
   private readonly occlusion = new SkyOcclusion()
+  private readonly aerial = new AerialPerspective()
   private hemisphere = new THREE.HemisphereLight(0x9dbdea, 0x6a5c46, HEMISPHERE_INTENSITY)
-  private fog = new THREE.FogExp2(0xb9c9d8, 0.0055)
+  private fog = new THREE.FogExp2(0xb9c9d8, RESIDUAL_FOG_DENSITY)
   private interiorFills: THREE.PointLight[] = []
 
   private ctx!: GameContext
@@ -99,7 +137,6 @@ export class LightingSystem implements System, LightingService {
   private shaftsDirty = true
   private frames = 0
   private indoorBlend = 0
-  private baseFogDensity = 0.0055
   private projScale = 600
   private viewportHeight = 1080
 
@@ -113,7 +150,8 @@ export class LightingSystem implements System, LightingService {
   private readonly tmpDir = new THREE.Vector3()
   private readonly tmpDir2 = new THREE.Vector3()
   private readonly tmpVec = new THREE.Vector3()
-  private readonly tmpQuat = new THREE.Quaternion()
+  private readonly tmpBetaR = new THREE.Vector3()
+  private readonly tmpBetaM = new THREE.Vector3()
 
   init(ctx: GameContext): void {
     this.ctx = ctx
@@ -125,8 +163,7 @@ export class LightingSystem implements System, LightingService {
     scene.add(this.sky.sunSource)
     scene.add(this.hemisphere)
 
-    this.baseFogDensity = FOG_DENSITY[config.quality] ?? FOG_DENSITY.high
-    this.fog.density = this.baseFogDensity
+    this.fog.density = RESIDUAL_FOG_DENSITY
     this.fog.color.copy(this.fogColor)
     scene.fog = this.fog
 
@@ -142,8 +179,9 @@ export class LightingSystem implements System, LightingService {
     )
     this.cascade.setColor(this.sunTint, this.sun.intensity)
     // The cascade's sweep is the only pass that sees every lit world material,
-    // so the occlusion term rides on it rather than traversing the scene again.
-    this.cascade.materialHook = this.occlusion.patch
+    // so both shading terms that have to touch all of them ride on it rather
+    // than traversing the scene again.
+    this.cascade.materialHook = this.patchWorldMaterial
 
     this.pool = new LightPool(scene, POOL_SIZE[config.quality] ?? 4)
     this.shafts = new LightShafts(scene)
@@ -198,6 +236,16 @@ export class LightingSystem implements System, LightingService {
     this.sun.target.position.set(0, 0, 0)
 
     this.sky.setSun(this.sunDirection, this.sunTint)
+    // The haze evaluates the same Preetham model per fragment, so it is fed the
+    // same inputs the dome is: distance must fade towards the sky it is fading
+    // into, not towards a colour sampled somewhere else.
+    this.aerial.setSun(
+      betaRayleigh(SKY_PARAMS, this.tmpBetaR),
+      betaMie(SKY_PARAMS, this.tmpBetaM),
+      this.sunDirection,
+      sunIntensity(this.sunDirection.y),
+      SKY_PARAMS.mieDirectionalG,
+    )
 
     // Ambient tint: the sky roughly opposite the sun, which is what actually
     // fills a shadow. Normalised so intensity alone controls its strength.
@@ -269,10 +317,11 @@ export class LightingSystem implements System, LightingService {
     const indoors = ctx.services.level?.isIndoors(this.tmpVec) ?? false
     const target = indoors ? 1 : 0
     this.indoorBlend += (target - this.indoorBlend) * Math.min(1, dt * 3)
+    // A room has a few metres of air across it, not ninety. Outdoor haze on an
+    // interior greys out a space that should read as crisp and close.
+    this.aerial.setStrength(THREE.MathUtils.lerp(1, 0.16, this.indoorBlend))
     if (ctx.scene.fog instanceof THREE.FogExp2) {
-      // Interiors have far less air between the camera and the far wall; the
-      // outdoor density would grey out a room that should read as crisp.
-      ctx.scene.fog.density = this.baseFogDensity * THREE.MathUtils.lerp(1, 0.3, this.indoorBlend)
+      ctx.scene.fog.density = RESIDUAL_FOG_DENSITY * THREE.MathUtils.lerp(1, 0.3, this.indoorBlend)
       ctx.scene.fog.color.copy(this.fogColor)
     } else if (ctx.scene.fog === null) {
       ctx.scene.fog = this.fog
@@ -326,21 +375,29 @@ export class LightingSystem implements System, LightingService {
   /**
    * Rooms the sun reaches get their fill under the shaft, which is where the
    * bounce actually comes from. Rooms it does not reach still need something,
-   * or cutting the ambient by the occlusion term leaves them black — so the
-   * remaining fills go to the darkest interiors the occlusion bake found.
+   * or cutting the ambient by the occlusion term leaves them black.
+   *
+   * Sunlit rooms sort first and used to be handed the entire budget, which is
+   * backwards: they are the rooms that least need help, and on a level with
+   * more shafts than fills every unlit interior got nothing at all — the black
+   * void the `interior` pose has been showing. So the shaft-lit rooms are
+   * capped at a share of the slots and the rest are reserved for the darkest
+   * interiors the occlusion bake found, whether or not any are needed.
    */
   private placeInteriorFills(): void {
     const lit = this.shafts.fillPoints
     const dark = this.occlusion.interiorPoints
+    const total = this.interiorFills.length
+    const litBudget = dark.length === 0 ? total : Math.floor(total * LIT_ROOM_FILL_SHARE)
     let slot = 0
 
-    for (let i = 0; i < lit.length && slot < this.interiorFills.length; i++, slot++) {
+    for (let i = 0; i < lit.length && slot < litBudget; i++, slot++) {
       const fill = this.interiorFills[slot]
       fill.position.copy(lit[i])
       fill.intensity = INTERIOR_FILL_INTENSITY
     }
 
-    for (let i = 0; i < dark.length && slot < this.interiorFills.length; i++) {
+    for (let i = 0; i < dark.length && slot < total; i++) {
       const point = dark[i]
       let crowded = false
       for (let j = 0; j < slot; j++) {
@@ -351,10 +408,18 @@ export class LightingSystem implements System, LightingService {
       fill.position.copy(point)
       // Unlit rooms have no sunlit floor patch to bounce off, only skylight
       // through whatever opening they have, so they get rather less.
-      fill.intensity = INTERIOR_FILL_INTENSITY * 0.62
+      fill.intensity = INTERIOR_FILL_INTENSITY * 0.75
     }
 
-    for (; slot < this.interiorFills.length; slot++) this.interiorFills[slot].intensity = 0
+    // Anything the dark rooms did not claim goes back to the lit ones rather
+    // than idling at zero.
+    for (let i = litBudget; i < lit.length && slot < total; i++, slot++) {
+      const fill = this.interiorFills[slot]
+      fill.position.copy(lit[i])
+      fill.intensity = INTERIOR_FILL_INTENSITY
+    }
+
+    for (; slot < total; slot++) this.interiorFills[slot].intensity = 0
   }
 
   private buildInteriorFills(scene: THREE.Scene, count: number): void {
@@ -367,6 +432,19 @@ export class LightingSystem implements System, LightingService {
       scene.add(light)
       this.interiorFills.push(light)
     }
+  }
+
+  /**
+   * Every shading term this system adds to the lit world, in one hook.
+   *
+   * Bound once, so nothing here runs per frame — `onBeforeCompile` fires only
+   * when a material is first registered or invalidated.
+   */
+  private readonly patchWorldMaterial = (
+    shader: { vertexShader: string; fragmentShader: string; uniforms: Record<string, THREE.IUniform> },
+  ): void => {
+    this.occlusion.patch(shader)
+    this.aerial.patch(shader)
   }
 
   // --- Viewmodel -----------------------------------------------------------
@@ -409,10 +487,20 @@ export class LightingSystem implements System, LightingService {
     this.pool.flash(position, color, intensity, distance, duration, priority)
   }
 
+  /**
+   * A muzzle flash is a hand-sized emitter, but a point light with inverse
+   * square falloff standing thirty centimetres off the barrel treats it as
+   * infinitesimal, and irradiance thirty centimetres from an infinitesimal
+   * source is unbounded. At the old figures anything within arm's reach took
+   * fifty times the sun and clipped flat white — silhouette, material and all.
+   * Pushing the light out past the muzzle and trimming the peak keeps the punch
+   * at the two to four metres a flash is actually read at, without a
+   * singularity sitting on the shooter's own chest.
+   */
   private onWeaponFired = (e: { origin: THREE.Vector3; direction: THREE.Vector3; loud: boolean }): void => {
     const strength = e.loud ? 1 : 0.35
-    this.tmpVec.copy(e.origin).addScaledVector(e.direction, 0.3)
-    this.pool.flash(this.tmpVec, this.muzzleColor, 26 * strength, 16, 0.06, 2)
+    this.tmpVec.copy(e.origin).addScaledVector(e.direction, 0.6)
+    this.pool.flash(this.tmpVec, this.muzzleColor, 11 * strength, 16, 0.05, 2)
   }
 
   private onExplosion = (e: { point: THREE.Vector3; radius: number }): void => {
