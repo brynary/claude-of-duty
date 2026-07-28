@@ -131,6 +131,7 @@ export class TelemetrySystem implements System {
   private damageTaken = 0
   private reloads = 0
   private dryFires = 0
+  private lastDryFireAt = -99
   private weaponSwaps = 0
 
   private tracks = new Map<number, EnemyTrack>()
@@ -157,13 +158,22 @@ export class TelemetrySystem implements System {
     e.on('weapon:fired', () => {
       this.shotsFired++
       this.bucket.shotsFired++
-      for (const track of this.tracks.values()) {
-        if (track.engagement) track.engagement.playerShotsFired++
-      }
+      // Attribute the shot to one engagement, not all of them. Crediting every
+      // open engagement made per-engagement accuracy exceed 100%.
+      const eng = this.nearestOpenEngagement()
+      if (eng) eng.playerShotsFired++
     })
 
     e.on('weapon:reload', (p) => { if (p.phase === 'start') this.reloads++ })
-    e.on('weapon:dryFire', () => this.dryFires++)
+
+    // Holding the trigger on an empty magazine emits one event per attempted
+    // shot, so counting them raw produced more dry fires than reloads. What
+    // matters is how many separate times the player ran the magazine out
+    // mid-fight, so episodes are debounced.
+    e.on('weapon:dryFire', () => {
+      if (this.t - this.lastDryFireAt > 0.4) this.dryFires++
+      this.lastDryFireAt = this.t
+    })
     e.on('weapon:switch', () => this.weaponSwaps++)
 
     e.on('damage:dealt', (p) => {
@@ -344,9 +354,20 @@ export class TelemetrySystem implements System {
     return n
   }
 
+  /**
+   * How long the player has been able to see this enemy during the *current*
+   * contact. Null means the attacker was never in view, which is the signature
+   * of a death the player could not have anticipated.
+   *
+   * This deliberately measures the enemy's current contact rather than the
+   * first one it ever made: an enemy that acquired the player twenty seconds
+   * ago, lost them and re-acquired is not an attacker the player has been
+   * watching for twenty seconds.
+   */
   private awarenessDuration(id: number): number | null {
     const track = this.tracks.get(id)
-    return track?.contactAt === null || track?.contactAt === undefined ? null : this.t - track.contactAt
+    if (!track || track.contactAt === null) return null
+    return this.t - track.contactAt
   }
 
   private nearestContactEnemy(): Damageable | null {
