@@ -22,6 +22,7 @@ export type Surface =
   | 'fabric'
   | 'plaster'
   | 'tile'
+  | 'rubber'
   | 'foliage'
 
 export type Team = 'player' | 'enemy'
