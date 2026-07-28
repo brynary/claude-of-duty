@@ -24,8 +24,11 @@ export class Engine {
   private running = false
   private lastTime = 0
   private frameId = 0
-  /** Physics and other stability-sensitive work step at this fixed rate. */
-  readonly fixedStep = 1 / 120
+  /**
+   * Physics and other stability-sensitive work step at this rate, and the whole
+   * simulation does when `config.fixedStep` is set.
+   */
+  readonly fixedStep = 1 / 60
 
   /** Rolling average frame time in ms, for the stats overlay. */
   frameMs = 0
@@ -120,9 +123,28 @@ export class Engine {
 
     // Clamp so a background tab or a long GC pause cannot tunnel the player
     // through the world when the tab regains focus.
-    const rawDt = Math.min((now - this.lastTime) / 1000, 0.1)
+    // A fixed step makes a run a pure function of its seed and input log. Real
+    // frame times vary with machine load, and a physics-driven game diverges
+    // from a different dt within a second or two, so telemetry gathered under
+    // variable timing is not comparable between builds.
+    const rawDt = this.config.fixedStep
+      ? this.fixedStep
+      : Math.min((now - this.lastTime) / 1000, 0.1)
     this.lastTime = now
+    this.tick(rawDt, now)
+  }
 
+  /**
+   * One simulated frame. Split out from the rAF loop so the play harness can
+   * drive the simulation as fast as the machine allows: presenting at display
+   * rate makes a ninety-second scripted run take ninety seconds of wall clock,
+   * which is far too slow to sweep a matrix of scenarios and skill profiles.
+   */
+  step(times = 1): void {
+    for (let i = 0; i < times; i++) this.tick(this.fixedStep, performance.now(), true)
+  }
+
+  private tick(rawDt: number, now: number, headless = false): void {
     const frozen = this.config.freezeAt !== null && this.ctx.elapsed >= this.config.freezeAt
     const dt = frozen ? 0 : rawDt
 
@@ -132,18 +154,25 @@ export class Engine {
     for (const s of this.systems) s.update?.(dt, this.ctx)
     for (const s of this.systems) s.lateUpdate?.(dt, this.ctx)
 
-    const postfx = this.ctx.services.postfx
-    if (postfx) {
-      postfx.render(rawDt)
-    } else {
-      this.renderer.render(this.scene, this.camera)
+    // A headless run still renders periodically: shaders, the shadow cascade
+    // and the light probes all run on the render path, and skipping it entirely
+    // would measure a game nobody is playing. Once every eight frames keeps
+    // that machinery live at a fraction of the cost.
+    const shouldRender = !headless || this.frames % 8 === 0
+    if (shouldRender) {
+      const postfx = this.ctx.services.postfx
+      if (postfx) postfx.render(rawDt)
+      else this.renderer.render(this.scene, this.camera)
     }
+    this.frames++
 
     this.input.endFrame()
     this.frameMs += (performance.now() - now - this.frameMs) * 0.1
 
     if (frozen) this.markCaptureReady()
   }
+
+  private frames = 0
 
   /**
    * The screenshot harness polls `window.__captureReady`. It is only set once

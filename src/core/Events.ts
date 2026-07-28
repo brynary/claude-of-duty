@@ -25,6 +25,19 @@ export interface GameEvents {
 
   'fx:explosion': { point: THREE.Vector3; radius: number; damage: number }
 
+  /**
+   * Perception and combat events from the AI, emitted so that reaction times
+   * can be measured rather than estimated. `ai:contact` fires on the rising
+   * edge of a soldier acquiring the player; `ai:engaged` on its first shot at
+   * them. The gap between the two is the reaction time the feel target
+   * constrains, so both must keep firing exactly once per transition.
+   */
+  'ai:contact': { id: number; position: THREE.Vector3; distance: number }
+  'ai:lostContact': { id: number; heldFor: number }
+  'ai:engaged': { id: number; distance: number; sinceContact: number }
+  'ai:shot': { id: number; distance: number; aimErrorDeg: number; willHit: boolean }
+  'ai:state': { id: number; from: string; to: string }
+
   'game:pause': { paused: boolean }
   'game:started': Record<string, never>
   'quality:changed': { level: string }

@@ -49,6 +49,26 @@ export interface Config {
   seed: number
   /** Show the frame-time / draw-call overlay. */
   stats: boolean
+
+  // --- Play harness ---
+  /**
+   * Name of a scripted scenario to run instead of taking human input. The
+   * synthetic player in PlayBot drives the ordinary Input surface, so the real
+   * controller, weapons and AI all run exactly as they do for a person.
+   */
+  bot: string | null
+  /** Skill profile for the synthetic player. */
+  botSkill: string
+  /**
+   * Advance the simulation by a fixed timestep regardless of wall clock. Real
+   * frame times make a run unreproducible; this makes a seed plus an input log
+   * replay identically.
+   */
+  fixedStep: boolean
+  /** Simulated seconds to run before reporting telemetry and stopping. */
+  runSeconds: number
+  /** Record the per-frame input stream for deterministic replay. */
+  record: boolean
 }
 
 const PRESETS: Record<QualityLevel, Partial<Config>> = {
@@ -116,6 +136,11 @@ export function createConfig(search = globalThis.location?.search ?? ''): Config
     autoStart: q.get('autostart') === '1' || q.has('pose'),
     seed: q.has('seed') ? Number(q.get('seed')) : 1337,
     stats: q.get('stats') === '1',
+    bot: q.get('bot'),
+    botSkill: q.get('skill') ?? 'average',
+    fixedStep: q.get('fixed') === '1' || q.has('bot'),
+    runSeconds: q.has('run') ? Number(q.get('run')) : 60,
+    record: q.get('record') === '1',
   }
 
   Object.assign(base, PRESETS[quality] ?? PRESETS.ultra)

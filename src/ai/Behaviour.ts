@@ -231,9 +231,47 @@ export class Behaviour {
       this.lostTime += dt
       if (this.lostTime > 1.2) this.contactTime = 0
     }
+    const had = this.hasContact
     this.hasContact = this.losClear && this.awareness > 0.55
     if (this.awareness > 0.6) this.alerted = true
     else if (this.awareness <= 0.02 && this.lostTime > 12) this.alerted = false
+
+    // Contact transitions are emitted so the play harness can measure reaction
+    // time — the gap between a soldier acquiring the player and firing — rather
+    // than estimate it. Both edges must fire exactly once per transition.
+    if (this.hasContact !== had) {
+      const p = this.d.ctx.services.player
+      const dist = p ? this.soldier.position.distanceTo(p.eye) : 0
+      if (this.hasContact) {
+        this.contactAt = this.d.ctx.elapsed
+        this.firedSinceContact = false
+        this.d.ctx.events.emit('ai:contact', {
+          id: this.soldier.id,
+          position: this.soldier.position.clone(),
+          distance: dist,
+        })
+      } else {
+        this.d.ctx.events.emit('ai:lostContact', {
+          id: this.soldier.id,
+          heldFor: this.contactAt > 0 ? this.d.ctx.elapsed - this.contactAt : 0,
+        })
+      }
+    }
+  }
+
+  /** Wall-clock time of the current contact, for reaction-time measurement. */
+  private contactAt = 0
+  private firedSinceContact = false
+
+  /** Called by the firing path on the first shot of each contact. */
+  protected noteShot(distance: number): void {
+    if (this.firedSinceContact) return
+    this.firedSinceContact = true
+    this.d.ctx.events.emit('ai:engaged', {
+      id: this.soldier.id,
+      distance,
+      sinceContact: this.contactAt > 0 ? this.d.ctx.elapsed - this.contactAt : 0,
+    })
   }
 
   /** Gunfire and explosions; effect falls off with distance. */
@@ -443,6 +481,7 @@ export class Behaviour {
     T1.y += 0.95
     T2.copy(T1).sub(s.muzzleWorld)
     const dist = T2.length() || 1
+    this.noteShot(dist)
     T2.divideScalar(dist)
     T3.set(-T2.z, 0, T2.x).normalize()
     T4.crossVectors(T2, T3).normalize()
