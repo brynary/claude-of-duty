@@ -12,9 +12,13 @@ import { HudSystem } from './ui/HudSystem'
 import { PostFxSystem } from './render/PostFX'
 
 /**
- * Registration order is update order. Physics settles before the player reads
- * the world; the player moves before weapons and the viewmodel key off the
- * camera; post-processing renders last.
+ * Registration order is both init order and update order, so a system is
+ * registered before anything that resolves it through `ctx.services`:
+ * materials and physics underpin the level; fx and audio must exist before
+ * weapons and AI call into them; post-processing renders last.
+ *
+ * Effects updating a frame before their emitters costs one frame of latency,
+ * which is invisible, and buys a dependency order that is always satisfied.
  */
 async function boot(): Promise<void> {
   const container = document.getElementById('app')!
@@ -24,12 +28,12 @@ async function boot(): Promise<void> {
     .add(new MaterialSystem())
     .add(new PhysicsSystem())
     .add(new LightingSystem())
+    .add(new FxSystem())
+    .add(new AudioSystem())
     .add(new LevelSystem())
     .add(new PlayerSystem())
     .add(new AiSystem())
     .add(new WeaponSystem())
-    .add(new FxSystem())
-    .add(new AudioSystem())
     .add(new HudSystem())
     .add(new PostFxSystem())
 
