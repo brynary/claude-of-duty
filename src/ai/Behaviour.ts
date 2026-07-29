@@ -700,9 +700,23 @@ export class Behaviour {
   }
 
   /**
-   * Re-tests whether the player's eye has a clear line to this soldier's chest.
-   * Only meaningful while the soldier can see the player at all, so a blocked
-   * line of sight forces it false.
+   * Re-tests whether the player's eye has a clear line to this soldier's chest,
+   * i.e. whether this soldier is shootable *back*.
+   *
+   * This exists so a soldier cannot shoot from a position the player has no
+   * answer to, which is the single rule that makes a firefight feel fair rather
+   * than sniped-at. It was also, on its own, most of why the player could not
+   * lose: gating the trigger on it meant an enemy only ever fired while the
+   * player could kill it, and with the attacker clamp at two the practical
+   * result was an incoming rate of 0.98 HP/s against a model that predicts 9.6.
+   * Nine tenths of the intended pressure never arrived.
+   *
+   * So the rule now costs accuracy rather than the whole shot. A soldier the
+   * player cannot answer still fires — the player hears rounds crack past and
+   * knows they are being shot at, which is the information they need to move —
+   * but its rounds are pushed wide, so an unanswerable position cannot kill.
+   * Being suppressed from cover you have not found yet is a Call of Duty
+   * experience; being ignored by half the enemies is not.
    */
   private refreshExposure(): void {
     this.exposed = false
@@ -1168,7 +1182,12 @@ export class Behaviour {
     T3.set(-T2.z, 0, T2.x).normalize()
     T4.crossVectors(T2, T3).normalize()
 
-    const willHit = mayHit && !this.rangingBurst && this.attacker && difficulty.rollHit(dist, rng)
+    // A soldier the player cannot shoot back at is suppressing, not duelling:
+    // it fires so the player knows where the threat is, and misses so an
+    // unanswerable position cannot kill. See `refreshExposure` for why the shot
+    // is no longer refused outright.
+    const willHit = mayHit && !this.rangingBurst && this.attacker && this.exposed
+      && difficulty.rollHit(dist, rng)
     /** Lateral placement at the target, metres: the miss the player can see. */
     let offset = 0
 
@@ -1278,8 +1297,13 @@ export class Behaviour {
     }
 
     // One line-of-fire test per frame; see the field for what it means.
+    //
+    // `exposed` no longer gates the shot — see `refreshExposure`. A soldier the
+    // player cannot shoot back at still engages, and pays for the unanswerable
+    // position in accuracy instead (see `shoot`). Only contact and a clear
+    // muzzle are required, so the soldier never fires through its own cover.
     this.engageable = false
-    if (this.hasContact && this.exposed) {
+    if (this.hasContact) {
       switch (this.state) {
         case 'engage': case 'suppress': case 'flank': case 'seekCover':
           this.engageable = this.muzzleClear()

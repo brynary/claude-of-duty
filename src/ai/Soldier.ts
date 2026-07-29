@@ -14,8 +14,29 @@ const UP = new THREE.Vector3(0, 1, 0)
 const DOWN = new THREE.Vector3(0, -1, 0)
 
 /** Damage multiplier per body region. A head hit ends a soldier outright. */
+/**
+ * Hitbox damage multipliers, §2.4 `[measured]`.
+ *
+ * The researched spread for modern titles is head 1.1-1.5 (BO6 nerfed the XM4
+ * from 1.3 to 1.15), upper torso 1.0-1.1, lower torso 0.9-0.98, arms 0.98-1.0.
+ * These were 4.6 / 1.15 / 1.0 / 0.68 / 0.62 — a headshot three to four times
+ * stronger than any shipped Call of Duty, and limbs far weaker.
+ *
+ * The 4.6 head figure made a headshot a one-shot kill at 119.6 damage against
+ * 100 HP, which sounds generous and is the opposite: it removes the interesting
+ * case. A 1.35 multiplier puts a headshot at 35.1, which drops shots-to-kill
+ * from 4 to 3 — the player who aims high kills 77ms faster and can feel it,
+ * rather than the exchange being decided by whether one round happened to
+ * clip a 12.5cm ball.
+ *
+ * Limbs at 1.24 damage under the 0.9 lower-torso figure matter for the opposite
+ * reason: at 0.62 a limb hit was so weak that spraying at a running target was
+ * hopeless, so the only viable play was to wait for a clean torso shot. Nearer
+ * parity keeps a hurried burst worth taking while still rewarding the better
+ * one.
+ */
 const REGION_MULT: Record<HitRegion, number> = {
-  head: 4.6, chest: 1.15, stomach: 1.0, arm: 0.68, leg: 0.62,
+  head: 1.35, chest: 1.1, stomach: 0.95, arm: 0.98, leg: 0.9,
 }
 
 interface HitboxDef {
