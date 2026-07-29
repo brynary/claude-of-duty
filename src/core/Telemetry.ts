@@ -120,6 +120,8 @@ interface EnemyTrack {
   everEngagedAt: number | null
   firstShotAt: number | null
   firstPlayerHitAt: number | null
+  /** Most recent damaging hit, so an interrupted duel can be detected. */
+  lastPlayerHitAt: number
   engagement: Engagement | null
 }
 
@@ -193,7 +195,15 @@ export class TelemetrySystem implements System {
       if (head) this.headshots++
 
       const track = this.track(p.target.id)
-      if (track.firstPlayerHitAt === null) track.firstPlayerHitAt = this.t
+      // Kill duration measures a duel, so a gap long enough to be a separate
+      // exchange restarts the clock. Without this, wounding an enemy, breaking
+      // contact for twenty seconds and returning to finish it reported as a
+      // 21.8s kill — a number that reads as an enemy soaking a magazine when
+      // the median kill in the same run was 0.60s.
+      if (track.firstPlayerHitAt === null || this.t - track.lastPlayerHitAt > 3) {
+        track.firstPlayerHitAt = this.t
+      }
+      track.lastPlayerHitAt = this.t
       const eng = this.openEngagement(track, p.target)
       eng.playerHits++
       if (head) eng.playerHeadshots++
@@ -336,7 +346,7 @@ export class TelemetrySystem implements System {
   private track(id: number): EnemyTrack {
     let t = this.tracks.get(id)
     if (!t) {
-      t = { id, contactAt: null, lostContactAt: null, everEngagedAt: null, firstShotAt: null, firstPlayerHitAt: null, engagement: null }
+      t = { id, contactAt: null, lostContactAt: null, everEngagedAt: null, firstShotAt: null, firstPlayerHitAt: null, lastPlayerHitAt: -99, engagement: null }
       this.tracks.set(id, t)
     }
     return t

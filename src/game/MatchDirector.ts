@@ -2,7 +2,7 @@ import type { Damageable, GameContext, System } from '../core/Types'
 import { callsign } from './Callsigns'
 import {
   DEFAULT_LIVES, MULTI_LABEL, SCORE, SPAWN_FAIL_LIMIT, SPAWN_RETRY, STALE_AFTER,
-  WAVE_SETTLE, WAVE_STALL, WAVES, type WaveDef,
+  tailFloor, WAVE_SETTLE, WAVE_STALL, WAVES, type WaveDef,
 } from './MatchDefs'
 import { setMatchService, type Award, type MatchService, type MatchState, type MatchSummary } from './Match'
 
@@ -65,14 +65,40 @@ interface Reinforcer {
  * reason: the budget was `max(opening, size - standing)`, so the same stragglers
  * that used to hold a wave open were now *shrinking* the next one. Wave one
  * spent its whole budget on its opening beat and then had nothing to send for
- * half a minute while the player worked the field down to nothing. Both measured
- * runs contain a ten-second stretch with no hostile alive anywhere.
+ * half a minute while the player worked the field down to nothing.
  *
  * So the two columns are separated. `size` is taken flat and decides how long a
  * wave runs; `concurrent` is checked on every beat and decides how many are in
  * the fight while it does. Nothing here derives one from the other, and nothing
  * derives either from how badly the AI is pathing.
  *
+ * ## A wave ends when the push breaks, not when the plaza empties
+ *
+ * The third thing, and the one the graded runs are loudest about. Separating the
+ * columns fixed the middle of a wave and left its ending alone, and the ending
+ * is most of it: a wave that waits for the last participant to fall spends
+ * `concurrent / killRate` — twenty-two seconds at the measured 0.27 kills/s —
+ * watching the field thin, against seven seconds of holding it. The hold run's
+ * three waves measured 2.93, 1.03 and 2.53 hostiles in contact; the 1.03 is a
+ * thirteen-second stretch of two hostiles standing somewhere unreachable while
+ * the objective line still read WAVE 2 — 02 LEFT.
+ *
+ * Three rules, and between them they are the change:
+ *
+ * 1. **{@link tailFloor}.** The wave is over when its budget is spent and the
+ *    field has fallen to half its `concurrent`. Whoever is left stays standing.
+ * 2. **The break survives them.** A break used to be cancelled the instant
+ *    anybody held contact, which under rule 1 would mean no break ever ran. It
+ *    now runs its scheduled length with the survivors on the field, so the
+ *    REGROUP banner and its countdown sit over a mop-up rather than a vacuum.
+ * 3. **The opening wave counts the field it opens onto.** `AiSystem` seeds five
+ *    soldiers before the match starts and `size` is flat, so wave one fielded
+ *    thirteen bodies against wave two's ten — which is why the arc measured
+ *    inverted. Only the wave the match opens on does this; on any later wave the
+ *    standing field is stragglers, and discounting those is the mistake that was
+ *    removed from every wave.
+ *
+
  * ## Everything is correct mid-wave
  *
  * A scripted run is a fixed number of simulated seconds and is cut off wherever
@@ -127,10 +153,17 @@ export class MatchDirector implements System, MatchService {
   /**
    * Wave the match opens on, from `?wave=N`.
    *
-   * A ninety-second run reaches the middle of wave three, so the top of the
-   * escalation is unmeasurable by default. This makes any wave reachable
-   * directly, so late-game pressure can be measured on the same length of run
-   * as the early game. Zero-based internally, one-based in the URL.
+   * A ninety-second run reaches waves one and two and the opening of three, so
+   * the top of the escalation is unmeasurable by default and always will be —
+   * six waves that each hold a field for twenty-five to fifty seconds do not fit
+   * in ninety. **This is the only way to measure the arc**, and the rows are now
+   * far enough apart to be worth measuring: replayed one at a time, mean hostiles
+   * in contact runs 2.06 at wave one to 3.19 at wave six. Zero-based internally,
+   * one-based in the URL.
+   *
+   * The opening-wave roster discount applies to whichever wave this names, which
+   * is right: `AiSystem` seeds the plaza before the match starts whatever wave the
+   * match starts on.
    */
   private startWave = 0
 
@@ -141,25 +174,49 @@ export class MatchDirector implements System, MatchService {
   /** Of that budget, how many are still to be sent. */
   private remainingToSpawn = 0
   /**
-   * Set by `beginWave`, cleared by the first beat that runs, and the reason the
-   * announced wave size is trustworthy.
+   * Set by `beginWave`, cleared by the first beat that runs, and the reason both
+   * the announced wave size and the opening wave's budget are trustworthy.
    *
    * `beginWave` is reached from the `game:started` event, which the HUD emits
    * from its own update; the AI seeds the level from *its* update. So on the
    * frame the match opens, the field the director can see may or may not contain
    * the AI's five soldiers, depending on which ran first — and it read empty in
-   * both measured runs. While the budget was derived from that field this race
-   * silently set wave one's size; now it only reaches the number on the HUD, and
-   * the first beat corrects it. `update` returns early on `dt <= 0`, so a beat
-   * only runs on a frame where the AI has already spawned.
+   * both graded runs. `update` returns early on `dt <= 0`, and `AiSystem` is
+   * registered ahead of this system, so by the first beat the seed is on the
+   * field and readable. Both the roster discount for the opening wave and the
+   * announced size are therefore settled there rather than in `beginWave`.
    */
   private budgetPending = false
+  /**
+   * True until the first wave of the match has taken its opening beat. That beat
+   * is the one that counts the standing field against the roster; see rule 3 in
+   * the class header.
+   */
+  private openingWave = true
   /** Match time of the next reinforcement beat. */
   private nextBeatAt = 0
   /** Beats delivered this wave; the first one is the opening squad. */
   private beatsSent = 0
   private spawnFails = 0
-  /** When the field last emptied of participants; -1 while the fight is live. */
+  /**
+   * Most live bodies this match has ever held at once.
+   *
+   * `AiSystem` will not exceed its own `MAX_LIVE`, which counts bodies while
+   * `concurrent` counts participants, so the two disagree by exactly the stale
+   * stragglers — and a wave can be refused a slot it is entitled to. This is how
+   * `deploy` tells that refusal apart from a blocked spawn point without
+   * duplicating another system's constant: a refusal while the field is as full
+   * as it has ever been is the cap. It is self-calibrating and cannot drift out
+   * of step with `MAX_LIVE` the way a copy of the number would.
+   *
+   * Written only from a successful `deploy`, so it is measured in the same
+   * quantity the refusal test reads — `ai.enemies.length` — and cannot be pushed
+   * a body high by a corpse awaiting retirement.
+   */
+  private bodyPeak = 0
+  /** Live bodies at the last scan, whether they are in the fight or not. */
+  private liveCount = 0
+  /** When the field last fell to the tail floor; -1 while the push is live. */
   private settleAt = -1
   /** Set when a wave was written off by the stall backstop rather than fought. */
   private stalled = false
@@ -314,6 +371,9 @@ export class MatchDirector implements System, MatchService {
     this.lastSummary = null
     this.inContact.clear()
     this.activeAt.clear()
+    this.bodyPeak = 0
+    this.liveCount = 0
+    this.openingWave = true
     this.beginWave(this.startWave)
   }
 
@@ -385,7 +445,13 @@ export class MatchDirector implements System, MatchService {
     s.elapsed = this.t
 
     const active = this.countParticipating()
-    s.hostilesLeft = active + this.remainingToSpawn
+    // Bodies, not participants. This number is read straight onto the objective
+    // line, and a participation count there can *rise* — a straggler that
+    // reacquires the player rejoins the fight and the counter goes up, which is
+    // worse than a counter that stalls. Bodies plus undelivered roster only ever
+    // falls within a wave, and every one of them is something the player can
+    // shoot.
+    s.hostilesLeft = this.liveCount + this.remainingToSpawn
 
     // Contact is a level, and the events that carry it are edges, so hold the
     // combat clock open for as long as anybody is holding the player. Without
@@ -394,22 +460,31 @@ export class MatchDirector implements System, MatchService {
     // write off a wave the player was in the middle of.
     if (this.inContact.size > 0) this.lastCombatAt = this.t
 
+    const def = WAVES[this.waveIndex]
+    const floor = tailFloor(def)
+
     if (s.phase === 'break') {
       s.breakLeft = Math.max(0, s.breakLeft - dt)
-      // A hostile *fighting* during a break means something else is spawning,
-      // or a straggler has finally found the player. Either way, sitting in a
-      // "break" while being shot at is worse than starting the wave early.
+      // The break runs its scheduled length, with no way to cut it short.
       //
-      // The test is contact, not `alive > 0`. It used to be the latter, and
-      // that is how a wave that ended with two hostiles standing somewhere
-      // unreachable skipped its entire scheduled break: `alive` was still two
-      // on the first frame of the break, so the next wave opened on the same
-      // frame the last one closed and the pacing beat never existed.
-      if (s.breakLeft <= 0 || this.inContact.size > 0) this.beginWave(this.waveIndex + 1)
+      // It used to be cancelled by `alive > 0`, which skipped the break entirely
+      // whenever a wave ended with a straggler standing; that was narrowed to
+      // "cancelled while anybody holds contact", which is the same bug for the
+      // same reason one step further out. Under the tail floor a break *opens*
+      // with survivors on the plaza by design, so any such test fires every time
+      // and no break ever runs again.
+      //
+      // The intent behind it — "being shot at during a break is worse than
+      // starting the wave early" — does not survive inspection either: if the
+      // plaza is unexpectedly full, opening the next wave adds hostiles to it.
+      // The next wave's concurrency gate is the right answer to a crowded field,
+      // and it runs on the opening beat whether the break was cut short or not.
+      //
+      // A fixed break also makes the schedule deterministic, which is what makes
+      // `?wave=N` runs comparable with each other and the arc measurable.
+      if (s.breakLeft <= 0) this.beginWave(this.waveIndex + 1)
       return
     }
-
-    const def = WAVES[this.waveIndex]
 
     // --- reinforcement, on a beat ----------------------------------------
     //
@@ -423,7 +498,22 @@ export class MatchDirector implements System, MatchService {
       if (this.budgetPending) {
         this.budgetPending = false
         // `dt > 0` here, so the AI has taken a frame and the field is real.
-        s.waveSize = active + this.remainingToSpawn
+        //
+        // The wave the match opens on counts whoever is already standing against
+        // its own roster: those are `AiSystem`'s seeded five and they are part of
+        // this wave, not a head start on top of it. Taking `size` flat here is
+        // what made wave one field thirteen bodies against wave two's ten and
+        // inverted the whole arc. `opening` is the floor, so the wave still has a
+        // punch even if the plaza is already busy.
+        //
+        // Every later wave takes `size` flat, because there the standing field is
+        // stragglers and shrinking a wave for those is the mistake this replaced.
+        if (this.openingWave) {
+          this.remainingToSpawn = Math.max(def.opening, def.size - this.liveCount)
+          this.waveBudget = this.remainingToSpawn
+        }
+        this.openingWave = false
+        s.waveSize = this.liveCount + this.remainingToSpawn
       }
       let blocked = false
       if (this.remainingToSpawn > 0) {
@@ -439,9 +529,16 @@ export class MatchDirector implements System, MatchService {
     }
 
     // --- ending the wave --------------------------------------------------
-    if (this.remainingToSpawn === 0 && active === 0) {
-      // Settle briefly rather than clearing on the frame the last participant
-      // drops, so a hostile mid-reacquire is not written out of its own wave.
+    //
+    // The push is broken when the field has fallen to half the density that
+    // defined the wave — not when the plaza is empty. Waiting for empty costs
+    // `concurrent / killRate`, which at the measured 0.27 kills/s is twenty-two
+    // seconds of diminuendo against seven seconds of holding the line, and the
+    // last third of it is hunting hostiles the AI has lost the player to. See
+    // {@link tailFloor}.
+    if (this.remainingToSpawn === 0 && active <= floor) {
+      // Settle briefly rather than clearing on the frame the count crosses, so a
+      // hostile mid-reacquire is not written out of its own wave.
       if (this.settleAt < 0) this.settleAt = this.t
       if (this.t - this.settleAt >= WAVE_SETTLE) this.clearWave()
       return
@@ -477,14 +574,13 @@ export class MatchDirector implements System, MatchService {
     this.waveIndex = index
     this.pruneParticipation()
 
-    // The budget is `def.size`, flat. It used to be
-    // `max(opening, size - standing)`, and subtracting the standing field is
-    // what hollowed the waves out: a wave shrank in exact proportion to how many
-    // hostiles were still on the plaza, which in this build means it shrank as a
-    // reward for the AI having lost the player. Wave one's budget came out at
-    // three or six depending on a frame race, and either way it was spent at the
-    // opening beat, after which the wave had nothing left to send and decayed
-    // from eight hostiles to none.
+    // The budget is `def.size`, flat, on every wave but the one the match opens
+    // on — and even there the discount is applied at the first beat rather than
+    // here, because the AI's seeded soldiers may not be on the field yet. It used
+    // to be `max(opening, size - standing)` on *every* wave, and subtracting the
+    // standing field is what hollowed the waves out: a wave shrank in exact
+    // proportion to how many hostiles were still on the plaza, which in this
+    // build means it shrank as a reward for the AI having lost the player.
     //
     // Presence is `concurrent`'s job and it does it on every beat, so the two
     // are no longer fighting over the same lever. See `WaveDef.size`.
@@ -543,6 +639,10 @@ export class MatchDirector implements System, MatchService {
     // of its roster never reached the field because the level had nowhere to
     // put them. A shortfall of a hostile or two is the player's win regardless
     // — they killed everyone who showed up — so the bar is half the roster.
+    //
+    // Clearing at {@link tailFloor} does not count as a shortfall: the roster was
+    // delivered, the survivors are still on the plaza, and the next wave will
+    // fight them.
     const shortfall = this.remainingToSpawn > this.waveBudget / 2
     const earned = !this.stalled && !shortfall
     if (earned) {
@@ -555,8 +655,11 @@ export class MatchDirector implements System, MatchService {
 
     s.phase = 'break'
     s.breakLeft = last ? 6 : def.breakSeconds
-    s.hostilesLeft = 0
     this.remainingToSpawn = 0
+    // Not zero: the tail floor leaves hostiles standing and the break is spent
+    // finishing them. Claiming an empty plaza here would be the same lie the
+    // objective line used to tell during the diminuendo, in the other direction.
+    s.hostilesLeft = this.liveCount
   }
 
   /**
@@ -566,6 +669,30 @@ export class MatchDirector implements System, MatchService {
    * budget by the request would end waiting on hostiles that never existed.
    *
    * Returns how many actually arrived.
+   *
+   * ## A full live cap is not a blocked spawn point
+   *
+   * The two refusals look identical from here and they mean opposite things.
+   *
+   *  - *Nowhere to put them.* The level's candidate positions are all blocked.
+   *    Nothing will change by asking again, so after {@link SPAWN_FAIL_LIMIT}
+   *    tries the wave gives up its roster and finishes on whoever arrived.
+   *  - *The field is already as full as the engine allows.* `AiSystem`'s
+   *    `MAX_LIVE` counts bodies while `concurrent` counts participants, so a wave
+   *    entitled to a slot can be refused one by hostiles the player has not
+   *    found. Asking again is exactly right: the next kill frees a slot.
+   *
+   * Treating the second as the first is what pinned the previous table's
+   * `concurrent` at eight. Replayed against a straggler model where a hostile the
+   * player never finds is never found, a wave at `concurrent` 8 or above forfeits
+   * its roster about half delivered: it ends early, having announced a size it
+   * then never sent, which is escalation running backwards in exactly the way the
+   * panel described. It does not cost contact — the field was already body-capped
+   * — so the fix is on the wave's *length* and on the honesty of the number the
+   * objective line shows, not on density.
+   *
+   * {@link bodyPeak} tells them apart without copying another system's constant:
+   * a refusal while the field is as full as it has ever been is the cap.
    */
   private deploy(count: number): number {
     const ai = this.ctx.services.ai
@@ -579,12 +706,18 @@ export class MatchDirector implements System, MatchService {
       this.remainingToSpawn = Math.max(0, this.remainingToSpawn - got)
       this.beatsSent++
       this.spawnFails = 0
+      if (ai.enemies.length > this.bodyPeak) this.bodyPeak = ai.enemies.length
       return got
     }
 
-    // Nowhere to put them, or the AI's live cap is full of hostiles that will
-    // not die. Give it a few beats, then stop asking and let the wave finish on
-    // whoever did arrive — `clearWave` decides whether that still counts.
+    // The live cap. Keep the roster and come back on the next beat. `bodyPeak`
+    // starts at zero, so a level that has never placed anybody still counts its
+    // refusals and a wholly blocked match still terminates.
+    if (this.bodyPeak > 0 && before >= this.bodyPeak) return 0
+
+    // Nowhere to put them. Give it a few beats, then stop asking and let the wave
+    // finish on whoever did arrive — `clearWave` decides whether that still
+    // counts as a wave the player cleared.
     this.spawnFails++
     if (this.spawnFails >= SPAWN_FAIL_LIMIT) {
       this.remainingToSpawn = 0
@@ -604,20 +737,27 @@ export class MatchDirector implements System, MatchService {
    * An id with no record is one that predates the match — the soldiers the AI
    * seeds during its own init. It is adopted here rather than being written off
    * for having no history.
+   *
+   * One pass, and it writes {@link liveCount} on the way through, because the
+   * body count and the participation count are wanted on the same frame and the
+   * difference between them is the whole subject of this file.
    */
   private countParticipating(): number {
     const ai = this.ctx.services.ai
-    if (!ai) return 0
+    if (!ai) { this.liveCount = 0; return 0 }
     let n = 0
+    let live = 0
     const list = ai.enemies
     for (let i = 0; i < list.length; i++) {
       const e = list[i]
       if (!e.alive) continue
+      live++
       if (this.inContact.has(e.id)) { n++; continue }
       const at = this.activeAt.get(e.id)
       if (at === undefined) { this.activeAt.set(e.id, this.t); n++; continue }
       if (this.t - at < STALE_AFTER) n++
     }
+    this.liveCount = live
     return n
   }
 
@@ -763,7 +903,8 @@ function readLives(): number {
  *
  * A debug entry point, not a difficulty setting: entering at wave five and
  * clearing five and six still wins the mission, having fought two waves. Do
- * not use it for a scored run.
+ * not use it for a scored run — but do use it for a measured one, because it is
+ * the only way a ninety-second harness run can see the top of the table.
  */
 function readStartWave(): number {
   const raw = param('wave')

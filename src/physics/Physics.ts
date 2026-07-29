@@ -255,6 +255,11 @@ export class PhysicsSystem implements System, PhysicsService {
 
   sphereCast(origin: THREE.Vector3, dir: THREE.Vector3, radius: number, maxDist: number): RaycastHit | null {
     const shape = new RAPIER.Ball(radius)
+    // The mask goes in the ninth slot (filterGroups), not the eighth
+    // (filterFlags). Passed as flags, no group filtering happened at all, so a
+    // cast could hit the player's own capsule — `canStand` starts its sweep at
+    // the top of that capsule, hit itself at zero distance, and reported a
+    // ceiling everywhere: once crouched, the player could never stand again.
     const hit = this.world.castShape(
       { x: origin.x, y: origin.y, z: origin.z },
       { x: 0, y: 0, z: 0, w: 1 },
@@ -263,6 +268,7 @@ export class PhysicsSystem implements System, PhysicsService {
       0,
       maxDist,
       true,
+      undefined,
       groups(0xffff, GROUP.WORLD | GROUP.DEBRIS),
     )
     if (!hit) return null

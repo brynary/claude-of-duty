@@ -111,6 +111,15 @@ export class PlayerSystem implements System, PlayerService {
   /** Read by: `HudSystem`, for the `?stats=1` readout. True while something
    * overhead is refusing the stand-up. */
   get standBlocked(): boolean { return this.loco.standBlocked }
+  /**
+   * Read by: nothing yet — offered to `HudSystem` alongside `standBlocked`.
+   *
+   * Metres of headroom the stand-up probe last measured, or `Infinity` when it
+   * found nothing. `standBlocked` says the crouch is pinned; this says by what.
+   * A pinned crouch with no number behind it is what let a broken probe read as
+   * a design problem for three rounds of playtesting.
+   */
+  get headroom(): number { return this.loco.clearance }
 
   private readonly loco = new Locomotion()
   private readonly rig = new CameraRig()

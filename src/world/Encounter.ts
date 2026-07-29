@@ -59,7 +59,56 @@ import { groundHeight } from './Terrain'
  * Nothing here decides *how* enemies fight — that is `src/ai`. This only
  * decides where they exist and when they arrive.
  *
- * ## This round: the staging is correct and almost none of it is reaching play
+ * ## This round: the wave was five copies of one post
+ *
+ * The playtest panel called out half of each run as dead air arriving in blocks,
+ * and named two shapes: stretches with **no hostile alive at all**, and stretches
+ * where hostiles exist and never arrive. They are different faults with different
+ * owners, and the arithmetic separates them cleanly.
+ *
+ * **The empty stretches are the scheduled wave break and they are not this
+ * file's.** `runs/feel7` hold holds zero alive from t = 30 through t = 40 and
+ * opens its next wave in the second beginning at t = 41 — an empty field of
+ * 10-11 s against the `WAVE_SETTLE` 1.5 s plus `breakSeconds` 9 s that
+ * `game/MatchDefs.ts` schedules. `MatchDirector` holds `directsSpawning`
+ * through both `wave` and `break`, so this director's own spawn path is gated off
+ * for the whole match and cannot fill the hole; it also sets
+ * `AiSystem.autoReinforce = !directsSpawning`, so nothing else can either. The
+ * break is deliberate and sourced — §6.1 `[measured]` puts a round break at
+ * 10-15 s — but it is spent with an empty map rather than with a thinning one,
+ * and only `MatchDefs` can change that.
+ *
+ * **The staging can always produce usable posts, so "asked for a wave and the
+ * level had nowhere to put it" is not what is happening.** Censused over 320
+ * stagings (the five positions the two scenarios put the player at x 8 facings x
+ * the 8 bands of {@link SIGHT_CYCLE}), the shipped file published 4.98 posts per
+ * staging and never once published none. Every one of the 35 ground posts routes
+ * to every one of those player positions under the same A* cost model
+ * `NavGrid` uses, detours 1.00-1.90x. **The briefed suspicion that this file
+ * stages posts a soldier cannot path to does not reproduce for any ground post.**
+ * The four interior posts cannot be judged from here — the occlusion lattice
+ * treats a footprint as solid, so its interior is not a place it can route
+ * through — and they are now capped at one per wave for that reason; see
+ * {@link ENCLOSED_MAX}.
+ *
+ * **What was wrong is that a wave was five near-copies of one post.** The score
+ * was dominated by `-|post.sight - targetSight|`, `sight` is a property of the
+ * lane, and on this map the lane is also the direction and the distance. So one
+ * band chose one lane and one lane chose everything: 2.02 directions per staging,
+ * three or more only 2% of the time, every post inside a 6 m distance band.
+ * Released together, five soldiers from one direction at one range walk one
+ * approach in single file and open contact one at a time as each rounds the same
+ * corner — `runs/feel7` hold opens its second wave at 42.8, 44.1, 46.7, 48.6 and
+ * 50.4 s, every one of them at 10.4-11.0 m. That is the panel's queue, and it is
+ * a scoring weight rather than a stall.
+ *
+ * The fix is to select the wave as a *set*: pick posts one at a time and charge
+ * each pick for repeating a direction ({@link GROUP_MAX}) or a range
+ * ({@link DIST_ECHO}) already in the wave. Re-censused, that gives 6.28 posts per
+ * staging and 2.94 directions, three or more 82% of the time, with both a fast
+ * and a slow arrival in 52.5% of waves against 35.9%.
+ *
+ * ## The round before: the staging is correct and almost none of it is reaching play
  *
  * Read the two shipped 90 s runs rather than the constants and three things
  * come out that no amount of tuning in this file would have found.
@@ -267,10 +316,17 @@ export const POSTS: readonly Post[] = [
 /**
  * Closest a wave may be staged in front of the player, metres.
  *
- * Under the §6.3 `[stated]` SMG sightline of 13.0 m, so a wave staged at the
- * short end still has to cross a room's worth of ground before it can shoot.
+ * This was 12, chosen to sit under the §6.3 `[stated]` SMG sightline of 13.0 m
+ * so a wave staged at the short end still had ground to cross. It is 15 because
+ * that is `AiSystem.MIN_SPAWN_RANGE`, and that constant is applied to *this
+ * file's output*: `pickSpawn` runs three passes and skips any candidate inside
+ * 15 m in the first two, so a post published at 12-15 m is only reachable on the
+ * pass that has already given up on everything else. Measured against the two
+ * shipped scenarios, one of the five posts published to the `hold` player stood
+ * at 14.1 m at four of the eight bands — a slot spent on a post the spawner
+ * would not take.
  */
-const MIN_FRONT = 12
+const MIN_FRONT = 15
 
 /**
  * Closest a wave may be staged *behind* the player, metres.
@@ -347,38 +403,52 @@ const MAX_STAGE = 30
 const LOOSE_STAGE = 40
 
 /**
- * Preferred staging distance, metres.
+ * Score charged per metre a post stands beyond {@link MIN_FRONT}.
  *
- * The old value of 30 was derived from §6.2 `[estimated]` spawn-to-contact of
- * 5-10 s at the §4.1 `[stated]` player speeds of 4.7-6.3 m/s. Two things were
- * wrong with that: soldiers do not move at player speeds, and the quantity that
- * matters is not arrival, it is the moment the fight starts.
+ * A monotone cost, and that is this round's change. It used to be a two-sided
+ * pull toward a preferred distance of 22 m — `-|dist - 22| * 0.25` — which is
+ * the wrong shape now that the wave is selected as a *set*: a term that pulls
+ * every post toward one distance is a term that makes every soldier in the wave
+ * walk the same length of route and arrive at the same moment. Nothing needs to
+ * push a post outward, because the near edge of the window is already held by
+ * the spawner's own floor at 15 m; the only thing distance should buy is spread,
+ * and {@link DIST_ECHO} buys that.
  *
- * Measured from the shipped staging, walking each published post's A* route at
- * the AI's real `travelSpeed` (sprint 5.1 m/s until 13 m out, then walk
- * 3.2 m/s, §7.5 `[stated]` `sv_botSprintDistance`), against the **11.63 m**
- * mean engagement distance the game actually measures:
+ * With this shape the selector lays a ladder rather than a clump. The first pick
+ * takes the near edge; a second post within {@link DIST_ECHO} of it costs 3
+ * points against the 1 point of stepping 4 m further out, so each successive
+ * pick steps outward: 15, 19, 23, 27 m rather than 26, 27, 29, 30. Measured over
+ * 320 stagings, that widens the spread between a wave's earliest and latest
+ * arrival from 2.16 s to 2.60 s, and takes the share of stagings holding **both**
+ * an arrival inside 2.5 s and one past 3.5 s from 35.9% to 52.5%. Half of every
+ * wave's posts now open at a different moment from the other half.
  *
- * | staging window | commute to 11.63 m: mean / p90 / max |
- * |----------------|-------------------------------------|
- * | 12-46 m (was)  | 5.9 s / 9.1 s / 13.3 s              |
- * | 12-34 m        | 4.6 s / 7.7 s / 11.6 s              |
- * | 12-30 m (now)  | 3.9 s / 7.2 s / 10.9 s              |
- * | 13-22 m        | 2.2 s / 3.8 s / 8.6 s               |
+ * **The commute is not the problem, and this round is the first measurement
+ * honest enough to say so.** Both this file's earlier figures and the brief's
+ * suspicion that "staging at 22-46 m may simply take longer than the budget
+ * assumed" rest on walking the soldier all the way to the player. It does not go
+ * there: `travelSpeed(remaining)` in `Behaviour.ts` is fed the distance still to
+ * run, the soldier stops when it acquires, and the measured opening range is
+ * about 10.7 m. So the quantity that matters is the time to *contact*, which is
+ * the route travelled until the straight line closes to 10.7 m — sprint at
+ * 5.1 m/s while more than 13 m remains, walk at 3.2 m/s below that (§7.5
+ * `[stated]` `sv_botSprintDistance`).
  *
- * Routes run 1.24x the straight line on this map, so the walk is longer than
- * the staging distance suggests but not by the margin the sprint/walk split
- * implies: a soldier sprints all but the last 13 m.
+ * Run against real A* routes over this district rather than a flat 1.24x detour
+ * factor — the true detour runs 1.00-1.90x, worst where the east row and the lot
+ * sit behind a block — spawn to contact comes out at:
  *
- * 22 m is the middle of the new window and lands the commute at roughly four
- * seconds — long enough to be an approach, short enough that the destination is
- * still where the player is. That last point is the one the distance figures
- * hide: a soldier walks to where the player *was* when it spawned, and
- * `AiSystem` only refreshes that after `HUNT_AFTER` seconds of quiet. Staging
- * at 33 m put the tail of the commute past that refresh, so a wave could spend
- * its whole approach walking to an address the player had left.
+ * | staging          | mean   | earliest in a wave | latest in a wave |
+ * |------------------|--------|--------------------|------------------|
+ * | shipped          | 3.56 s | 2.41 s             | 4.56 s           |
+ * | this round       | 3.74 s | 2.43 s             | 5.03 s           |
+ *
+ * Two and a half to five seconds, against a match that opens a wave with five
+ * hostiles and reinforces every 1.5-2.2 s. The approach is not what leaves five
+ * hostiles standing with nothing in contact for five seconds; it accounts for
+ * about half of the first such gap in a wave and none of the later ones.
  */
-const WANT_DIST = 22
+const FAR_COST = 0.25
 
 /**
  * The sightline each successive wave aims to open at, metres.
@@ -400,6 +470,31 @@ const WANT_DIST = 22
  * paired with {@link EncounterDirector.recentLanes} it is what stops three
  * waves in a row walking out of the alley. It is no longer described as
  * controlling the distance fights happen at, because it does not.
+ *
+ * **It is also no longer allowed to choose the whole wave, and that is this
+ * round's largest change.** `sight` is a property of the lane, and on this map
+ * the lane is also the *direction* — the highway lane is the only one that
+ * fights at 26-34 m and every one of its posts stands east of the plaza. So a
+ * score whose dominant term was `-|sight - targetSight|` picked one lane, and
+ * picking one lane picked one bearing and one distance for every post in the
+ * wave. Driven against the five positions the two shipped scenarios put the
+ * player at, the eight bands of this cycle collapsed to **two or three distinct
+ * stagings** per position, and each of those published three to five posts from
+ * one lane group: to the `hold` player, three highway posts and two east ones,
+ * all 24-30 m out, bearings within 30 degrees of each other. The 19 posts
+ * standing in the usable ring at that moment spanned **15-30 m and the whole
+ * front arc**, and the selector reached none of the near or western ones.
+ * Censused over 320 stagings the shipped file published 2.02 directions each and
+ * reached three only 2% of the time. That is the panel's queue, written as a
+ * scoring weight: five soldiers
+ * released together from one direction at one distance file down one approach
+ * and open contact one at a time as each rounds the same corner. The measured
+ * `hold` wave opens at 42.8, 44.1, 46.7, 48.6 and 50.4 s, every one of them at
+ * 10.4-11.0 m.
+ *
+ * The term is therefore scaled by {@link SIGHT_WEIGHT} — kept as a flavour
+ * preference, demoted from the thing that decides the wave. What decides the
+ * wave is spread; see {@link GROUP_MAX} and {@link DIST_ECHO}.
  *
  * Until this round it did not rotate at all in a played game: the index it is
  * read with was only advanced past the `directsSpawning` gate. Driven over a
@@ -582,37 +677,125 @@ const STAGE_INTERVAL = 2.0
 const STAGE_MOVE = 5
 
 /**
- * Posts published per wave: one lane's worth plus a secondary direction.
+ * Posts published per wave.
  *
- * The secondary allowance was 2 and is 3, to pay back part of what the tighter
- * {@link MAX_STAGE} costs. A 12-30 m window has fewer posts in it than a 12-46 m
- * one, so stagings got thinner: 5.11 published posts each on average before,
- * 3.73 after. Every post a staging is short of is a soldier `AiSystem` places
- * from its own composed arc instead — close, and in the player's view. Widening
- * the flank recovers it to 3.95 for half a point of promotion share and no
- * change to cover or commute. Five and three still reads as a front and a
- * flank, which is the shape this is for.
+ * Eight was `PRIMARY_MAX` 5 plus `SECONDARY_MAX` 3 — one lane's worth plus a
+ * flank. The total is unchanged and the split is gone: the wave is no longer
+ * built as a front plus a flank but as a spread, three posts to a direction at
+ * most, no two at the same range. See {@link GROUP_MAX} and {@link DIST_ECHO}.
+ *
+ * Eight is also more than any single beat asks for — `MatchDefs` opens a wave
+ * with five or six — and that is deliberate. Every post a staging is short of is
+ * a soldier `AiSystem` places from its own composed arc instead, and every point
+ * on that arc is required to have a clear line to the player's chest, which is a
+ * hostile appearing in view rather than walking into contact.
  */
-const PRIMARY_MAX = 5
-const SECONDARY_MAX = 3
-const MAX_STAGED = PRIMARY_MAX + SECONDARY_MAX
+const MAX_STAGED = 8
 
 /**
- * Posts a wave may take from an overwatch lane.
+ * Most posts a wave may take from one direction, where "one direction" means
+ * within {@link MIN_LANE_SPREAD} of a post already taken.
  *
- * `roof` is the only one: two posts on the market hall deck, 2.86 m up, whose
- * whole value is the angle down into the junction. One soldier there is a
- * threat the player has to solve; a squad there is a squad that is not coming.
- * See {@link leads} for why it may not lead a wave at all.
+ * This is the constant that breaks the queue. Three is chosen against the
+ * arithmetic of the fight rather than by taste: kill duration measures 2.3 s and
+ * the engine clamps concurrent attackers to two (§7.2 `[stated]`
+ * `ai_maxAttackerCount`), so three soldiers arriving on one bearing are serviced
+ * one after another by a player who never has to turn — the third is still
+ * waiting when the first two are dead. A fourth on the same bearing adds
+ * nothing the player can feel. Eight posts at three to a direction is therefore
+ * at least three directions, which is what "the player turns between threats"
+ * requires.
  *
- * Dormant in live play, where the deck is dropped outright for being
- * unreachable — see the note on the roof entries in {@link POSTS}. It is kept
- * because the cap is the right rule for any overwatch lane, and because the
- * deck is two lines away from coming back if the stair is ever regraded.
+ * Measured over the five positions the shipped scenarios put the player at, the
+ * usable ring holds 11-23 posts spanning four to six lanes, so three directions
+ * is available everywhere on this map — thinnest at the plaza's west side,
+ * (-10, -12), which offers 11 posts across four lanes.
+ *
+ * The count is of posts *already taken* within {@link MIN_LANE_SPREAD} of the
+ * candidate, so it is a pairwise rule rather than a clustering one, and the
+ * difference is not academic: nothing stops a chain of posts each 44 degrees from
+ * the last. Censused over 55,663 stagings on a 3 m lattice across the district,
+ * the widest 45-degree window the shipped file filled held **four to seven posts,
+ * a quarter of the time**; under the cap it never holds more than three.
  */
-const OVERWATCH_MAX = 1
+const GROUP_MAX = 3
 
-/** Minimum bearing between the primary and secondary lanes, radians (45 deg). */
+/**
+ * Metres within which two posts count as the same arrival, and what a repeat
+ * costs.
+ *
+ * Two soldiers released together from posts the same distance out walk the same
+ * length of route at the same speed and arrive at the same moment from, as far
+ * as the fight is concerned, the same place. Four metres is about 0.9 s of
+ * commute at the AI's 5.1 m/s sprint (§7.5 `[stated]` `sv_botSprintDistance`),
+ * which is under half a kill, so anything inside it is a duplicate arrival.
+ *
+ * The penalty is set against the far-distance term: at 0.25 points per metre,
+ * reaching 12 m further out to break a tie costs 3 points, so an echo penalty of
+ * 3 makes the selector rather cross the map than send two soldiers to the same
+ * range. It is under {@link CROWD_PENALTY} because a repeated range with a new
+ * bearing is still a threat the player has to turn for, and a repeated bearing
+ * is not.
+ */
+const DIST_ECHO = 4
+const ECHO_PENALTY = 3
+
+/** What each post already taken within {@link MIN_LANE_SPREAD} costs. */
+const CROWD_PENALTY = 4
+
+/**
+ * Weight on the {@link SIGHT_CYCLE} match.
+ *
+ * The raw term is `-|post.sight - targetSight|`, which on this post graph runs
+ * to -26 and buried every other term in the score. Scaling it to a quarter caps
+ * it at about -6.5, level with the spread penalties, so the cycle still tilts a
+ * wave toward the alley or toward the square without deciding all eight posts.
+ * See {@link SIGHT_CYCLE}.
+ */
+const SIGHT_WEIGHT = 0.25
+
+/**
+ * Posts a wave may take from inside a building — a room or a roof deck.
+ *
+ * This was `OVERWATCH_MAX`, a cap on the `roof` lane alone: two posts on the
+ * market hall deck, 2.86 m up, whose whole value is the angle down into the
+ * junction. One soldier there is a threat the player has to solve; a squad there
+ * is a squad that is not coming. See {@link leads} for why it may not lead a
+ * wave at all.
+ *
+ * It now covers every `enclosed` post, which is the roof deck *and* the four
+ * interior rooms, for two reasons that turn out to be the same reason.
+ *
+ * The first is composition. A room post fights at 8-9 m through a doorway, so a
+ * soldier in one is a position rather than an approach — three of them at once is
+ * three soldiers in three rooms, none of them the room the player is in.
+ *
+ * The second is that these are the only posts in the graph whose route to the
+ * player this file cannot check. The occlusion lattice is built from building
+ * footprints, so a footprint's interior is solid to it: an interior post reads as
+ * perfectly hidden, skips the ring test that asks whether a firing line is a
+ * short walk away, and collects a room's cover bonus on top. That is exactly the
+ * scoring shape that made two roof posts the district's most popular approach
+ * before {@link DECK_SUPPORT} was added, and the roof deck then turned out to be
+ * a nav island. Whether the four rooms are connected depends on doorway widths
+ * against `NavGrid`'s 0.75 m lattice and its clearance rule, neither of which is
+ * answerable from here. Capping them at one bounds the exposure to a single
+ * soldier per wave, whom `AiSystem.recycleStranded` will collect if the room does
+ * turn out to be sealed.
+ *
+ * Demoting the {@link SIGHT_CYCLE} term made this cap necessary rather than
+ * merely tidy: rooms are the only posts with a sight under 10 m, so under the old
+ * weight they won only at the near bands, and under the new one they win wherever
+ * a direction has nothing else in it. With the term demoted and before this cap
+ * was added, staging against the `hold` position published two or three rooms in
+ * every eight posts, at every band.
+ */
+const ENCLOSED_MAX = 1
+
+/**
+ * Smallest bearing, in radians, at which two posts read as separate directions
+ * rather than as one group spread thin. 45 degrees.
+ */
 const MIN_LANE_SPREAD = Math.PI / 4
 
 /**
@@ -735,7 +918,13 @@ interface Candidate {
   index: number
   score: number
   bearing: number
+  /** Metres from the player's eye, on the ground plane. */
+  dist: number
   lane: Lane
+  /** Mirrors `Post.enclosed`; see {@link ENCLOSED_MAX}. */
+  enclosed: boolean
+  /** Set while this candidate is in the staging currently being built. */
+  taken: boolean
 }
 
 export class EncounterDirector {
@@ -749,6 +938,8 @@ export class EncounterDirector {
   private pool: THREE.Vector3[] = []
   private cands: Candidate[] = []
   private usable = 0
+  /** Indices into {@link cands} of the posts taken by the staging in progress. */
+  private order = new Int32Array(MAX_STAGED)
 
   private ai: AiService | null = null
   private level: LevelService | null = null
@@ -873,7 +1064,8 @@ export class EncounterDirector {
     }
     for (let i = 0; i < MAX_STAGED; i++) this.pool.push(new THREE.Vector3())
     for (let i = 0; i < this.posts.length; i++) {
-      this.cands.push({ index: i, score: 0, bearing: 0, lane: this.posts[i].lane })
+      const p = this.posts[i]
+      this.cands.push({ index: i, score: 0, bearing: 0, dist: 0, lane: p.lane, enclosed: !!p.enclosed, taken: false })
     }
 
     this.buildSolidGrid(level.bounds)
@@ -1055,57 +1247,73 @@ export class EncounterDirector {
       cands[j + 1] = c
     }
 
-    // The lane the wave comes *from* has to be a lane a wave can come from.
-    // `roof` is not one: it is two posts on one deck, 2.86 m up, and a soldier
-    // put there is already at its firing position — there is no approach to
-    // walk. Letting it lead means the whole wave stands on a platform whose
-    // route down this file cannot verify, which is the playtest's "hostiles
-    // standing somewhere unreachable" written as a staging decision. It came up
-    // immediately: staged against `playerSpawn`, with the tighter ceiling, roof
-    // was the top-scoring lane and took two of the three opening posts.
+    // Pick the wave one post at a time, each pick charged for how much it
+    // repeats what is already in the wave.
     //
-    // It stays in the graph, capped at {@link OVERWATCH_MAX}, as a flank. One
-    // rifle looking down into the junction is the shot the deck was composed
-    // for; six soldiers milling about on it is not.
-    let lead = 0
-    while (lead < this.usable && !leads(cands[lead].lane)) lead++
-    if (lead >= this.usable) lead = 0
-    const primary = cands[lead].lane
-    const primaryBearing = cands[lead].bearing
+    // Selecting the *set* rather than ranking posts independently is this
+    // round's change and it is the whole of the fix. Independent ranking cannot
+    // produce a spread, because the thing that makes a post score well —
+    // matching the band, sitting near the preferred distance, holding cover — is
+    // shared by every other post in the same lane, so the top of the list is
+    // always five near-clones. Charging for repetition is the smallest rule that
+    // makes the second pick depend on the first.
+    //
+    // Two repetitions are charged, and they are not the same fault. A post on a
+    // bearing already taken is a soldier the player does not have to turn for;
+    // three of those is the most the fight can use, so the count is a hard cap
+    // ({@link GROUP_MAX}) as well as a penalty. A post at a range already taken
+    // is a soldier who arrives at the same moment as one already sent, which is
+    // a wasted arrival rather than a wasted direction, so it is only a penalty.
+    //
+    // The first pick must be a lane that can lead. `roof` is not one: it is two
+    // posts on one deck, 2.86 m up, and a soldier put there is already at its
+    // firing position — there is no approach to walk. Letting it lead means the
+    // whole wave stands on a platform whose route down this file cannot verify,
+    // which is the playtest's "hostiles standing somewhere unreachable" written
+    // as a staging decision. It came up immediately: staged against
+    // `playerSpawn`, with the tighter ceiling, roof was the top-scoring lane and
+    // took two of the three opening posts. It stays in the graph, capped at
+    // {@link ENCLOSED_MAX}, as a flank — one rifle looking down into the
+    // junction is the shot the deck was composed for.
     const out = level.spawnPoints
     out.length = 0
-
-    const primaryCap = Math.min(PRIMARY_MAX, laneCap(primary))
+    const order = this.order
     let taken = 0
-    for (let i = 0; i < this.usable && taken < primaryCap; i++) {
-      if (cands[i].lane !== primary) continue
-      const v = this.pool[taken++]
-      v.copy(this.world[cands[i].index])
-      out.push(v)
-    }
+    let enclosedTaken = 0
+    for (let i = 0; i < this.usable; i++) cands[i].taken = false
 
-    // One secondary direction, far enough round from the first to read as a
-    // separate one rather than as the same group spread thin.
-    let secondary: Lane | null = null
-    let secondaryCap = SECONDARY_MAX
-    let secondaryTaken = 0
-    for (let i = 0; i < this.usable && secondaryTaken < secondaryCap; i++) {
-      const c = cands[i]
-      if (c.lane === primary) continue
-      if (secondary === null) {
-        if (angleBetween(c.bearing, primaryBearing) < MIN_LANE_SPREAD) continue
-        secondary = c.lane
-        secondaryCap = Math.min(SECONDARY_MAX, laneCap(secondary))
-      } else if (c.lane !== secondary) {
-        continue
+    while (taken < MAX_STAGED) {
+      let bestAt = -1
+      let bestScore = 0
+      for (let i = 0; i < this.usable; i++) {
+        const c = cands[i]
+        if (c.taken) continue
+        if (taken === 0 && !leads(c.lane)) continue
+        if (c.enclosed && enclosedTaken >= ENCLOSED_MAX) continue
+        let crowd = 0
+        let echo = 0
+        for (let k = 0; k < taken; k++) {
+          const t = cands[order[k]]
+          if (angleBetween(c.bearing, t.bearing) < MIN_LANE_SPREAD) crowd++
+          if (Math.abs(c.dist - t.dist) < DIST_ECHO) echo++
+        }
+        if (crowd >= GROUP_MAX) continue
+        const s = c.score - crowd * CROWD_PENALTY - echo * ECHO_PENALTY
+        if (bestAt < 0 || s > bestScore) { bestAt = i; bestScore = s }
       }
+      if (bestAt < 0) break
+      const c = cands[bestAt]
+      c.taken = true
+      order[taken] = bestAt
+      if (c.enclosed) enclosedTaken++
       const v = this.pool[taken++]
       v.copy(this.world[c.index])
       out.push(v)
-      secondaryTaken++
     }
 
-    this.stagedLane = primary
+    // The lane the wave is *remembered* by is the one it led with, which is the
+    // one {@link recentLanes} penalises next time round.
+    this.stagedLane = taken > 0 ? cands[order[0]].lane : null
   }
 
   /**
@@ -1151,8 +1359,11 @@ export class EncounterDirector {
         if (!this.occluded(w.x, w.z - EDGE_RADIUS, false)) openNeighbours++
       }
 
-      let score = -Math.abs(p.sight - targetSight)
-      score -= Math.abs(dist - WANT_DIST) * 0.25
+      // Scaled, and monotone in distance. Both terms used to be able to decide
+      // the whole wave on their own; see {@link SIGHT_WEIGHT} and
+      // {@link FAR_COST}.
+      let score = -Math.abs(p.sight - targetSight) * SIGHT_WEIGHT
+      score -= Math.max(0, dist - MIN_FRONT) * FAR_COST
       if (p.lane === this.recentLanes[0]) score -= 9
       else if (p.lane === this.recentLanes[1]) score -= 4
       if (!hidden) score -= 8
@@ -1172,7 +1383,10 @@ export class EncounterDirector {
       c.index = i
       c.score = score
       c.bearing = Math.atan2(dx, dz)
+      c.dist = dist
       c.lane = p.lane
+      c.enclosed = !!p.enclosed
+      c.taken = false
     }
   }
 
@@ -1314,11 +1528,6 @@ function footprintUnder(x: number, z: number): Footprint | null {
 /** Whether a lane can be the direction a wave arrives from. */
 function leads(lane: Lane): boolean {
   return lane !== 'roof'
-}
-
-/** Most posts a wave may take from one lane. */
-function laneCap(lane: Lane): number {
-  return lane === 'roof' ? OVERWATCH_MAX : PRIMARY_MAX
 }
 
 /** Absolute difference between two bearings, wrapped into [0, PI]. */

@@ -125,6 +125,37 @@ const MANTLE_COS = Math.cos(MOVE.mantleMaxAngle)
 /** Seconds a failed mantle probe is remembered for. See `probeRested`. */
 const MANTLE_PROBE_REST = 0.12
 
+/** Height above the ledge, and radius, of the mantle headroom probe sphere. */
+const MANTLE_PROBE_UP = 0.42
+const MANTLE_PROBE_R = 0.28
+
+/**
+ * Below this, a shape-cast result is a penetration rather than a contact.
+ *
+ * Rapier's `castShape` is called with `stopAtPenetration`, so a probe sphere
+ * that begins already overlapping something returns a time of impact of exactly
+ * zero. Read as a distance that says "solid surface zero metres away", which is
+ * never what it means: it means the probe started inside something.
+ *
+ * This is not hypothetical. The same query, one argument out of position, put
+ * its interaction-group mask in rapier's `filterFlags` slot; reinterpreted as
+ * flags, `WORLD | DEBRIS` is `EXCLUDE_FIXED | EXCLUDE_SENSORS`, so every sphere
+ * cast in the game excluded all static level geometry and filtered by no group
+ * at all. The nearest thing left to hit was the player's own kinematic capsule,
+ * which `crouchFloor`'s probe starts inside by construction — a zero-distance
+ * self-hit every frame, on every surface, so once the player crouched they could
+ * never stand again. That accounted for a measured 97.5% of a 90-second run
+ * spent crouched and 0.17% spent sprinting.
+ *
+ * The argument order is fixed in `Physics.ts`. The class of failure is not:
+ * debris and ragdoll segments are both inside this cast's mask and both pass
+ * straight through the player capsule, whose solver filter is empty, so a corpse
+ * or a kicked prop resting inside the player's chest still returns zero and
+ * would still latch the crouch. Refusing to read zero as a ceiling closes it
+ * from this side for good.
+ */
+const PENETRATION_EPS = 1e-4
+
 /** Seconds for the tactical-sprint meter to refill from empty. */
 const TAC_REFILL = 4.0
 
@@ -230,6 +261,12 @@ export class Locomotion {
    * readout names it rather than leaving the player to guess.
    */
   standBlocked = false
+  /**
+   * Metres of headroom the last stand-up probe found, or `Infinity` when it
+   * found nothing. Only meaningful on frames where the player was trying to
+   * rise; `standBlocked` says whether it mattered.
+   */
+  clearance = Infinity
   height: number = MOVE.standHeight
   eyeHeight: number = MOVE.eyeStand
 
@@ -278,7 +315,6 @@ export class Locomotion {
   private jumpBuffer = 0
   private slideCooldown = 0
   private mantleCooldown = 0
-  private forceCrouch = 0
   private tacSprintTimer = 0
   private colliderHalf = 0
   private snapEnabled = true
@@ -373,7 +409,6 @@ export class Locomotion {
 
     this.slideCooldown = Math.max(0, this.slideCooldown - dt)
     this.mantleCooldown = Math.max(0, this.mantleCooldown - dt)
-    this.forceCrouch = Math.max(0, this.forceCrouch - dt)
     this.sprintOut = Math.max(0, this.sprintOut - dt)
     this.jumpBuffer = m.jumpPressed ? MOVE.jumpBufferTime : Math.max(0, this.jumpBuffer - dt)
     this.coyote = this.onGround ? MOVE.coyoteTime : Math.max(0, this.coyote - dt)
@@ -476,7 +511,7 @@ export class Locomotion {
     }
 
     // Jump, with coyote time and a buffered press.
-    if (this.jumpBuffer > 0 && (this.onGround || this.coyote > 0) && this.canStand(true)) {
+    if (this.jumpBuffer > 0 && (this.onGround || this.coyote > 0) && this.canStand()) {
       const boost = this.isSliding ? 1.12 : 1
       if (this.isSliding) this.endSlide(true)
       this.velocity.x *= boost
@@ -750,12 +785,27 @@ export class Locomotion {
     //    clears the player's own radius past the face, so a thin obstacle ends
     //    with the player over the far side and falling — a vault — while a solid
     //    one ends with them standing on it.
+    //
+    //    The one thing this has to decide is whether the crouched player fits on
+    //    the far side, so the threshold is `crouchHeight` rather than a number.
+    //    The probe sphere sits `MANTLE_PROBE_UP` above the ledge with radius
+    //    `MANTLE_PROBE_R`, so its top starts 0.70 m up and a hit at distance `d`
+    //    puts the ceiling at `0.70 + d`. The old form refused below d = 0.22,
+    //    i.e. 0.92 m of clearance — 0.28 m less than the crouched capsule — so a
+    //    mantle could commit the player to a landing they did not fit inside.
+    //    Anything taller than a crouch and shorter than a stand needs no test
+    //    here at all: the landing leaves `crouchAmount` at 0.65 and `stepStance`
+    //    resolves it against the real clearance on the next frame.
     const ex = wall.point.x + fx * (MOVE.radius + 0.12)
     const ez = wall.point.z + fz * (MOVE.radius + 0.12)
-    this.v1.set(ex, top.point.y + 0.42, ez)
-    const ceiling = this.physics.sphereCast(this.v1, UP, 0.28, 0.85)
-    if (ceiling && ceiling.distance < 0.22) return this.failProbe(m)
-    if (ceiling && ceiling.distance < 0.8) this.forceCrouch = 1.0
+    this.v1.set(ex, top.point.y + MANTLE_PROBE_UP, ez)
+    const span = MOVE.crouchHeight - MANTLE_PROBE_UP - MANTLE_PROBE_R + 0.05
+    const ceiling = this.physics.sphereCast(this.v1, UP, MANTLE_PROBE_R, span)
+    // A zero-distance result is a penetration, not a ceiling: see `crouchFloor`.
+    if (ceiling && ceiling.distance > PENETRATION_EPS) {
+      const room = MANTLE_PROBE_UP + MANTLE_PROBE_R + ceiling.distance
+      if (room < MOVE.crouchHeight) return this.failProbe(m)
+    }
 
     this.mantleFrom.copy(this.position)
     this.mantleTo.set(ex, top.point.y + 0.02, ez)
@@ -831,11 +881,26 @@ export class Locomotion {
     let target: number
     if (this.isSliding) target = 1
     else if (this.mantleProgress > 0) target = 0.65
-    else if (m.crouchHeld || this.forceCrouch > 0) target = 1
+    else if (m.crouchHeld) target = 1
     else target = 0
 
-    this.standBlocked = target < this.crouchAmount && !this.canStand(true)
-    if (this.standBlocked) target = this.crouchAmount
+    // A ceiling refuses only as much of the stand-up as it physically has to.
+    // The old form pinned the target to whatever `crouchAmount` happened to be
+    // when the probe first failed, which froze the stance at an arbitrary depth
+    // — 0.65 straight out of a mantle — and, because the pin fed itself, gave
+    // the player no way back up even where the ceiling had room for more of
+    // them. Solving for the crouch the clearance actually demands means a 1.5 m
+    // ceiling produces a 1.5 m player instead of a 1.41 m one held there
+    // forever, and it replaces the mantle's blunt one-second forced crouch:
+    // the landing arrives at 0.65 and this resolves it on the next frame.
+    this.standBlocked = false
+    if (target < this.crouchAmount) {
+      const floor = this.crouchFloor()
+      if (floor > target) {
+        target = floor
+        this.standBlocked = true
+      }
+    }
 
     const k = this.isSliding ? 20 : (target > this.crouchAmount ? 15 : 11)
     this.crouchAmount += (target - this.crouchAmount) * approach(k, dt)
@@ -857,14 +922,41 @@ export class Locomotion {
     }
   }
 
-  /** Sphere-cast upward to see whether there is room to stand back up. */
-  private canStand(wantStand: boolean): boolean {
-    if (!wantStand || !this.physics || this.crouchAmount < 0.05) return true
-    const from = this.position.y + MOVE.crouchHeight - MOVE.radius
-    this.v1.set(this.position.x, from, this.position.z)
-    const need = MOVE.standHeight - MOVE.crouchHeight
-    const hit = this.physics.sphereCast(this.v1, UP, MOVE.radius * 0.92, need + 0.05)
-    return !hit || hit.distance > need
+  /**
+   * The shallowest crouch that fits under whatever is overhead, 0..1, where 0
+   * means the player can stand fully upright.
+   *
+   * Sphere-casts upward from the top of the crouched capsule. The probe sits
+   * `crouchHeight - radius` above the feet with radius `radius * 0.92`, so its
+   * top starts 1.174 m up and a hit at distance `d` puts the ceiling at
+   * `1.174 + d`. Sweeping the 0.65 m that stand-up needs therefore measures
+   * clearance across the whole 1.174-1.824 m range, which brackets the crouched
+   * and standing heights and lets the answer be a height rather than a refusal.
+   */
+  private crouchFloor(): number {
+    if (!this.physics || this.crouchAmount < 0.05) return 0
+    const probe = MOVE.radius * 0.92
+    const base = MOVE.crouchHeight - MOVE.radius
+    this.v1.set(this.position.x, this.position.y + base, this.position.z)
+    const hit = this.physics.sphereCast(this.v1, UP, probe, MOVE.standHeight - MOVE.crouchHeight + 0.05)
+    // The probe sphere begins inside the player's own crouched capsule, so a
+    // zero-distance result can only ever mean something is overlapping the
+    // player — never a ceiling zero metres above their head. See
+    // `PENETRATION_EPS` for what reading it the other way cost.
+    if (!hit || hit.distance <= PENETRATION_EPS) {
+      this.clearance = Infinity
+      return 0
+    }
+    this.clearance = base + probe + hit.distance
+    if (this.clearance >= MOVE.standHeight) return 0
+    return THREE.MathUtils.clamp(
+      (MOVE.standHeight - this.clearance) / (MOVE.standHeight - MOVE.crouchHeight), 0, 1,
+    )
+  }
+
+  /** Whether the player has room to come all the way up — jumps need it. */
+  private canStand(): boolean {
+    return this.crouchFloor() <= 0.02
   }
 
   // --- integration ---------------------------------------------------------

@@ -101,6 +101,22 @@ const SHOT_INTERVAL = 0.105
  * pause, so this is the free variable, and it is the one that sets how much
  * damage two attackers deliver. See {@link PLAYER_DAMAGE} for the budget it is
  * solved against.
+ *
+ * **It is deliberately unchanged, and that is a finding rather than an
+ * omission.** These numbers were solved against the simulation in
+ * {@link PLAYER_DAMAGE}, which assumed the pause runs on the clock. The code
+ * did not: {@link fire} only counted it down on frames the trigger was already
+ * available, so a soldier behind cover froze its pause and served the remainder
+ * standing in the open. The shipped cadence was therefore never the cadence
+ * this constant asks for, and the honest repair was to make the code obey it —
+ * not to shorten the pause a second time to cover for a clock that had stopped.
+ *
+ * Measured after that repair, in the headless AI harness (twelve seeds, six
+ * soldiers, street cover, a kill every 2.3 s so the fight turns over as it does
+ * in play): incoming **4.79 HP/s** and **2.2 deaths per 90 s**, against the
+ * 0.94-1.30 deaths per minute the {@link PLAYER_DAMAGE} table predicts for the
+ * row a real fight spends most of its time in. The arithmetic and the code now
+ * agree, so there is nothing left here to solve.
  */
 const BURST_PAUSE_MIN = 1.6
 const BURST_PAUSE_MAX = 2.6
@@ -123,8 +139,10 @@ const BURST_PAUSE_MAX = 2.6
  * a factor of two to fourteen, because the player regenerates **75 HP/s after a
  * 3 s gap** (`PlayerSystem`, MWIII Season 2 patch notes `[stated]` §5.2). The
  * fight is not an averaging process, it is a race between sustained pressure
- * and a very fast reset, and burst pauses of 1.6–2.6 s plus hide phases of
- * 1.2–2.2 s open 3 s gaps often. Simulating the actual cycles — two attackers,
+ * and a very fast reset, and burst pauses of 1.6–2.6 s open 3 s gaps often.
+ * (They used to open them far more often than this table assumed, because the
+ * hide phase *added* to the pause instead of overlapping it. See below.)
+ * Simulating the actual cycles — two attackers,
  * their burst and peek timers, 30-round magazines, a 2.5 s reload, the 0.5 roll,
  * against 100 HP with that regen — gives time-to-die at 5 HP a round:
  *
@@ -145,6 +163,36 @@ const BURST_PAUSE_MAX = 2.6
  * and 0.3 quadruples it. Anything that keeps attackers from having a clear line
  * — losing the token, engagements past 20 m, cover that hides them from
  * themselves — pushes deaths down hard and this number up.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THE RUNNING CODE DELIVERED A THIRD OF THIS, AND WHAT WAS ACTUALLY WRONG
+ * ---------------------------------------------------------------------------
+ *
+ * The table above is right and the code did not obey it: the live build measured
+ * **2.68 HP/s and zero deaths across 180 s**. Reproduced in the headless AI
+ * harness — the real `Squad`, `Behaviour`, `NavGrid` and this `difficulty`
+ * against a stub soldier and an analytic box world — a squad of six on street
+ * cover with the player killing one every 2.3 s delivered 3.49 HP/s and 0.83
+ * deaths per 90 s, close enough to the live figure to work in. Three defects,
+ * each measured and each fixed, none of them this constant:
+ *
+ * | defect | cost, measured |
+ * |---|---|
+ * | rounds aimed at the chest while the trigger gate tested the eye ({@link shoot}) | **15% of rounds that won the roll at 23 m, 21% at 27 m**, every one with a clear line to the eye |
+ * | burst pause frozen while a soldier was behind cover ({@link fire}) | interval between one soldier's bursts was pause **plus** hide, up to 4.8 s against a 3 s regen delay |
+ * | a reloading soldier kept its attacker token ({@link Behaviour.readyToAttack}) | **9-11% of all token seconds** held by someone who could not shoot |
+ *
+ * Together: 3.49 → **4.79 HP/s**, 0.83 → **2.2 deaths per 90 s**, gaps between
+ * landed rounds longer than the 3 s regen delay 13% → **7%**, and the player
+ * dropped under 40 HP 3.1 times per 90 s against 1.3 before. Reaction time
+ * stayed at 0.75 s and the mean engagement distance at 23 m, so nothing that
+ * §7.5 fixes moved.
+ *
+ * Two of the briefed suspects were measured and **refuted**, which is worth
+ * recording so nobody spends the effort again: attacker tokens are not sitting
+ * idle (171-179 of 180 slot-seconds filled, even with eight soldiers spawning at
+ * 32 m behind dense cover), and {@link rangingBurst} costs 5-9% of an attacker's
+ * rounds, not most of them.
  */
 const PLAYER_DAMAGE = 5.0
 
@@ -160,6 +208,18 @@ const PLAYER_DAMAGE = 5.0
  */
 const MISS_MIN = 0.85
 const MISS_MAX = 2.4
+
+/**
+ * Where on the player a round is aimed, metres above their feet.
+ *
+ * The chest is the point every shot is placed at. The upper chest is the
+ * fallback for when the chest line is blocked and the eye line — the one the
+ * trigger gate actually tested — is not; see {@link shoot}. Both sit inside the
+ * player's 1.6 m silhouette, so neither is a head shot and neither changes what
+ * a round does when it arrives.
+ */
+const CHEST_HEIGHT = 0.95
+const UPPER_CHEST_HEIGHT = 1.5
 
 /**
  * `sv_botSprintDistance "512"` = **13.0 m** `[stated]` §7.5: a bot sprints only
@@ -181,10 +241,25 @@ const SPRINT_SPEED = 5.1
  * before the clamp. Rounds per second is the burst cycle: five rounds at
  * 0.105 s inside a 0.4-0.6 s burst, then a 1.6-2.6 s pause.
  *
- * `exposedFraction` is the part a reader would otherwise get wrong. A token
- * holder is only shooting while it is stepped out of cover and not reloading,
- * which is a little over half the time, so the sustained figure reaching the
- * player is roughly half of `roundsPerSecond`.
+ * `exposedFraction` is the part a reader would otherwise get wrong: the share of
+ * the seconds a soldier holds a token during which rounds actually leave its
+ * rifle. It is **counted, not reasoned about** — the headless AI harness tallies
+ * every token-second by why nothing came out of it, and rounds fired divided by
+ * token-seconds held gives, per attacker:
+ *
+ * | scenario, twelve seeds, 90 s | rounds/s per attacker | implied fraction |
+ * |---|---|---|
+ * | six soldiers, street cover, nobody dying | 1.59 | 0.83 |
+ * | six soldiers, a kill every 2.3 s (play-like) | 1.27 | 0.66 |
+ * | as above, spawns at 26 m | 1.22 | 0.63 |
+ * | eight soldiers, dense cover, spawns at 32 m | 1.38 | 0.72 |
+ *
+ * **0.70** is the play-like middle of that. It was 0.55, which was right for the
+ * code as it then behaved: a reloading soldier kept its token for the whole 2.5 s
+ * (9-11% of all token-seconds) and a soldier behind cover froze its burst pause
+ * and served the rest of it standing in the open. Both are fixed, so more of a
+ * token holder's time is now spent shooting and the published figure has to say
+ * so or `Difficulty` under-reports the threat by a quarter.
  *
  * Note that a time-to-die computed from these — as `Difficulty.effective` does
  * — is an average and will read about twice as lethal as the simulated figures
@@ -194,7 +269,7 @@ const SPRINT_SPEED = 5.1
 export const AI_CADENCE = {
   roundsPerSecond: 5 / (0.5 + (BURST_PAUSE_MIN + BURST_PAUSE_MAX) / 2),
   meanDamagePerHit: PLAYER_DAMAGE,
-  exposedFraction: 0.55,
+  exposedFraction: 0.7,
 } as const
 
 /** Stance dwell: `sv_botMinCrouchTime "2000"` / `Max "4000"` `[stated]` §7.5. */
@@ -402,6 +477,7 @@ export class Squad {
       if (!m.attacker) continue
       const heldFor = this.clock - m.tokenSince
       const spent = !m.soldier.alive || !m.alerted || m.sightLostFor > TOKEN_MIN_HOLD
+        || m.soldier.isReloading
       if (spent || (waiting > 0 && heldFor >= TOKEN_MAX_HOLD)) {
         m.releaseToken(this.clock)
         held--
@@ -738,9 +814,20 @@ export class Behaviour {
     return this.lostTime
   }
 
-  /** Eligible to be handed an attacker token right now. */
+  /**
+   * Eligible to be handed an attacker token right now.
+   *
+   * Reloading disqualifies. The clamp exists to decide *who is shooting at the
+   * player*, and a soldier with an empty magazine is not a candidate for that
+   * however well placed it is: `engageable` is false for the whole of the
+   * `reload` state, so a reloading holder was a slot the squad could not use.
+   * Measured in the headless AI harness, six seeds: **9-11% of all token
+   * seconds** were held by a soldier waiting for a magazine while soldiers with
+   * a clear line stood by. Handing the token on costs the reloader nothing —
+   * `tokenReleasedAt` puts it at the front of the queue when it comes back.
+   */
   readyToAttack(): boolean {
-    return this.soldier.alive && this.alerted && this.hasContact
+    return this.soldier.alive && this.alerted && this.hasContact && !this.soldier.isReloading
   }
 
   takeToken(clock: number): void {
@@ -1117,20 +1204,38 @@ export class Behaviour {
     return !this.d.physics.raycast(s.muzzleWorld, T1, dist - 0.4, { characters: false })
   }
 
+  /** Whether this soldier's muzzle has an unobstructed line to a world point. */
+  private lineClear(p: THREE.Vector3): boolean {
+    const s = this.soldier
+    T1.copy(p).sub(s.muzzleWorld)
+    const dist = T1.length()
+    if (dist < 0.5) return true
+    T1.divideScalar(dist)
+    return !this.d.physics.raycast(s.muzzleWorld, T1, dist - 0.35, { characters: false })
+  }
+
   /**
    * Trigger discipline: 0.4–0.6 s of fire then a pause,
-   * `sv_botMinFireTime`/`MaxFireTime` `[stated]` §7.5. The reaction window is
-   * counted in `update` rather than here, because a soldier that is stepping
-   * out of cover is not calling this yet and its reaction still has to be
-   * running.
+   * `sv_botMinFireTime`/`MaxFireTime` `[stated]` §7.5.
+   *
+   * Every timer this reads is counted in `update` and none of them is counted
+   * here, for the reason the reaction window was already moved there: a soldier
+   * behind cover, walking to cover, or reloading does not call this method, and
+   * a clock that only advances while the trigger is available is not a clock.
+   *
+   * That was not a detail. Measured in the headless AI harness: a token holder
+   * on the cover cycle hides for 1.2-2.2 s, and its burst pause was frozen for
+   * the whole hide, so it stepped out with up to 2.6 s of pause still to serve
+   * and stood in the open doing nothing until it expired. The interval between
+   * one soldier's bursts was therefore pause **plus** hide — up to 4.8 s —
+   * against a player who resets to full health after 3 s. Every soldier's
+   * contribution was individually erasable, which is most of why 90 seconds of
+   * continuous contact could not kill anyone. Now the pause overlaps the hide,
+   * so the interval is the larger of the two rather than their sum.
    */
-  private fire(dt: number, target: THREE.Vector3, mayHit: boolean): void {
+  private fire(target: THREE.Vector3, mayHit: boolean): void {
     if (this.reactionTimer > 0) return
-    this.fireTimer -= dt
-    if (this.burstPause > 0) {
-      this.burstPause -= dt
-      return
-    }
+    if (this.burstPause > 0) return
     if (this.fireTimer > 0) return
     if (this.magazine <= 0) {
       this.enter('reload')
@@ -1172,8 +1277,28 @@ export class Behaviour {
     s.fireVisuals()
     ctx.services.audio?.play('enemyFire', s.muzzleWorld, { volume: 0.85, maxDistance: 110 })
 
+    // Aim at the part of the player this muzzle can actually reach.
+    //
+    // The gate that let this soldier pull the trigger is `muzzleClear`, which
+    // tests the muzzle against the player's **eye**. The round was then placed
+    // at the chest, 0.67 m lower, and a descending line over a waist-high wall
+    // clips the top of it — so the soldier had a clear shot, took it, and put
+    // the round into cover the player was not even using.
+    //
+    // Measured in the headless AI harness, six seeds, six soldiers, a kill
+    // every 2.3 s: of the rounds that had won every other test — token holder,
+    // exposed, past its ranging burst — **28% were stopped by geometry at
+    // 22.7 m and 33% at 27.7 m, and every single one of them had a clear line
+    // to the eye.** None of them was real cover. That is the largest per-round
+    // loss in the file, and it grows with range, which is why the damage model
+    // reads honestly at 10 m and not at all at 25 m.
+    //
+    // So the chest is the preferred point and the upper chest is the fallback,
+    // both inside the same 1.6 m silhouette. A player genuinely behind cover
+    // still takes nothing: `muzzleClear` fails first and no shot comes out.
     this.firePoint.copy(target)
-    this.firePoint.y += 0.95
+    this.firePoint.y += CHEST_HEIGHT
+    if (mayHit && !this.lineClear(this.firePoint)) this.firePoint.y = target.y + UPPER_CHEST_HEIGHT
     T2.copy(this.firePoint).sub(s.muzzleWorld)
     const dist = T2.length() || 1
     this.noteShot(dist)
@@ -1251,7 +1376,7 @@ export class Behaviour {
     this.suppressAim.z += this.d.rng.spread(2.4) * dt
     this.suppressAim.y = this.lastKnown.y - 1.4
     if (this.suppressAim.distanceToSquared(this.lastKnown) > 12) this.suppressAim.copy(this.lastKnown)
-    this.fire(dt, this.suppressAim, false)
+    this.fire(this.suppressAim, false)
   }
 
   // -------------------------------------------------------------------------
@@ -1294,6 +1419,10 @@ export class Behaviour {
         this.fireTimer = 0
         this.burstLeft = burstRounds(this.d.rng)
       }
+    } else {
+      // Trigger discipline runs on the clock too. See {@link fire}.
+      if (this.burstPause > 0) this.burstPause -= dt
+      if (this.fireTimer > 0) this.fireTimer -= dt
     }
 
     // One line-of-fire test per frame; see the field for what it means.
@@ -1517,7 +1646,7 @@ export class Behaviour {
       s.stance = dist > 14 ? 'crouch' : 'stand'
     }
 
-    if (this.engageable) this.fire(dt, this.pPos, true)
+    if (this.engageable) this.fire(this.pPos, true)
     else if (this.lostTime < 3.5 && this.d.squad.alert > 0.5 && this.d.rng.bool(0.02)) this.enter('suppress')
   }
 
@@ -1545,7 +1674,7 @@ export class Behaviour {
     // that pushed the live figure past the 0.5-1.0 s of §7.5. `engageable`
     // already covers this state, so the exposure rule still holds and the
     // player can always shoot back.
-    if (this.engageable) this.fire(dt, this.pPos, true)
+    if (this.engageable) this.fire(this.pPos, true)
     if (done || this.timeInState > 6) {
       this.inCover = true
       this.enter('suppress')
@@ -1602,7 +1731,7 @@ export class Behaviour {
     s.stance = this.peeking ? 'stand' : 'crouch'
 
     if (!this.peeking) return
-    if (this.engageable) this.fire(dt, this.pPos, true)
+    if (this.engageable) this.fire(this.pPos, true)
     else if (this.lostTime > 0.5 && this.lostTime < 6) this.suppressFire(dt)
   }
 
@@ -1629,7 +1758,7 @@ export class Behaviour {
     this.aimAtLastKnown(this.hasContact ? 1 : 0.5)
     const left = this.hasDestination ? s.position.distanceTo(this.destination) : 0
     const done = this.followPath(dt, travelSpeed(left))
-    if (this.engageable) this.fire(dt, this.pPos, true)
+    if (this.engageable) this.fire(this.pPos, true)
     if (done || this.timeInState > 9) {
       this.role = 'suppress'
       this.enter('engage')
