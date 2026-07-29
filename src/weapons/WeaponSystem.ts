@@ -88,10 +88,15 @@ export class WeaponSystem implements System, WeaponService {
     yawDelta: 0, pitchDelta: 0, lowReady: 0, elapsed: 0,
   }
 
+  /** Falling edge of the player's life, so death is handled exactly once. */
+  private wasAlive = true
+  private offs: (() => void)[] = []
+
   private tmpPos = new THREE.Vector3()
   private tmpDir = new THREE.Vector3()
   private tmpSpread = new THREE.Vector3()
   private tmpVel = new THREE.Vector3()
+  private tmpPort = new THREE.Vector3()
   private tmpQuat = new THREE.Quaternion()
   private tmpMat = new THREE.Matrix4()
   private tmpEuler = new THREE.Euler(0, 0, 0, 'YXZ')
@@ -125,7 +130,26 @@ export class WeaponSystem implements System, WeaponService {
     this.lastYaw = ctx.camera.rotation.y
     this.lastPitch = ctx.camera.rotation.x
 
+    // A respawn hands back a fresh loadout. Without this the weapon survived
+    // death exactly as it was left: the player came back holding whatever was
+    // in the magazine when they died, part way through a reload, with the
+    // recoil and sustained-fire spread of the burst that got them killed still
+    // accumulated. Coming out of a death into a fight with four rounds is a
+    // large part of why the run after a death reads as unwinnable.
+    this.offs.push(ctx.events.on('player:respawn', () => this.onRespawn()))
+
     ctx.services.weapons = this
+  }
+
+  /**
+   * Whether the player is alive. `PlayerService` in the frozen `Types.ts`
+   * contract predates the death state, so this is a structural read of the
+   * field `PlayerSystem` already publishes — the same pattern the sprint-out
+   * clock uses below. Absent means alive, so a stripped-down player harness
+   * still shoots.
+   */
+  private playerAlive(ctx: GameContext): boolean {
+    return (ctx.services.player as { alive?: boolean } | undefined)?.alive !== false
   }
 
   // ------------------------------------------------------------------ input
@@ -137,12 +161,25 @@ export class WeaponSystem implements System, WeaponService {
     const player = ctx.services.player
     const scripted = this.captureScript(ctx)
 
-    const wantAds = scripted ? scripted.ads : input.mouse1
-    const trigger = scripted ? scripted.fire : input.mouse0
+    // A corpse does not shoot. Nothing gated the trigger on the player being
+    // alive, and the death camera runs for four seconds before the respawn —
+    // so a held trigger kept the weapon firing along a view that is rolling
+    // onto its side, and every one of those rounds was a guaranteed miss. It
+    // is measurable: in the shipped `push` run the player died at t=16.4 s and
+    // the telemetry records 7 rounds in the t=17 s bucket and 8 in t=18 s, all
+    // for 0 damage, with the player 0.06 m from where they fell. That is 16 of
+    // the run's 158 shots — a tenth of every shot fired, all misses, dragging
+    // measured accuracy from 16.9% to 15.2% on its own.
+    const alive = this.playerAlive(ctx)
+    if (this.wasAlive && !alive) this.onDeath()
+    this.wasAlive = alive
+
+    const wantAds = scripted ? scripted.ads : alive && input.mouse1
+    const trigger = scripted ? scripted.fire : alive && input.mouse0
     const sprinting = !scripted && (player?.isSprinting ?? false) && !trigger && !wantAds
 
     // --- discrete actions -------------------------------------------------
-    if (!scripted) {
+    if (!scripted && alive) {
       if (input.wasPressed(KEY_RELOAD)) this.tryReload()
       if (input.wasPressed(KEY_INSPECT)) this.vm.beginInspect(def.inspectTime)
       if (input.wasPressed(KEY_FIREMODE)) this.cycleFireMode()
@@ -162,7 +199,7 @@ export class WeaponSystem implements System, WeaponService {
     // trigger is still down. Doing this only on the fire path left the weapon
     // sitting empty whenever the player let go, so the next trigger pull was a
     // dry click instead of a shot.
-    if (state.mag <= 0 && state.reserve > 0) this.tryReload()
+    if (alive && state.mag <= 0 && state.reserve > 0) this.tryReload()
 
     // --- sprint-out -------------------------------------------------------
     // §3.2 `[stated]`: sprint-out is 160-230 ms and is "the number that
@@ -201,6 +238,13 @@ export class WeaponSystem implements System, WeaponService {
     const movementSprintOut = (player as { sprintOutRemaining?: number } | undefined)?.sprintOutRemaining ?? 0
     const sprintBlocked = sprinting || this.sprintOutLeft > 0 || movementSprintOut > 0
     let firing = false
+
+    // An interrupted burst is abandoned, not banked. `burstLeft` survived a
+    // reload, a weapon switch and a sprint, so the moment the block cleared the
+    // weapon fired the remainder of the burst on its own with the trigger up —
+    // and after a switch it fired the *new* weapon's rounds against the old
+    // one's burst count.
+    if ((blocked || sprintBlocked) && this.burstLeft > 0) this.burstLeft = 0
 
     if (this.burstLeft > 0 && !blocked && !sprintBlocked) {
       firing = true
@@ -325,11 +369,14 @@ export class WeaponSystem implements System, WeaponService {
     const fx = ctx.services.fx
     if (fx) {
       fx.muzzleFlash(this.vm.muzzleMatrix(this.tmpMat), def.muzzleFlashScale, true)
-      this.vm.portWorld(this.tmpPos)
+      // Its own vector. This used to write the ejection port into `tmpPos`,
+      // which is `origin` — so the gunshot position handed to the AI below was
+      // wherever the brass left the gun, and only when effects were enabled.
+      this.vm.portWorld(this.tmpPort)
       this.vm.weaponDirToWorld(def.shellVel, this.tmpSpread)
       this.tmpSpread.x += this.rand.spread(0.5)
       this.tmpSpread.y += this.rand.spread(0.4)
-      fx.ejectShell(this.tmpPos, this.tmpSpread, true)
+      fx.ejectShell(this.tmpPort, this.tmpSpread, true)
     }
 
     ctx.services.ai?.notifyNoise(origin, def.noiseRadius)
@@ -437,6 +484,68 @@ export class WeaponSystem implements System, WeaponService {
     this.isReloading = false
     this.vm.cancelReload()
     ctx.events.emit('weapon:reload', { weapon: this.def.id, phase: 'end' })
+  }
+
+  // ------------------------------------------------------- death and respawn
+
+  /**
+   * Put the weapon down. The trigger is already refused above; this clears the
+   * state that would otherwise carry across the four seconds of death camera
+   * and out the other side — a half-finished reload, a pending burst, an
+   * accumulated recoil offset the camera rig is still adding to the aim.
+   */
+  private onDeath(): void {
+    this.burstLeft = 0
+    this.burstCooldown = 0
+    this.semiLatched = false
+    this.dryLatched = false
+    this.isFiring = false
+    this.wasFiring = false
+    this.spread = 0
+    this.sprintOutLeft = 0
+    this.recoil.reset()
+    this.recoilPitch = 0
+    this.recoilYaw = 0
+    if (this.reloadTimer >= 0) this.cancelReload(this.ctx)
+  }
+
+  /**
+   * A fresh loadout, the way respawning in Call of Duty hands one back. §3.4
+   * `[measured]` even gives spawning its own weapon-raise timing ("first raise
+   * (spawn)"), which only means anything if the weapon is reset with it.
+   *
+   * The equipped weapon is deliberately kept. There is no loadout screen here,
+   * so the slot the player chose is the closest thing to a stated preference,
+   * and forcing them back to slot 1 on every death would take it away.
+   */
+  private onRespawn(): void {
+    for (const w of WEAPONS) {
+      const s = this.ammo.get(w.id)
+      if (!s) continue
+      s.mag = w.magSize
+      s.reserve = w.reserve
+    }
+    this.reloadTimer = -1
+    this.isReloading = false
+    this.ammoCredited = false
+    this.pendingSwitch = -1
+    this.switchTimer = -1
+    this.fireTimer = 0
+    this.onDeath()
+    this.wasAlive = true
+    // A trigger held through the death does not count as a pull on the new
+    // life: a semi-automatic would otherwise fire the instant the player came
+    // back. Released and pulled again, it clears on the first frame.
+    this.semiLatched = true
+    this.vm.cancelReload()
+    // BO6 `[stated]`: "weapon raise animations that play on respawn are now
+    // fully interruptible." So the draw plays, but it does not lock the
+    // trigger — `fireTimer` stays at 0 rather than taking the usual
+    // `drawTime * 0.5` a deliberate weapon switch pays.
+    this.vm.beginSwitch(false, this.def.drawTime)
+    this.vm.setSlideLocked(false)
+    this.ammoDirty = true
+    this.ctx.events.emit('weapon:ammo', { mag: this.state.mag, reserve: this.state.reserve })
   }
 
   private spawnDroppedMag(ctx: GameContext): void {
@@ -624,6 +733,8 @@ export class WeaponSystem implements System, WeaponService {
   }
 
   dispose(): void {
+    for (const off of this.offs) off()
+    this.offs.length = 0
     this.vm.dispose()
     this.mats.dispose()
   }

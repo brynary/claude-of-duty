@@ -8,7 +8,7 @@ import type { Soldier } from './Soldier'
 
 export type AiState =
   | 'idle' | 'patrol' | 'investigate' | 'engage' | 'seekCover'
-  | 'suppress' | 'flank' | 'reload' | 'retreat' | 'dead'
+  | 'suppress' | 'flank' | 'reload' | 'retreat' | 'reposition' | 'dead'
 
 /** Role handed down by the squad so the whole team does not do one thing. */
 export type Role = 'hold' | 'suppress' | 'advance' | 'flank'
@@ -200,6 +200,66 @@ export const AI_CADENCE = {
 /** Stance dwell: `sv_botMinCrouchTime "2000"` / `Max "4000"` `[stated]` §7.5. */
 const HIDE_MIN = 2.0
 const HIDE_MAX = 4.0
+
+/**
+ * Seconds a soldier may go without a line of sight to the player before it
+ * starts closing on them again — the single number that decides whether a wave
+ * has dead air in it.
+ *
+ * `ai_noPathToEnemyGiveupTime "6000"` `[stated]` §7.4: after six seconds of
+ * being unable to reach the player the series' own AI gives up and repositions.
+ * The same six seconds is used here for the wider condition — *cannot see the
+ * player*, whatever the reason — because the measured failure was never
+ * specifically about pathing.
+ *
+ * What it replaces, measured in the harness against the shipped file: a squad
+ * that lost the player produced **60.0 s of silence in a 60 s window**, zero
+ * contact, with both soldiers ending in `idle`/`patrol` 38-49 m away. The
+ * encounter's own rescue — {@link Behaviour.alertTo} fired by `AiSystem` every
+ * 12 s — ran five times in that window and changed nothing, because
+ * `investigate` abandoned the order after five seconds however much ground it
+ * had left to cover, and because `alertTo` was ignored by any soldier not
+ * already idle. Two soldiers on a nav island with no route at all produced
+ * **70.0 s of silence in 70 s** and never moved a metre.
+ *
+ * A hunting soldier is told where the player is. That is not the AI cheating
+ * its way to a sighting: §7.4 `[measured]` is explicit that Call of Duty's
+ * enemies "move to scripted destinations" and that the tactical appearance is
+ * the level script rather than an agent deciding anything. Contact still needs
+ * line of sight, the vision cone and the reaction window; all this decides is
+ * that the fight comes to the player rather than expiring quietly.
+ */
+const HUNT_AFTER_QUIET = 6
+
+/** How long a hunting order stands before the soldier reverts to patrol. */
+const HUNT_DURATION = 30
+
+/**
+ * How often a hunting soldier is given the player's current position.
+ *
+ * Not every frame: a soldier that tracks the player continuously never loses
+ * the thread and there is no point at which breaking contact pays. On a 2.5 s
+ * refresh a player who moves at 4.7 m/s is up to 12 m from where the hunter
+ * believes them to be, which is a corner's worth of doubt.
+ */
+const HUNT_REFRESH = 2.5
+
+/**
+ * `ai_noPathToEnemyGiveupTime "6000"` `[stated]` §7.4, in its literal sense:
+ * seconds of wanting to move toward the player and finding no route before the
+ * soldier stops asking and repositions instead.
+ */
+const NO_PATH_GIVEUP = 6
+
+/**
+ * How much closer a reposition has to get before it is worth walking.
+ *
+ * Below this the soldier is shuffling, which reads worse than standing still.
+ * A reposition that cannot beat it means the soldier is genuinely stranded —
+ * a roof deck with no stair, a courtyard the nav grid never connected — and
+ * {@link Behaviour.stranded} goes up so `AiSystem` can recycle it.
+ */
+const REPOSITION_GAIN = 4
 
 interface CoverSpot {
   pos: THREE.Vector3
@@ -476,6 +536,26 @@ export class Behaviour {
   private idleLook = 0
   /** Seconds left of a standing order to close on {@link lastKnown}. */
   private huntFor = 0
+  /** Seconds until a hunting soldier is told where the player is now. */
+  private huntRefresh = 0
+  /**
+   * Seconds spent wanting to move toward the player and finding no route.
+   *
+   * `ai_noPathToEnemyGiveupTime "6000"` `[stated]` §7.4 exists because this
+   * state is otherwise permanent, and it was: `setDestination` dropped a failed
+   * `findPath` on the floor, `followPath` then reported "arrived" on the empty
+   * path, and every caller believed it. A soldier put somewhere the grid never
+   * connected — the market hall roof deck is the case this level actually
+   * produces — stood still for the rest of the match while the wave stayed open
+   * around it.
+   */
+  private noRouteFor = 0
+  /**
+   * No reachable position gets this soldier meaningfully closer to the player.
+   * Read by `AiSystem`, which recycles a stranded soldier the player cannot
+   * currently see rather than leaving the wave parked on it.
+   */
+  stranded = false
 
   // Player state cached once per frame so tick methods never fight over scratch.
   private pPos = new THREE.Vector3()
@@ -531,16 +611,7 @@ export class Behaviour {
       // difference is exactly the unfairness this file used to ship. Firing is
       // gated on this one, so an enemy shooting at the player is always an
       // enemy the player can shoot back at.
-      this.exposed = false
-      if (visible) {
-        s.chest(T4)
-        T2.copy(T4).sub(this.pEye)
-        const cd = T2.length()
-        if (cd > 0.01) {
-          T2.divideScalar(cd)
-          this.exposed = !this.d.physics.raycast(this.pEye, T2, cd - 0.3, { characters: false })
-        }
-      }
+      this.refreshExposure()
     }
 
     if (this.losClear) {
@@ -556,6 +627,13 @@ export class Behaviour {
     }
     const had = this.hasContact
     this.hasContact = this.losClear && this.awareness > 0.55
+    // Contact settles both give-up clocks wherever the soldier is in the state
+    // machine: it can see the player, so by definition it is not stranded and
+    // it is not out of routes worth trying.
+    if (this.hasContact) {
+      this.noRouteFor = 0
+      this.stranded = false
+    }
     if (this.awareness > 0.6) this.alerted = true
     else if (this.awareness <= 0.02 && this.lostTime > 12) this.alerted = false
 
@@ -567,7 +645,14 @@ export class Behaviour {
       const dist = p ? this.soldier.position.distanceTo(p.eye) : 0
       if (this.hasContact) {
         this.contactAt = this.d.ctx.elapsed
-        this.firedSinceContact = false
+        // Only a contact that re-arms the reaction window produces a reaction
+        // time. A soldier that ducked and popped back up inside
+        // {@link REACQUIRE_GRACE} deliberately keeps its spent window, so its
+        // next shot comes out in the same frame and reports 0.000 s — a number
+        // no soldier ever waited, from a rule that exists on purpose. The same
+        // argument `forceEngage` and `suppressFire` already make: report the
+        // measurement this file sets, and stay silent about the rest.
+        this.firedSinceContact = this.outOfContactFor <= REACQUIRE_GRACE
         // Sighting → first shot, 500-1000 ms on Regular. Rolled here so the
         // measured number is this one and not an artefact of burst timing, and
         // deliberately slower than the 200-350 ms the player needs to kill:
@@ -585,7 +670,20 @@ export class Behaviour {
         // A soldier that spots the player from behind cover comes out to fight
         // rather than finishing the hide it was in the middle of; otherwise its
         // first shot lands a hide-length after its reaction window closed.
-        if (this.state === 'suppress' && !this.peeking && this.peekTimer > 0.3) this.peekTimer = 0.3
+        //
+        // Zero, not 0.3. §7.5's 500-1000 ms is sighting to first shot, and the
+        // step out of cover is 0.75 m at 1.7 m/s — about 0.5 s once the walk
+        // ramps — which already runs concurrently with the reaction window and
+        // already sets the floor. Holding the hide for a further 0.3 s put the
+        // first shot past 1 s on every soldier that acquired from cover, which
+        // is most of them, and is the gap between the 0.694 s this file measures
+        // in isolation and the 1.36 s the live build reports.
+        if (this.state === 'suppress' && !this.peeking) this.peekTimer = 0
+        // The exposure line is sampled at 12 Hz with a per-soldier phase, so on
+        // the frame contact rises it can be up to 0.08 s stale — and firing is
+        // gated on it. One ray here, once per contact edge, keeps that latency
+        // out of the measured reaction time.
+        this.refreshExposure()
         this.d.ctx.events.emit('ai:contact', {
           id: this.soldier.id,
           position: this.soldier.position.clone(),
@@ -599,6 +697,22 @@ export class Behaviour {
       }
     }
     if (!this.hasContact) this.outOfContactFor += dt
+  }
+
+  /**
+   * Re-tests whether the player's eye has a clear line to this soldier's chest.
+   * Only meaningful while the soldier can see the player at all, so a blocked
+   * line of sight forces it false.
+   */
+  private refreshExposure(): void {
+    this.exposed = false
+    if (!this.losClear) return
+    this.soldier.chest(T4)
+    T2.copy(T4).sub(this.pEye)
+    const cd = T2.length()
+    if (cd <= 0.01) return
+    T2.divideScalar(cd)
+    this.exposed = !this.d.physics.raycast(this.pEye, T2, cd - 0.3, { characters: false })
   }
 
   /** Wall-clock time of the current contact, for reaction-time measurement. */
@@ -668,9 +782,26 @@ export class Behaviour {
    */
   alertTo(point: THREE.Vector3): void {
     this.awareness = Math.max(this.awareness, 0.45)
-    this.huntFor = 25
+    this.huntFor = HUNT_DURATION
+    this.huntRefresh = HUNT_REFRESH
     this.lastKnown.copy(point)
-    if (this.state === 'idle' || this.state === 'patrol') this.enter('investigate')
+    // Any state that is not already committed to something. The old guard only
+    // converted `idle` and `patrol`, so a soldier sitting in `suppress` or
+    // `engage` against a contact it lost ten seconds ago ignored the order
+    // outright — which is why `AiSystem`'s stall rescue fired five times over a
+    // minute in the harness and moved nobody. `reload` finishes its animation
+    // and `flank` is already a manoeuvre with its own nine-second cap.
+    if (!this.hasContact && this.state !== 'reload' && this.state !== 'flank' && this.state !== 'dead') {
+      this.enter('investigate')
+    }
+  }
+
+  /**
+   * Whether this soldier is under a standing order to go and find the player.
+   * Public so `AiSystem` can tell a parked wave from a fighting one.
+   */
+  get hunting(): boolean {
+    return this.huntFor > 0
   }
 
   /**
@@ -736,15 +867,73 @@ export class Behaviour {
   // Navigation
   // -------------------------------------------------------------------------
 
-  private setDestination(p: THREE.Vector3, force = false): void {
-    if (!force && this.hasDestination && this.destination.distanceToSquared(p) < 1.6) return
+  /**
+   * @returns whether the soldier has a route to `p`. **Check it.** A failed
+   * path used to be indistinguishable from an arrival, which is the whole of
+   * the stall in {@link noRouteFor}.
+   */
+  private setDestination(p: THREE.Vector3, force = false): boolean {
+    if (!force && this.hasDestination && this.destination.distanceToSquared(p) < 1.6) return true
     this.destination.copy(p)
     this.hasDestination = true
     this.pathIndex = 0
     if (this.d.nav.findPath(this.soldier.position, p, this.path) === 0) {
       this.path.length = 0
       this.hasDestination = false
+      return false
     }
+    return true
+  }
+
+  /**
+   * Repaths toward the player's last known position on a timer and charges the
+   * give-up clock when there is no route. Every state that tries to close on
+   * the player goes through this, so one soldier stuck behind geometry cannot
+   * quietly hold a wave open.
+   *
+   * @returns true once the soldier has arrived at the destination.
+   */
+  private advanceToward(p: THREE.Vector3, dt: number, interval: number): boolean {
+    if (this.repathTimer <= 0) {
+      this.repathTimer = interval
+      if (this.setDestination(p, true)) this.noRouteFor = 0
+      else this.noRouteFor += interval
+    }
+    if (!this.hasDestination) {
+      this.soldier.moveSpeed = 0
+      return false
+    }
+    return this.followPath(dt, travelSpeed(this.soldier.position.distanceTo(p)))
+  }
+
+  /**
+   * Finds the reachable point that gets this soldier closest to the player.
+   *
+   * Only ever called on the {@link NO_PATH_GIVEUP} edge — once per six seconds
+   * per stuck soldier — because each candidate costs a path query. The node cap
+   * is deliberately low: a route that needs more than a few hundred cells of
+   * search is not a reposition, it is the long way round, and the soldier can
+   * discover that one leg at a time.
+   */
+  private findReposition(out: THREE.Vector3): boolean {
+    const { nav, rng } = this.d
+    const s = this.soldier
+    const here = s.position.distanceTo(this.pPos)
+    let best = here - REPOSITION_GAIN
+    let found = false
+    for (let i = 0; i < 8; i++) {
+      if (!nav.randomPointNear(s.position, 3, 20, rng, G1)) continue
+      const d = G1.distanceTo(this.pPos)
+      if (d >= best) continue
+      if (nav.findPath(s.position, G1, this.path, 700) === 0) continue
+      best = d
+      out.copy(G1)
+      found = true
+    }
+    this.path.length = 0
+    this.pathIndex = 0
+    this.hasDestination = false
+    return found
   }
 
   private clearPath(): void {
@@ -1056,7 +1245,7 @@ export class Behaviour {
     this.timeInState = 0
     if (next !== 'engage' && next !== 'suppress') this.soldier.leanTarget = 0
     if (next === 'reload') this.soldier.startReload()
-    if (next === 'seekCover' || next === 'flank' || next === 'retreat') this.clearPath()
+    if (next === 'seekCover' || next === 'flank' || next === 'retreat' || next === 'reposition') this.clearPath()
   }
 
   update(dt: number): void {
@@ -1101,7 +1290,36 @@ export class Behaviour {
 
     this.repathTimer -= dt
     this.coverTimer -= dt
-    if (this.huntFor > 0) this.huntFor -= dt
+
+    // --- the anti-dead-air rule ------------------------------------------
+    //
+    // A soldier is never allowed to be out of contact and doing nothing about
+    // it for longer than `ai_noPathToEnemyGiveupTime`. This is the fix for the
+    // finding that every quiet stretch in a run was two live enemies who never
+    // made contact; see {@link HUNT_AFTER_QUIET} for the measurement.
+    //
+    // The trigger is `lostTime`, seconds without line of sight, rather than
+    // seconds without contact. They are the same number during a firefight —
+    // awareness is pinned at 1 and decays at 0.22/s, so contact returns on the
+    // same frame sight does — but only `lostTime` is guaranteed to reset on a
+    // peek, and a cover cycle that hides for four seconds and reloads for two
+    // and a half must not read as a soldier who has lost the fight.
+    if (this.huntFor > 0) {
+      this.huntFor -= dt
+      this.huntRefresh -= dt
+      // The order is refreshed rather than being a single stale coordinate, so
+      // a hunter that arrives where the player *was* keeps going instead of
+      // standing on an empty street and reverting to patrol.
+      if (this.huntRefresh <= 0) {
+        this.huntRefresh = HUNT_REFRESH
+        if (!this.hasContact) {
+          this.lastKnown.copy(this.pEye)
+          this.repathTimer = Math.min(this.repathTimer, 0)
+        }
+      }
+    } else if (this.lostTime > HUNT_AFTER_QUIET && !this.hasContact) {
+      this.alertTo(this.pEye)
+    }
     // Every second on target shaves the cone; this is the whole "they are
     // ranging you in" feeling. It bottoms out well short of perfect, because
     // an enemy that never misses is not a difficulty setting, it is a wall.
@@ -1117,6 +1335,7 @@ export class Behaviour {
       case 'flank': this.tickFlank(dt); break
       case 'reload': this.tickReload(dt); break
       case 'retreat': this.tickRetreat(dt); break
+      case 'reposition': this.tickReposition(dt); break
       case 'dead': break
     }
   }
@@ -1164,19 +1383,76 @@ export class Behaviour {
     }
   }
 
+  /**
+   * Closing on the player's last known position.
+   *
+   * This is the only state that covers ground toward the player, and the two
+   * rules it used to have were both wrong. It gave up after five seconds
+   * "arrived or not" — measured in the harness, a soldier under a hunt order
+   * covered 13 m of a 40 m approach and then reverted to a random local patrol,
+   * repeating on a 30% duty cycle and closing 40 m to 22 m over a full minute.
+   * And a failed path was indistinguishable from an arrival, so a soldier with
+   * no route quit instantly and permanently.
+   *
+   * Now: a standing hunt order is worked until it expires or contact is made,
+   * an unreachable destination charges the give-up clock rather than passing
+   * for success, and arriving at an empty last-known position means the next
+   * refresh moves the goalposts instead of ending the search.
+   */
   private tickInvestigate(dt: number): void {
     const s = this.soldier
     s.stance = 'stand'
-    if (this.alerted) { this.enter('engage'); return }
+    if (this.alerted && this.hasContact) { this.enter('engage'); return }
     if (this.awareness <= 0.02 && this.huntFor <= 0) { this.enter('patrol'); return }
-    if (this.repathTimer <= 0) {
-      this.setDestination(this.lastKnown, true)
-      this.repathTimer = 1.5
-    }
+
     this.aimAtLastKnown(0.75)
     s.faceTarget = this.lastKnown
-    const left = s.position.distanceTo(this.lastKnown)
-    if (this.followPath(dt, travelSpeed(left)) && this.timeInState > 5) this.enter('patrol')
+
+    const arrived = this.advanceToward(this.lastKnown, dt, 1.5)
+    if (this.noRouteFor >= NO_PATH_GIVEUP) { this.enter('reposition'); return }
+    // Arriving without finding anyone is not a reason to stop looking while an
+    // order stands; the hunt refresh will hand over a fresher position.
+    if (arrived && this.huntFor <= 0 && this.timeInState > 5) this.enter('patrol')
+  }
+
+  /**
+   * `ai_noPathToEnemyGiveupTime "6000"` `[stated]` §7.4 made visible: the
+   * soldier cannot reach the player from here, so it walks to the reachable
+   * place that gets it closest and tries again from there.
+   *
+   * A soldier that cannot improve on where it stands is genuinely stranded —
+   * put on a roof deck the nav grid never connected to the street, most often —
+   * and says so through {@link stranded} rather than standing in the state that
+   * looks identical to waiting. Standing still forever is the one outcome that
+   * produces dead air, and it was the shipped one.
+   */
+  private tickReposition(dt: number): void {
+    const s = this.soldier
+    s.stance = 'stand'
+    s.faceTarget = this.hasDestination ? this.destination : this.lastKnown
+    this.aimAtLastKnown(0.5)
+
+    if (this.hasContact) { this.noRouteFor = 0; this.stranded = false; this.enter('engage'); return }
+
+    if (!this.hasDestination && this.timeInState < 0.2) {
+      if (this.findReposition(T1) && this.setDestination(T1, true)) {
+        this.stranded = false
+      } else {
+        this.stranded = true
+      }
+    }
+    if (!this.hasDestination) {
+      // Nowhere to go. Keep watching the player's bearing so a recycled or
+      // rescued soldier is at least facing the fight, and re-test occasionally
+      // in case the player has moved somewhere this position can reach.
+      s.moveSpeed = 0
+      if (this.timeInState > 4) { this.noRouteFor = 0; this.enter('investigate') }
+      return
+    }
+    if (this.followPath(dt, travelSpeed(s.position.distanceTo(this.destination))) || this.timeInState > 12) {
+      this.noRouteFor = 0
+      this.enter('investigate')
+    }
   }
 
   private tickEngage(dt: number): void {
@@ -1206,8 +1482,10 @@ export class Behaviour {
     if (this.role === 'advance' && dist > 9 && this.lostTime < 3 && !holding) {
       if (this.repathTimer <= 0) {
         this.repathTimer = 0.9
-        this.setDestination(this.pPos, true)
+        if (this.setDestination(this.pPos, true)) this.noRouteFor = 0
+        else this.noRouteFor += 0.9
       }
+      if (this.noRouteFor >= NO_PATH_GIVEUP) { this.enter('reposition'); return }
       this.followPath(dt, travelSpeed(dist - 9))
       s.stance = 'stand'
     } else {
@@ -1222,12 +1500,29 @@ export class Behaviour {
   private tickSeekCover(dt: number): void {
     const s = this.soldier
     if (!this.cover) { this.enter('engage'); return }
-    if (!this.hasDestination) this.setDestination(this.cover.pos, true)
+    // A cover spot with no route to it is not cover, it is a reason to stand
+    // still: `followPath` reports arrival on an empty path, so the soldier used
+    // to declare itself in cover on the spot and start peeking at a wall.
+    if (!this.hasDestination && !this.setDestination(this.cover.pos, true)) {
+      this.cover = null
+      this.coverTimer = 2.4
+      this.enter('engage')
+      return
+    }
     this.aimAtLastKnown(0.85)
     s.faceTarget = this.lastKnown
     s.stance = 'stand'
     const left = s.position.distanceTo(this.cover.pos)
-    if (this.followPath(dt, travelSpeed(left)) || this.timeInState > 6) {
+    const done = this.followPath(dt, travelSpeed(left))
+    // Firing on the move to cover. A soldier that has just sighted the player
+    // with a clear line and walks 8 m to a wall before pulling the trigger
+    // reports a reaction time of the walk, not of the reaction: measured at
+    // 1.73 s against a 0.83 s window, and it is the second of the two shapes
+    // that pushed the live figure past the 0.5-1.0 s of §7.5. `engageable`
+    // already covers this state, so the exposure rule still holds and the
+    // player can always shoot back.
+    if (this.engageable) this.fire(dt, this.pPos, true)
+    if (done || this.timeInState > 6) {
       this.inCover = true
       this.enter('suppress')
     }
@@ -1359,6 +1654,26 @@ export class Behaviour {
     }
     s.moveDir.copy(T1).divideScalar(d)
     s.moveSpeed = Math.min(speed, d * 3.5)
+  }
+
+  /**
+   * Called after `AiSystem` has physically moved this soldier somewhere else,
+   * so nothing carries over from the position it was stuck in: the path, the
+   * cover spot and the stuck detector all refer to coordinates that are now
+   * behind it, and the give-up clock has to start again or the soldier gives up
+   * on its new post within a frame.
+   */
+  relocated(): void {
+    this.clearPath()
+    this.cover = null
+    this.inCover = false
+    this.coverTimer = 0
+    this.noRouteFor = 0
+    this.stranded = false
+    this.stuckTimer = 0
+    this.repathTimer = 0
+    this.lastPos.copy(this.soldier.position)
+    this.enter('investigate')
   }
 
   /**

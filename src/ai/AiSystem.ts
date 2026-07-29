@@ -54,13 +54,52 @@ const LULL_MAX = 15
  * Seconds a wave may go without anyone holding contact before the survivors are
  * told where the player is.
  *
- * `ai_noPathToEnemyGiveupTime "6000"` `[stated]` §7.4 gives up on an
- * unreachable player after 6 s and repositions, which is the right behaviour
- * and also how a wave stalls: one soldier that cannot find the player leaves
- * the encounter parked. Twice the give-up time, then the survivors get a
- * heading.
+ * `ai_noPathToEnemyGiveupTime "6000"` `[stated]` §7.4. This is now a backstop
+ * rather than the mechanism — every soldier issues its own hunt order after the
+ * same six seconds, see `HUNT_AFTER_QUIET` in Behaviour — and it is kept
+ * because a wave-wide re-issue also re-arms soldiers that are mid-reposition.
  */
-const HUNT_AFTER = 12
+const HUNT_AFTER = 6
+
+/**
+ * Seconds a soldier may report itself stranded before it is picked up and put
+ * somewhere it can fight from.
+ *
+ * A soldier that has told the encounter it cannot get closer to the player from
+ * where it stands has nothing left to contribute, and the measured consequence
+ * is severe: two soldiers on the market hall roof deck — which the nav grid
+ * samples as perfectly standable ground and which no route reaches, because a
+ * 2.9 m drop is six times `STEP_HEIGHT` — held a wave open for **70 seconds of
+ * unbroken silence** in a 70 second harness run, never moving and never making
+ * contact. That is the panel's "enemiesAlive floors at exactly 2 with
+ * enemiesInContact at 0", and there are exactly two roof posts in the level's
+ * post graph.
+ *
+ * Recycling is only allowed while the player cannot see the soldier. A hostile
+ * that vanishes in plain sight is a worse bug than a hostile standing on a
+ * roof, and a soldier the player *can* see is contributing to the encounter
+ * whether or not it can walk to them.
+ */
+const STRANDED_GRACE = 3
+
+/**
+ * How close to the player a wave is allowed to arrive, metres.
+ *
+ * §6.2 `[estimated]` puts spawn to first contact at 5-10 s, which at a 3.2 m/s
+ * walk-in is 16-32 m, and §6.3 `[stated]` puts the designed engagement
+ * distances at 13 m and 26 m. The opening wave was measuring **5.8-6.3 m** —
+ * inside the fight, in the open, with a clear line by construction, on the
+ * first frame of the run — because the composed-arc candidates start at 8.5 m
+ * and `nearestWalkable` may pull one a further 3 m in.
+ *
+ * Every zero-hit engagement across all seven recorded runs opens at t = 0.1 s;
+ * engagements at the same 4-6 m later in the same runs land 3 of 10, 4 of 4 and
+ * 3 of 2 hits. So the point-blank opening is not by itself why the player
+ * cannot hit anything for the first fifteen seconds — that fault is not in this
+ * system — but an unavoidable point-blank ambush on frame one is a bad opening
+ * on its own terms and this is the floor that removes it.
+ */
+const MIN_SPAWN_RANGE = 15
 
 /** Minimum bearing separation between two live soldiers, radians. */
 const MIN_SCREEN_SEPARATION = 0.115
@@ -172,6 +211,18 @@ export class AiSystem implements System, AiService {
   private waveIndex = 0
   /** Seconds since anyone in the current wave held contact with the player. */
   private quietFor = 0
+  /**
+   * Size of the opening wave, spawned on the first simulated frame rather than
+   * in {@link init}. Zero once it has gone out.
+   *
+   * `init` runs before the first physics step that contains this system's own
+   * colliders and before the player controller has taken its first frame, so a
+   * wave staged there is composed against a player that has not moved yet and
+   * lands in a world Rapier's query pipeline has not seen. Deferring one frame
+   * costs nothing and removes a whole class of first-second artefact.
+   */
+  private openingWave = 0
+  private strandedFor = new Map<number, number>()
   private spawnCandidates: THREE.Vector3[] = []
   private observer = new THREE.Vector3()
   private observerYaw = 0
@@ -260,7 +311,10 @@ export class AiSystem implements System, AiService {
       AI_CADENCE.meanDamagePerHit,
     )
 
-    this.spawnWave(this.scripted ? 7 : 5)
+    // A capture pose is a frozen composition and has no first frame to wait
+    // for, so it still stages here. Live play waits for {@link openingWave}.
+    if (this.scripted) this.spawnWave(7)
+    else this.openingWave = 5
   }
 
   // -------------------------------------------------------------------------
@@ -304,8 +358,13 @@ export class AiSystem implements System, AiService {
     const rightX = Math.cos(this.observerYaw)
     const rightZ = -Math.sin(this.observerYaw)
 
+    // A capture pose wants soldiers legible in frame and composes at whatever
+    // range reads; live play wants a wave that walks in, so its nearest arc
+    // candidate sits on {@link MIN_SPAWN_RANGE} rather than at 8.5 m.
     const angles = [0.06, -0.2, 0.28, -0.42, 0.44, -0.1, 0.2, -0.55, 0.58]
-    const ranges = [11, 16, 8.5, 20, 13.5, 24, 18, 9.5, 22]
+    const ranges = this.scripted
+      ? [11, 16, 8.5, 20, 13.5, 24, 18, 9.5, 22]
+      : [19, 24, 16, 28, 21.5, 32, 26, 17, 30]
     for (let i = 0; i < angles.length; i++) {
       const a = angles[i]
       const r = ranges[i]
@@ -349,6 +408,15 @@ export class AiSystem implements System, AiService {
       this.spawnCandidates[write++] = c
       this.spawnCandidates[i] = tmp
     }
+  }
+
+  /**
+   * Inside the wave's arrival floor. Scripted captures are exempt: they compose
+   * a frame rather than staging an approach.
+   */
+  private tooClose(p: THREE.Vector3): boolean {
+    if (this.scripted) return false
+    return Math.hypot(p.x - this.observer.x, p.z - this.observer.z) < MIN_SPAWN_RANGE
   }
 
   /** Whether the observer has a clear line to a chest standing at `p`. */
@@ -414,12 +482,18 @@ export class AiSystem implements System, AiService {
     this.quietFor = 0
   }
 
+  /**
+   * Three passes, each dropping one constraint rather than leaving the wave
+   * short-handed. Order matters: screen separation is the first thing given up
+   * because two soldiers on the same bearing is a composition fault, and the
+   * arrival floor is the last because a wave landing on top of the player is a
+   * gameplay fault. `MatchDirector` forfeits a wave after a few spawn failures,
+   * so returning null has to stay genuinely rare.
+   */
   private pickSpawn(index: number, wave: number): THREE.Vector3 | null {
     const n = this.spawnCandidates.length
     if (n === 0) return null
-    // Two passes: the first also enforces angular separation in the observer's
-    // frame, the second drops it rather than leaving the wave short-handed.
-    for (let pass = 0; pass < 2; pass++) {
+    for (let pass = 0; pass < 3; pass++) {
       for (let attempt = 0; attempt < n; attempt++) {
         const c = this.spawnCandidates[(index + attempt + wave * 3) % n]
         let clash = false
@@ -430,7 +504,15 @@ export class AiSystem implements System, AiService {
         }
         if (clash) continue
         this.tmpA.copy(c)
-        if (this.nav.nearestWalkable(this.tmpA, 3, this.tmpB)) return this.tmpB.clone()
+        // The arrival floor is applied *after* the walkable snap, not before:
+        // the snap moves a candidate by up to 3 m and it is the position the
+        // soldier actually stands at that has to clear the floor. Checking the
+        // candidate instead is what let an 8.5 m arc point become a 5.8 m spawn.
+        if (this.nav.nearestWalkable(this.tmpA, 3, this.tmpB)) {
+          if (pass < 2 && this.tooClose(this.tmpB)) continue
+          return this.tmpB.clone()
+        }
+        if (pass < 2 && this.tooClose(c)) continue
         return c.clone()
       }
     }
@@ -478,6 +560,14 @@ export class AiSystem implements System, AiService {
     if (ctx.config.freezeAt !== null && ctx.elapsed >= ctx.config.freezeAt - 0.05) this.forceCaptureAction()
 
     if (dt > 0) {
+      // Deferred from init: by now the player controller has taken a frame and
+      // the physics world has stepped with this level in it.
+      if (this.openingWave > 0) {
+        const n = this.openingWave
+        this.openingWave = 0
+        this.spawnWave(n)
+      }
+
       this.retireDead()
 
       const player = ctx.services.player
@@ -491,6 +581,7 @@ export class AiSystem implements System, AiService {
       for (const s of this.soldiers) s.update(dt)
 
       this.updateCorpses(dt)
+      this.recycleStranded(dt)
       this.updateWaves(dt)
     }
 
@@ -525,6 +616,7 @@ export class AiSystem implements System, AiService {
       const bi = this.squad.members.findIndex((b) => b.soldier === s)
       if (bi >= 0) this.squad.members.splice(bi, 1)
       this.byId.delete(s.id)
+      this.strandedFor.delete(s.id)
     }
   }
 
@@ -539,6 +631,52 @@ export class AiSystem implements System, AiService {
       } else if (s.deadTime > CORPSE_FADE_START) {
         s.setFade(1 - (s.deadTime - CORPSE_FADE_START) / (CORPSE_LIFETIME - CORPSE_FADE_START))
       }
+    }
+  }
+
+  /**
+   * Picks up soldiers that have reported themselves stranded and puts them
+   * somewhere they can fight from.
+   *
+   * `Behaviour` raises {@link Behaviour.stranded} only after the six seconds of
+   * `ai_noPathToEnemyGiveupTime` `[stated]` §7.4 *and* a failed search for any
+   * reachable position that gets it materially closer. At that point the
+   * soldier is not slow, it is unreachable — a roof deck the nav grid never
+   * connected to the street — and there is no behaviour that fixes it from the
+   * inside. Leaving it standing there is what held waves open for a minute at a
+   * time and made every lull in the run a hostile the player could not fight.
+   *
+   * The move is a real respawn at a fresh staged post, not a nudge, and it only
+   * happens out of the player's sight.
+   */
+  private recycleStranded(dt: number): void {
+    for (const b of this.squad.members) {
+      const s = b.soldier
+      if (!s.alive) continue
+      if (!b.stranded) {
+        if (this.strandedFor.size > 0) this.strandedFor.delete(s.id)
+        continue
+      }
+      const held = (this.strandedFor.get(s.id) ?? 0) + dt
+      this.strandedFor.set(s.id, held)
+      if (held < STRANDED_GRACE) continue
+
+      // The observer has to be current before the visibility test, not after:
+      // `seesChestAt` reads it, and a stale one asks whether the player could
+      // have seen this soldier from wherever they were standing last wave.
+      this.resolveObserver()
+      if (this.seesChestAt(s.position)) continue
+      this.buildSpawnCandidates()
+      const spot = this.pickSpawn(this.waveIndex + s.id, this.waveIndex)
+      if (!spot) continue
+      const yaw = Math.atan2(this.observer.x - spot.x, this.observer.z - spot.z)
+      s.teleport(spot, yaw)
+      b.relocated()
+      b.alertTo(this.observer)
+      this.strandedFor.delete(s.id)
+      // One per frame: each one costs a candidate rebuild and a spawn search,
+      // and a wave that needs several of them is not in a hurry.
+      return
     }
   }
 
@@ -565,7 +703,10 @@ export class AiSystem implements System, AiService {
         this.quietFor = 0
         const player = this.ctx.services.player
         this.tmpA.copy(player ? player.eye : this.ctx.camera.position)
-        for (const b of this.squad.members) if (b.soldier.alive) b.alertTo(this.tmpA)
+        // Skips soldiers already hunting: re-issuing resets their order timer
+        // every six seconds, which never expires and so never lets a soldier
+        // that has genuinely lost the fight fall back to patrol.
+        for (const b of this.squad.members) if (b.soldier.alive && !b.hunting) b.alertTo(this.tmpA)
       }
       // Negative means "the field is busy"; the lull is only rolled once, on
       // the transition to empty, so the shared PRNG is not advanced every frame

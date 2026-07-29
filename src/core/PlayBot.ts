@@ -279,12 +279,24 @@ export class PlayBotSystem implements System {
 
     // Convert the aim delta into mouse movement so the real camera rig, its
     // sensitivity and its recoil handling all stay in the loop.
+    //
+    // The rig scales sensitivity down while aiming — `sensitivity * (1 - 0.38 *
+    // ads)` — so dividing by the raw value delivered only 62% of the requested
+    // turn in exactly the situation the bot is trying to aim carefully in, and
+    // it converged 38% slower there than anywhere else.
     const dYaw = wrapAngle(this.aimYaw - player.yaw)
     const dPitch = this.aimPitch - player.pitch
-    const sens = ctx.config.sensitivity
+    const ads = ctx.services.weapons?.adsFraction ?? 0
+    const sens = ctx.config.sensitivity * (1 - 0.38 * ads)
     this.frame.mouseDX = -dYaw / sens
     this.frame.mouseDY = -dPitch / sens
+
+    // How far off target the aim currently is, for the trigger to consult.
+    this.aimErrorRad = Math.hypot(dYaw, dPitch)
   }
+
+  /** Angular distance between where the bot is looking and where it wants to. */
+  private aimErrorRad = Math.PI
 
   // --- movement ------------------------------------------------------------
 
@@ -414,8 +426,17 @@ export class PlayBotSystem implements System {
   private trigger(dt: number, ctx: GameContext, weapons: GameContext['services']['weapons']): void {
     if (this.scenario.goal === 'traverse') return
 
+    // Wait for the aim to arrive before pulling the trigger. Firing on
+    // "has a target and has finished reacting" meant the bot emptied magazines
+    // while still slewing onto the target, which is not what a player does and
+    // it charged every one of those rounds to accuracy. The tolerance is
+    // generous — a player fires as the sights sweep on, not after they settle —
+    // and it widens close in, where a large angular error is still a hit.
     const reacting = this.target !== null && this.t - this.targetSince < this.skill.reactionTime
-    const onTarget = this.target !== null && !reacting
+    const tolerance = THREE.MathUtils.degToRad(this.target
+      ? THREE.MathUtils.clamp(140 / Math.max(this.target.position.distanceTo(ctx.services.player!.eye), 3), 4, 30)
+      : 4)
+    const onTarget = this.target !== null && !reacting && this.aimErrorRad < tolerance
 
     this.frame.mouse1 = onTarget && this.wantAds
 

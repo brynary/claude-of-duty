@@ -71,7 +71,32 @@ export class Input {
   /** When set, every read below comes from here instead of the hardware. */
   scripted: ScriptedFrame | null = null
 
-  locked = false
+  private hardwareLocked = false
+
+  /**
+   * Whether look input should be honoured.
+   *
+   * Scripted frames count as locked. A scripted frame *is* captured input — it
+   * is the harness standing in for a hand on a mouse — and gating it on a
+   * browser pointer lock was a bug that silently invalidated every gameplay
+   * measurement taken through this class.
+   *
+   * `CameraRig.look` reads the mouse only when this is true. In a bot run
+   * nothing ever requests the lock: the autostart path skips it, `PlayerSystem`
+   * asks only on `mouse0Pressed` which the bot never sets, and the harness never
+   * clicks the canvas. So every delta the bot produced was discarded and the
+   * camera held its spawn yaw for the whole run — while the bot, which acquires
+   * any target within 70m with line of sight regardless of facing, cheerfully
+   * held the trigger on enemies behind it. Measured against the real rig: 0.3
+   * degrees of total view rotation over 90 seconds, and 0% accuracy on any
+   * target more than a few degrees off the spawn line.
+   */
+  get locked(): boolean {
+    return this.scripted !== null || this.hardwareLocked
+  }
+  set locked(v: boolean) {
+    this.hardwareLocked = v
+  }
 
   get mouseDX(): number { return this.scripted ? this.scripted.mouseDX : this.rawMouseDX }
   set mouseDX(v: number) { this.rawMouseDX = v }
@@ -101,8 +126,8 @@ export class Input {
 
   private element: HTMLElement | null = null
   private onLockChange = () => {
-    this.locked = document.pointerLockElement === this.element
-    if (!this.locked) this.forgetHeld()
+    this.hardwareLocked = document.pointerLockElement === this.element
+    if (!this.hardwareLocked) this.forgetHeld()
   }
 
   attach(element: HTMLElement): void {

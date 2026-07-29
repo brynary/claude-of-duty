@@ -30,11 +30,31 @@ import { groundHeight } from './Terrain'
  *   than from everywhere at once;
  * - starts **behind cover**, out of the player's line of sight, so contact is
  *   something the player walks into rather than something that appears;
- * - starts far enough out that the approach itself is the lull — §6.2 of
- *   `.ai/FEEL_TARGET.md` puts spawn to first contact at 5-10 s `[estimated]`;
- * - opens at a deliberately varied distance, cycling through the §6.3 `[stated]`
- *   CoD5 level-design sightlines (13 m SMG, 26 m rifle) and this map's long
- *   case at ~34 m, so the fight is not the same fight every time.
+ * - starts far enough out that the approach itself is the lull, and close
+ *   enough that the approach ends.
+ *
+ * That last clause is this round's correction. The file was staging waves at a
+ * measured mean of **32.9 m** — reasoned from the player movement speeds in
+ * §4.1 and the 5-10 s spawn-to-contact of §6.2 `[estimated]` — and three things
+ * were wrong with it, all of them measured rather than argued:
+ *
+ * 1. Soldiers do not move at player speeds. Walking each staged post's A* route
+ *    at the AI's own `travelSpeed` (sprint 5.1 m/s down to 13 m out, then walk
+ *    3.2 m/s, §7.5 `[stated]` `sv_botSprintDistance`) put the commute to the
+ *    distance fights actually happen at at 5.9 s mean, 9.1 s p90, 13.3 s max.
+ *    Not catastrophic — the briefed suspicion that the walk blew the budget
+ *    outright does not survive the measurement — but the tail is the whole
+ *    problem, because a soldier walks to where the player *was* and `AiSystem`
+ *    only refreshes that address after `HUNT_AFTER` seconds of quiet. Every
+ *    second of commute past that is a soldier walking to a stale address.
+ * 2. `AiSystem.buildSpawnCandidates` promotes a published post ahead of its own
+ *    composed arc only when the post is 12-30 m out and hidden. At a 32.9 m
+ *    mean, most of what this file published was never preferred. The opening
+ *    staging put five of its six posts outside that band, so the opening wave —
+ *    the one the playtest panel called an unwinnable scripted loss — landed on
+ *    the arc: close, and in the player's view.
+ * 3. Varying the *sightline* per wave does not vary the range fights open at.
+ *    See {@link SIGHT_CYCLE}.
  *
  * Nothing here decides *how* enemies fight — that is `src/ai`. This only
  * decides where they exist and when they arrive.
@@ -199,31 +219,105 @@ const MIN_BEHIND = 26
 const REAR_COS = -0.174
 
 /**
- * Furthest a wave is staged, metres. Enemy `VIEW_RANGE` in `src/ai` is 55 m, so
- * past that a soldier can never acquire the player at all and the encounter
- * simply stops. 46 m leaves headroom under it.
+ * Furthest a wave is staged, metres.
+ *
+ * This used to be 46, reasoned from enemy `VIEW_RANGE` (55 m in `src/ai`) with
+ * headroom. That is the wrong ceiling: it is the distance past which a soldier
+ * cannot *see*, and the binding limit is the distance past which the spawner
+ * will not *use* the post at all.
+ *
+ * `AiSystem.buildSpawnCandidates` ranks its own composed arc first — nine
+ * points at 8.5-24 m in front of the player, each required to have a clear line
+ * to the chest — and then appends this director's published points. It promotes
+ * a published point ahead of that arc only when it is **12-30 m out and not
+ * visible**; everything else keeps arc order. So a point staged past 30 m is
+ * not staged at all in any useful sense. It sits behind nine positions chosen
+ * to be close and in view, which is the exact opposite of what this file is
+ * for.
+ *
+ * Measured, driving the shipped director over 1,968 standable spots x 6
+ * facings x the 8 bands of {@link SIGHT_CYCLE} — 11,808 stagings, 60,340
+ * published posts: mean staged distance **32.9 m**, p90 42.7 m, max 46.0 m.
+ * The opening staging against `playerSpawn` publishes six posts at 27.0, 35.0,
+ * 37.7, 38.7, 38.8 and 40.7 m, of which **one** is inside the band the spawner
+ * promotes. The opening wave therefore lands on the composed arc — close, and
+ * in the player's view — however carefully this file staged it.
+ *
+ * 30 m is that band's upper edge, so every post published now outranks the arc.
  */
-const MAX_STAGE = 46
+const MAX_STAGE = 30
+
+/**
+ * The ceiling the fallback passes may reach out to, metres.
+ *
+ * Used when the map cannot offer three legal posts inside {@link MAX_STAGE};
+ * measured at 29.5% of stagings, which is the price of the tighter ceiling and
+ * is paid in commute rather than in cover.
+ *
+ * This was 60 m, which is past the 55 m `VIEW_RANGE` in `src/ai`. A soldier
+ * staged past its own view range cannot see the player from where it is put, so
+ * it has nothing to walk towards and nothing to shoot at; it waits for a noise
+ * event or for someone else's contact, and if neither comes it patrols. That is
+ * the mechanism behind "two live enemies that never make contact", and a
+ * distance ceiling should never be able to produce it. 40 m leaves 15 m of
+ * headroom under `VIEW_RANGE`.
+ */
+const LOOSE_STAGE = 40
 
 /**
  * Preferred staging distance, metres.
  *
- * §6.2 `[estimated]` puts spawn to first contact at 5-10 s. At the §4.1
- * `[stated]` band of 4.7-6.3 m/s that is 24-63 m of travel, and a soldier
- * crossing broken ground rather than a straight line covers rather less than
- * its top speed, so 30 m is the middle of that window.
+ * The old value of 30 was derived from §6.2 `[estimated]` spawn-to-contact of
+ * 5-10 s at the §4.1 `[stated]` player speeds of 4.7-6.3 m/s. Two things were
+ * wrong with that: soldiers do not move at player speeds, and the quantity that
+ * matters is not arrival, it is the moment the fight starts.
+ *
+ * Measured from the shipped staging, walking each published post's A* route at
+ * the AI's real `travelSpeed` (sprint 5.1 m/s until 13 m out, then walk
+ * 3.2 m/s, §7.5 `[stated]` `sv_botSprintDistance`), against the **11.63 m**
+ * mean engagement distance the game actually measures:
+ *
+ * | staging window | commute to 11.63 m: mean / p90 / max |
+ * |----------------|-------------------------------------|
+ * | 12-46 m (was)  | 5.9 s / 9.1 s / 13.3 s              |
+ * | 12-34 m        | 4.6 s / 7.7 s / 11.6 s              |
+ * | 12-30 m (now)  | 3.9 s / 7.2 s / 10.9 s              |
+ * | 13-22 m        | 2.2 s / 3.8 s / 8.6 s               |
+ *
+ * Routes run 1.24x the straight line on this map, so the walk is longer than
+ * the staging distance suggests but not by the margin the sprint/walk split
+ * implies: a soldier sprints all but the last 13 m.
+ *
+ * 22 m is the middle of the new window and lands the commute at roughly four
+ * seconds — long enough to be an approach, short enough that the destination is
+ * still where the player is. That last point is the one the distance figures
+ * hide: a soldier walks to where the player *was* when it spawned, and
+ * `AiSystem` only refreshes that after `HUNT_AFTER` seconds of quiet. Staging
+ * at 33 m put the tail of the commute past that refresh, so a wave could spend
+ * its whole approach walking to an address the player had left.
  */
-const WANT_DIST = 30
+const WANT_DIST = 22
 
 /**
  * The sightline each successive wave aims to open at, metres.
  *
- * Mean engagement distance measured 17.9 m, which sits between the two §6.3
- * `[stated]` standards and is fine as a mean — the fault would be if every
- * fight happened there. This cycle is built so it does not: two waves at the
- * 13 m SMG standard, two at the 26 m rifle standard, and the rest spread
- * between and beyond them out to this map's longest usable line. Mean 21.5 m,
- * range 10-34 m.
+ * **This rotates the approach, not the range, and the difference matters.** The
+ * cycle was written believing it varied how far away fights start. Measured
+ * over 11,808 stagings it does not: every band stages at the same distance to
+ * within half a metre — 32.1-33.6 m under the old ceiling, 24.9-25.2 m now —
+ * because `sight` is a property of the *post*, and scoring for it picks which
+ * lane the wave comes from, not how far out it is put.
+ *
+ * Nor could staging set the engagement distance even if it did vary the range.
+ * A soldier walks to where the player is and stops when it acquires, so the
+ * fight opens wherever the district's clutter first gives it a line. That
+ * measures **11.63 m** live, against a staged mean of 32.9 m — the two numbers
+ * are barely related. Staging far bought commute, not range.
+ *
+ * The cycle is kept because rotating the approach is worth having on its own:
+ * paired with {@link EncounterDirector.recentLanes} it is what stops three
+ * waves in a row walking out of the alley. It is no longer described as
+ * controlling the distance fights happen at, because it does not.
  */
 const SIGHT_CYCLE = [26, 13, 30, 18, 22, 10, 34, 20]
 
@@ -233,23 +327,47 @@ const SIGHT_CYCLE = [26, 13, 30, 18, 22, 10, 34, 20]
  * §7.2 `[stated]` clamps concurrent attackers to 2 (`ai_maxAttackerCount`),
  * which `src/ai` already enforces, so wave size does not control lethality —
  * it controls how long the fight lasts and how many separate contacts it
- * produces. Three to five gives a fight that resolves in roughly 10-20 s at the
- * 200-350 ms TTK of §1, which is what leaves room for a lull afterwards.
+ * produces. Two more bodies is two more seconds of fight, not twice the
+ * incoming fire.
+ *
+ * The old cycle was `[4, 3, 5, 3, 4, 5]`, which has no shape: it rises and
+ * falls at random and the playtest read it as intensity collapsing rather than
+ * building. This one climbs across the cycle and resets, which is the wave
+ * shape the series uses — the fifth minute of a level is meant to be harder
+ * than the first, and then a new sequence starts.
+ *
+ * Delivery is `min(size, LIVE_CAP - live)`, so the cap has to leave room for
+ * the top of the cycle or the escalation is thrown away at the clamp.
  */
-const WAVE_SIZES = [4, 3, 5, 3, 4, 5]
+const WAVE_SIZES = [3, 4, 4, 5, 5, 6]
 
-/** Live enemies past which no new wave is committed. */
-const LIVE_CAP = 6
+/**
+ * Live enemies past which no new wave is committed.
+ *
+ * 6 with {@link SPENT_LIVE} at 2 means a wave is never larger than four however
+ * big {@link WAVE_SIZES} asks for, which flattens the escalation above into
+ * nothing. 8 leaves the top of the cycle intact and still sits under the
+ * `MAX_LIVE` of 10 in `src/ai`, which is the real ceiling.
+ */
+const LIVE_CAP = 8
 
 /**
  * Seconds with nothing in contact before the next wave is committed.
  *
  * This is the *quiet* part of the lull; the rest of the downtime is the wave's
- * approach. It is deliberately under the 6 s at which `AiSystem`'s own wave
- * timer fires, so the director's shaped wave lands first and that timer resets
- * rather than spawning a second one on top of it.
+ * approach. Downtime is a graded metric with a 12-28 s band and it measures
+ * **6.69 s**, which is short of it. The two terms are this constant and the
+ * commute, and the commute is now measured at roughly 4 s mean from the tighter
+ * staging window, so 4.5 + 4 could never have reached the band whatever else
+ * happened. Nine seconds plus the commute lands at about 13 s, inside it.
+ *
+ * It has to stay under `AiSystem`'s own reinforcement lull so the director's
+ * shaped wave lands first and that timer resets rather than putting a second
+ * wave on top of it. The comment here used to give that as 6 s; the constants
+ * in `src/ai` are `LULL_MIN` 11 / `LULL_MAX` 15, so the real headroom is two
+ * seconds, not one and a half.
  */
-const QUIET_BEFORE_WAVE = 4.5
+const QUIET_BEFORE_WAVE = 9
 
 /**
  * Seconds of quiet after which a wave is staged at the near band whatever else
@@ -263,8 +381,14 @@ const QUIET_BEFORE_WAVE = 4.5
  * This handles a player nobody can find. It is not a backstop on the director
  * itself, because it reads the same accumulator as {@link QUIET_BEFORE_WAVE}:
  * see {@link MAX_SILENCE}, which is.
+ *
+ * 26 s was set against the 60 s ceiling on the longest-quiet-stretch metric,
+ * which is the wrong reference — it asks only that the silence not be
+ * catastrophic. The downtime band is 12-28 s, so 18 s puts a forced contact at
+ * the top of a lull the player is meant to enjoy rather than several seconds
+ * after they have concluded the district is empty.
  */
-const MAX_QUIET = 26
+const MAX_QUIET = 18
 
 /**
  * The backstop that does not read the accumulator: seconds since the last spawn
@@ -290,8 +414,13 @@ const MAX_QUIET = 26
  * healthy fight: a wave still carrying more than one soldier is not stalled,
  * it is being fought. In ordinary pacing a wave is spent and replaced well
  * inside this, so it never fires at all.
+ *
+ * Held level with {@link MAX_QUIET} at the top of the 12-28 s downtime band for
+ * the same reason. Note that it is paired with {@link SPENT_LIVE}, which is now
+ * 2 rather than 1, so the pair of stragglers that used to pin both clocks open
+ * no longer does.
  */
-const MAX_SILENCE = 26
+const MAX_SILENCE = 18
 
 /**
  * The band the backstop stages into, metres, and the sightline it aims at.
@@ -308,17 +437,53 @@ const BACKSTOP_SIGHT = 13
 /** Seconds between any two spawns, including ones `AiSystem` initiates. */
 const MIN_WAVE_GAP = 7
 
-/** Live enemies at or below which the current wave counts as spent. */
-const SPENT_LIVE = 1
+/**
+ * Live enemies at or below which the current wave counts as spent.
+ *
+ * This was 1, and 1 is the number behind the playtest note that "enemiesAlive
+ * floors at exactly 2 and sits there, with enemiesInContact at 0". Two soldiers
+ * who have lost the player are not a fight, but they are two, so `spent` stayed
+ * false and the only way out was {@link MAX_QUIET} or {@link MAX_SILENCE} —
+ * both of which were 26 s. Every pair of stragglers bought itself the better
+ * part of half a minute of silence.
+ *
+ * 2 is `ai_maxAttackerCount` `[stated]` §7.2: the engine only ever lets two AI
+ * shoot at the player at once, so a field that cannot fill both attacker slots
+ * is thin by the series' own definition. And the live count is a second opinion
+ * on a question `quiet` has already answered — {@link QUIET_BEFORE_WAVE}
+ * requires nine seconds with nobody in contact before this is even consulted.
+ */
+const SPENT_LIVE = 2
 
 /** Seconds between restagings, and metres of player movement that force one. */
 const STAGE_INTERVAL = 2.0
 const STAGE_MOVE = 5
 
-/** Posts published per wave: one lane's worth plus a secondary direction. */
+/**
+ * Posts published per wave: one lane's worth plus a secondary direction.
+ *
+ * The secondary allowance was 2 and is 3, to pay back part of what the tighter
+ * {@link MAX_STAGE} costs. A 12-30 m window has fewer posts in it than a 12-46 m
+ * one, so stagings got thinner: 5.11 published posts each on average before,
+ * 3.73 after. Every post a staging is short of is a soldier `AiSystem` places
+ * from its own composed arc instead — close, and in the player's view. Widening
+ * the flank recovers it to 3.95 for half a point of promotion share and no
+ * change to cover or commute. Five and three still reads as a front and a
+ * flank, which is the shape this is for.
+ */
 const PRIMARY_MAX = 5
-const SECONDARY_MAX = 2
+const SECONDARY_MAX = 3
 const MAX_STAGED = PRIMARY_MAX + SECONDARY_MAX
+
+/**
+ * Posts a wave may take from an overwatch lane.
+ *
+ * `roof` is the only one: two posts on the market hall deck, 2.86 m up, whose
+ * whole value is the angle down into the junction. One soldier there is a
+ * threat the player has to solve; a squad there is a squad that is not coming.
+ * See {@link leads} for why it may not lead a wave at all.
+ */
+const OVERWATCH_MAX = 1
 
 /** Minimum bearing between the primary and secondary lanes, radians (45 deg). */
 const MIN_LANE_SPREAD = Math.PI / 4
@@ -380,8 +545,18 @@ const POST_CLEARANCE = 0.9
  * Staged from every one of those spots against a uniformly random facing, they
  * took the primary slot 36% of the time at the cycle's 26 m band, 48% at 30 m
  * and 40% at 34 m — the top lane at every long sightline the cycle asks for.
- * The same census now gives them 20%, 30% and 25%, behind `north` in all three,
- * and reads them as hidden from 77% and 79% of spots rather than all of them.
+ * The same census now gives them 20%, 30% and 25%, and reads them as hidden
+ * from 77% and 79% of spots rather than all of them.
+ *
+ * Re-measured this round by driving the shipped director over 11,808 stagings
+ * (1,968 standable spots x 6 facings x the 8 bands) rather than by censusing
+ * the grid, the roof lane takes **14% / 20% / 19%** of the primary slot at the
+ * 26, 30 and 34 m bands, behind `north` at 20% / 31% / 31%. The fix holds and
+ * the live figures are a little kinder than the census suggested. One detail of
+ * the claim above did not survive: under the old 46 m ceiling the roof lane led
+ * `north` at the 30 m band, 35% to 31%, so "behind north in all three" was
+ * true of the census protocol and not of the director. Bringing the ceiling in
+ * to 30 m is what put `north` ahead at every long band.
  *
  * The two classes are an approximation with one known error each way. Every
  * building in the district is taller than the 2.8 m deck — the shortest,
@@ -656,9 +831,24 @@ export class EncounterDirector {
     // Three passes, loosening only what can be loosened. The rear-arc rule is
     // never relaxed: a wave the player could not have seen coming is the one
     // failure this system exists to prevent.
+    //
+    // Distance gives way before cover does, and that order was measured rather
+    // than assumed. Tightening {@link MAX_STAGE} to 30 m means the strict pass
+    // no longer answers every time — over 11,808 stagings it finds three or
+    // more posts 70.5% of the time, against 100% under the old 46 m ceiling.
+    // Swapping the order so cover gave way first was tried and is worse: it
+    // buys 0.5 s of commute and ten points of promotion share, and it costs
+    // 11.6% of published posts their cover, which is 11.6% of waves appearing
+    // in front of a player who was watching. Holding cover keeps 99.1% of posts
+    // hidden for a mean commute of 4.7 s.
+    //
+    // What was genuinely wrong was the ceiling the fallback reached to: 60 m,
+    // past the 55 m `VIEW_RANGE` in `src/ai`, where a soldier cannot see the
+    // player from where it is put and so has nothing to walk towards. See
+    // {@link LOOSE_STAGE}.
     for (let relax = 0; relax < 3; relax++) {
-      const maxDist = near ? BACKSTOP_MAX : relax === 0 ? MAX_STAGE : 60
       const minDist = near ? BACKSTOP_MIN : MIN_FRONT
+      const maxDist = near ? BACKSTOP_MAX : relax === 0 ? MAX_STAGE : LOOSE_STAGE
       this.collect(fx, fz, minDist, maxDist, targetSight, relax < 2)
       if (this.usable >= 3 || relax === 2) break
     }
@@ -673,13 +863,29 @@ export class EncounterDirector {
       cands[j + 1] = c
     }
 
-    const primary = cands[0].lane
-    const primaryBearing = cands[0].bearing
+    // The lane the wave comes *from* has to be a lane a wave can come from.
+    // `roof` is not one: it is two posts on one deck, 2.86 m up, and a soldier
+    // put there is already at its firing position — there is no approach to
+    // walk. Letting it lead means the whole wave stands on a platform whose
+    // route down this file cannot verify, which is the playtest's "hostiles
+    // standing somewhere unreachable" written as a staging decision. It came up
+    // immediately: staged against `playerSpawn`, with the tighter ceiling, roof
+    // was the top-scoring lane and took two of the three opening posts.
+    //
+    // It stays in the graph, capped at {@link OVERWATCH_MAX}, as a flank. One
+    // rifle looking down into the junction is the shot the deck was composed
+    // for; six soldiers milling about on it is not.
+    let lead = 0
+    while (lead < this.usable && !leads(cands[lead].lane)) lead++
+    if (lead >= this.usable) lead = 0
+    const primary = cands[lead].lane
+    const primaryBearing = cands[lead].bearing
     const out = level.spawnPoints
     out.length = 0
 
+    const primaryCap = Math.min(PRIMARY_MAX, laneCap(primary))
     let taken = 0
-    for (let i = 0; i < this.usable && taken < PRIMARY_MAX; i++) {
+    for (let i = 0; i < this.usable && taken < primaryCap; i++) {
       if (cands[i].lane !== primary) continue
       const v = this.pool[taken++]
       v.copy(this.world[cands[i].index])
@@ -689,13 +895,15 @@ export class EncounterDirector {
     // One secondary direction, far enough round from the first to read as a
     // separate one rather than as the same group spread thin.
     let secondary: Lane | null = null
+    let secondaryCap = SECONDARY_MAX
     let secondaryTaken = 0
-    for (let i = 0; i < this.usable && secondaryTaken < SECONDARY_MAX; i++) {
+    for (let i = 0; i < this.usable && secondaryTaken < secondaryCap; i++) {
       const c = cands[i]
       if (c.lane === primary) continue
       if (secondary === null) {
         if (angleBetween(c.bearing, primaryBearing) < MIN_LANE_SPREAD) continue
         secondary = c.lane
+        secondaryCap = Math.min(SECONDARY_MAX, laneCap(secondary))
       } else if (c.lane !== secondary) {
         continue
       }
@@ -909,6 +1117,16 @@ function footprintUnder(x: number, z: number): Footprint | null {
     if (rotRectSdf(x, z, s.cx, s.cz, s.hw, s.hd, s.yaw) < 0) return s
   }
   return null
+}
+
+/** Whether a lane can be the direction a wave arrives from. */
+function leads(lane: Lane): boolean {
+  return lane !== 'roof'
+}
+
+/** Most posts a wave may take from one lane. */
+function laneCap(lane: Lane): number {
+  return lane === 'roof' ? OVERWATCH_MAX : PRIMARY_MAX
 }
 
 /** Absolute difference between two bearings, wrapped into [0, PI]. */

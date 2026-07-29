@@ -190,6 +190,32 @@ export class Soldier implements Damageable {
     this.rig.root.updateMatrixWorld(true)
   }
 
+  /**
+   * Moves a live soldier to a new post without rebuilding it.
+   *
+   * Used by `AiSystem` to recycle a soldier that has no route to the player
+   * from where it stands. Deliberately not `spawn`: that creates a second set
+   * of hitbox colliders and leaks the first. The hitboxes here are parented to
+   * the bones and follow on the next `update`, so nothing has to be rebuilt —
+   * only the locomotion state, which otherwise carries a velocity and a foot
+   * plant belonging to a place the soldier is no longer standing in.
+   */
+  teleport(at: THREE.Vector3, yaw: number): void {
+    this.position.copy(at)
+    this.groundY = at.y
+    this.yaw = yaw
+    this.velocity.set(0, 0, 0)
+    this.moveSpeed = 0
+    this.moveDir.set(0, 0, 0)
+    this.faceTarget = null
+    this.lean = 0
+    this.leanTarget = 0
+    this.rig.root.position.copy(at)
+    this.rig.root.rotation.set(0, yaw, 0)
+    this.resetFeet()
+    this.rig.root.updateMatrixWorld(true)
+  }
+
   private createHitboxes(): void {
     const { physics } = this.world
     // The carrier body never moves; the colliders carry world transforms
