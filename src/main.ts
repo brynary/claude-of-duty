@@ -14,6 +14,8 @@ import { PlayBotSystem } from './core/PlayBot'
 import { TelemetrySystem } from './core/Telemetry'
 import { MatchDirector } from './game/MatchDirector'
 import { difficulty } from './game/Difficulty'
+import { PrewarmSystem } from './render/Prewarm'
+import { BootScreen } from './ui/BootScreen'
 
 /**
  * Registration order is both init order and update order, so a system is
@@ -24,11 +26,35 @@ import { difficulty } from './game/Difficulty'
  * Effects updating a frame before their emitters costs one frame of latency,
  * which is invisible, and buys a dependency order that is always satisfied.
  */
+/** Resolves once the display has been given `count` frames. */
+function presentedFrames(count: number): Promise<void> {
+  return new Promise((resolve) => {
+    let seen = 0
+    const tick = (): void => {
+      seen++
+      if (seen >= count) resolve()
+      else requestAnimationFrame(tick)
+    }
+    requestAnimationFrame(tick)
+  })
+}
+
 async function boot(): Promise<void> {
   const container = document.getElementById('app')!
   const engine = new Engine(container)
   const bot = new PlayBotSystem()
   const telemetry = new TelemetrySystem()
+
+  // Available to every system's init, but registered last so its own pass runs
+  // after the world, the lighting patches and the weapons have all settled.
+  const prewarm = new PrewarmSystem()
+  prewarm.publish(engine.ctx)
+
+  // A capture or a scripted run must never photograph the loading screen or
+  // wait for a keypress that will not come, so those dismiss it themselves.
+  const scripted = engine.config.pose !== null || engine.config.bot !== null
+  const loading = new BootScreen(scripted)
+  engine.ctx.boot = loading
 
   engine
     .add(new MaterialSystem())
@@ -54,6 +80,7 @@ async function boot(): Promise<void> {
     .add(new HudSystem())
     .add(new PostFxSystem())
     .add(telemetry)
+    .add(prewarm)
 
   await engine.init()
   engine.start()
@@ -62,6 +89,14 @@ async function boot(): Promise<void> {
   dbg.__engine = engine
   dbg.__booted = true
   dbg.__telemetry = () => ({ ...telemetry.report(), botLog: bot.log })
+
+  // The opening frames run underneath the loading screen. They are the
+  // expensive ones — the post chain compiles its own shaders on the first, and
+  // the light probes bake on the third — and the player should not be looking
+  // at the world while that happens. Only then is the game offered.
+  if (!engine.config.bot) await presentedFrames(6)
+  engine.ctx.boot = undefined
+  await loading.finish()
 
   // A scripted run is driven by the harness rather than by the display, so it
   // completes as fast as the machine allows instead of in real time. Stepping

@@ -54,7 +54,11 @@ export class Engine {
     // Tone mapping is applied inside the post chain, not here.
     this.renderer.toneMapping = THREE.NoToneMapping
     this.renderer.shadowMap.enabled = true
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap
+    // PCF, stated plainly. `PCFSoftShadowMap` is deprecated in this version of
+    // three and silently becomes PCF on the first shadow render — which is one
+    // frame *after* the shader pre-warm, so every material in the level was
+    // compiled once for soft PCF and then again for PCF.
+    this.renderer.shadowMap.type = THREE.PCFShadowMap
     this.renderer.shadowMap.autoUpdate = true
     this.renderer.info.autoReset = false
 
@@ -96,7 +100,16 @@ export class Engine {
   }
 
   async init(): Promise<void> {
+    const boot = this.ctx.boot
+    // Every stage the loading screen will be told about, in order: one per
+    // system, then one more for each system that also has settling work to do.
+    boot?.begin([
+      ...this.systems.map((s) => s.name),
+      ...this.systems.filter((s) => s.postInit).map((s) => s.name),
+    ])
+
     for (const s of this.systems) {
+      await boot?.stage(s.name)
       const t0 = performance.now()
       await s.init(this.ctx)
       const ms = performance.now() - t0
@@ -119,6 +132,7 @@ export class Engine {
     // frame will actually use.
     for (const s of this.systems) {
       if (!s.postInit) continue
+      await boot?.stage(s.name)
       const t0 = performance.now()
       await s.postInit(this.ctx)
       const ms = performance.now() - t0

@@ -7,7 +7,7 @@ import { difficulty } from '../game/Difficulty'
 import { NavGrid, Steering } from './Navigation'
 import { AI_CADENCE, Behaviour, Squad, groundBelow } from './Behaviour'
 import { Soldier, type SoldierWorld } from './Soldier'
-import { buildSoldierAsset, fadeWarmupProxy, type SoldierAsset } from './SoldierMesh'
+import { buildSoldierAsset, soldierWarmupProxies, type SoldierAsset } from './SoldierMesh'
 
 /**
  * Enemy soldiers: procedural characters, navigation, cover-based combat,
@@ -241,10 +241,6 @@ export class AiSystem implements System, AiService {
 
     const mats = ctx.services.materials
     for (let i = 0; i < 3; i++) this.assets.push(buildSoldierAsset(mats, ctx.config.seed + i * 977))
-    // A corpse fades through its own transparent copies of these materials,
-    // which no living soldier ever puts in front of the compiler.
-    const prewarm = ctx.services.prewarm
-    if (prewarm) for (const a of this.assets) prewarm.world(fadeWarmupProxy(a))
 
     this.flashGeometry = buildMuzzleFlash()
     // No `toneMapped: false` here: the Engine leaves renderer tone mapping off
@@ -259,6 +255,19 @@ export class AiSystem implements System, AiService {
       depthWrite: false,
       side: THREE.DoubleSide,
     })
+
+    // Soldiers and their muzzle flashes are all built here but none of them are
+    // in the scene yet — the first wave spawns on the match director's first
+    // frame — so the compiler would meet them for the first time in the middle
+    // of the opening exchange.
+    const prewarm = ctx.services.prewarm
+    if (prewarm) {
+      for (const a of this.assets) prewarm.world(...soldierWarmupProxies(a))
+      const flash = new THREE.Mesh(this.flashGeometry, this.flashMaterial)
+      flash.castShadow = false
+      flash.receiveShadow = false
+      prewarm.world(flash)
+    }
 
     // Lights are created up front and only ever change intensity: adding or
     // removing one at runtime forces every material in the scene to recompile.

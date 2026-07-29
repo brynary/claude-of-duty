@@ -40,7 +40,13 @@ export class MaterialSystem implements System, MaterialService {
   /** Micro-detail shared by every triplanar surface in the world. */
   private detailMap: THREE.DataTexture | null = null
 
-  init(ctx: GameContext): void {
+  /**
+   * Baking is by far the longest part of the boot, so it hands the thread back
+   * between materials. Nothing here depends on the gap — each material is baked
+   * from its own seeded noise, in a fixed order — and without it the loading
+   * screen cannot repaint for the twelve seconds this takes.
+   */
+  async init(ctx: GameContext): Promise<void> {
     ctx.services.materials = this
     this.seed = ctx.config.seed
     this.anisotropy = Math.min(ctx.config.anisotropy, ctx.renderer.capabilities.getMaxAnisotropy())
@@ -48,7 +54,11 @@ export class MaterialSystem implements System, MaterialService {
 
     const started = performance.now()
     this.detailMap = this.buildDetailMap()
-    for (const name of MATERIAL_NAMES) this.cache.set(name, this.build(name))
+    for (let i = 0; i < MATERIAL_NAMES.length; i++) {
+      const name = MATERIAL_NAMES[i]
+      this.cache.set(name, this.build(name))
+      await ctx.boot?.step((i + 1) / MATERIAL_NAMES.length)
+    }
     const ms = performance.now() - started
     console.info(`[materials] baked ${MATERIAL_NAMES.length} materials in ${ms.toFixed(0)}ms`)
   }

@@ -4,16 +4,210 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
     <title>Claude of Duty</title>
+    <link rel="preload" as="image" href="/loading-frame.jpg" />
     <style>
       * { margin: 0; padding: 0; box-sizing: border-box; }
       html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
       body { font-family: 'Rajdhani', 'Bebas Neue', 'Helvetica Neue', Arial, sans-serif; }
       #app { position: fixed; inset: 0; }
       canvas { display: block; width: 100%; height: 100%; }
+
+      /*
+        Loading screen. Written inline rather than imported so it paints on the
+        browser's first frame: the module bundle is several megabytes and the
+        world takes seconds to bake, and all of that happens behind this.
+
+        One design pixel, as in the HUD: sizes are calc(N * var(--lpx)) so the
+        screen holds its proportions from a laptop to a 4K display.
+      */
+      #boot {
+        position: fixed; inset: 0; z-index: 40;
+        --lpx: calc(100vw / 1920);
+        --fg: 232, 236, 231;
+        --accent: 154, 196, 138;
+        --amber: 214, 168, 88;
+        color: rgba(var(--fg), .9);
+        background: #05070a;
+        opacity: 1;
+        transition: opacity .9s ease-in;
+      }
+      @media (max-aspect-ratio: 16/9) { #boot { --lpx: calc(100vh / 1080); } }
+      #boot.gone { opacity: 0; pointer-events: none; }
+
+      /* The frame itself, drifting. Nothing here is a live render. */
+      #boot .frame {
+        position: absolute; inset: 0;
+        background: #05070a url(/loading-frame.jpg) center / cover no-repeat;
+        transform: scale(1.06);
+        animation: boot-drift 46s ease-out forwards;
+        filter: saturate(.92) contrast(1.04);
+      }
+      @keyframes boot-drift {
+        from { transform: scale(1.11) translate3d(calc(-8 * var(--lpx)), calc(4 * var(--lpx)), 0); }
+        to   { transform: scale(1.0)  translate3d(0, 0, 0); }
+      }
+
+      /* Legibility: the type sits on scrims, never straight on the picture. */
+      #boot .scrim {
+        position: absolute; inset: 0;
+        background:
+          linear-gradient(to bottom, rgba(3,5,7,.82) 0%, rgba(3,5,7,.10) 26%, rgba(3,5,7,0) 44%),
+          linear-gradient(to top, rgba(3,5,7,.94) 0%, rgba(3,5,7,.55) 22%, rgba(3,5,7,0) 46%),
+          radial-gradient(120% 90% at 50% 46%, rgba(0,0,0,0) 38%, rgba(0,0,0,.62) 100%);
+      }
+      /* Film grain: one tiny generated tile, no asset, barely there. */
+      #boot .grain {
+        position: absolute; inset: -60%;
+        opacity: .05; pointer-events: none;
+        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='140' height='140'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/></filter><rect width='140' height='140' filter='url(%23n)'/></svg>");
+        animation: boot-grain 1.1s steps(3) infinite;
+      }
+      @keyframes boot-grain {
+        0%   { transform: translate3d(0, 0, 0); }
+        33%  { transform: translate3d(calc(-14 * var(--lpx)), calc(9 * var(--lpx)), 0); }
+        66%  { transform: translate3d(calc(11 * var(--lpx)), calc(-12 * var(--lpx)), 0); }
+        100% { transform: translate3d(0, 0, 0); }
+      }
+
+      #boot .plate { position: absolute; inset: 0; padding: calc(64 * var(--lpx)) calc(86 * var(--lpx)); }
+
+      /* --- masthead --- */
+      #boot .eyebrow {
+        display: flex; align-items: center; gap: calc(14 * var(--lpx));
+        font-size: calc(15 * var(--lpx)); letter-spacing: calc(5.5 * var(--lpx));
+        text-transform: uppercase; color: rgba(var(--accent), .88);
+        text-shadow: 0 calc(1 * var(--lpx)) calc(3 * var(--lpx)) rgba(0,0,0,.9);
+      }
+      #boot .eyebrow::before {
+        content: ''; width: calc(46 * var(--lpx)); height: calc(2 * var(--lpx));
+        background: rgba(var(--accent), .8); box-shadow: 0 0 calc(8 * var(--lpx)) rgba(var(--accent), .4);
+      }
+      #boot h1 {
+        margin-top: calc(14 * var(--lpx));
+        font-size: calc(78 * var(--lpx)); line-height: .96; font-weight: 700;
+        letter-spacing: calc(3 * var(--lpx)); text-transform: uppercase;
+        text-shadow: 0 calc(3 * var(--lpx)) calc(18 * var(--lpx)) rgba(0,0,0,.85);
+      }
+      #boot .sub {
+        margin-top: calc(12 * var(--lpx));
+        font-size: calc(19 * var(--lpx)); letter-spacing: calc(3.4 * var(--lpx));
+        text-transform: uppercase; color: rgba(var(--fg), .62);
+        text-shadow: 0 calc(1 * var(--lpx)) calc(4 * var(--lpx)) rgba(0,0,0,.9);
+      }
+
+      /* --- briefing --- */
+      #boot .brief {
+        position: absolute; left: calc(86 * var(--lpx)); bottom: calc(168 * var(--lpx));
+        max-width: calc(720 * var(--lpx));
+        border-left: calc(2 * var(--lpx)) solid rgba(var(--amber), .7);
+        padding-left: calc(18 * var(--lpx));
+      }
+      #boot .brief-label {
+        font-size: calc(14 * var(--lpx)); letter-spacing: calc(4.4 * var(--lpx));
+        text-transform: uppercase; color: rgba(var(--amber), .9);
+      }
+      #boot .brief-body {
+        margin-top: calc(7 * var(--lpx));
+        font-size: calc(23 * var(--lpx)); letter-spacing: calc(.6 * var(--lpx));
+        color: rgba(var(--fg), .84);
+        text-shadow: 0 calc(1 * var(--lpx)) calc(5 * var(--lpx)) rgba(0,0,0,.9);
+      }
+      #boot .intel {
+        position: absolute; right: calc(86 * var(--lpx)); bottom: calc(168 * var(--lpx));
+        max-width: calc(560 * var(--lpx)); text-align: right;
+      }
+      #boot .intel-label {
+        font-size: calc(14 * var(--lpx)); letter-spacing: calc(4.4 * var(--lpx));
+        text-transform: uppercase; color: rgba(var(--fg), .42);
+      }
+      #boot .intel-body {
+        margin-top: calc(7 * var(--lpx));
+        font-size: calc(20 * var(--lpx)); color: rgba(var(--fg), .78);
+        transition: opacity .5s ease;
+        text-shadow: 0 calc(1 * var(--lpx)) calc(5 * var(--lpx)) rgba(0,0,0,.9);
+      }
+      #boot .intel-body.fading { opacity: 0; }
+
+      /* --- progress --- */
+      #boot .bar-row {
+        position: absolute; left: calc(86 * var(--lpx)); right: calc(86 * var(--lpx));
+        bottom: calc(84 * var(--lpx));
+        display: flex; align-items: baseline; justify-content: space-between;
+        font-size: calc(16 * var(--lpx)); letter-spacing: calc(4 * var(--lpx));
+        text-transform: uppercase;
+      }
+      #boot .stage { color: rgba(var(--fg), .8); }
+      #boot .pct { color: rgba(var(--accent), .92); font-variant-numeric: tabular-nums; }
+      #boot .track {
+        position: absolute; left: calc(86 * var(--lpx)); right: calc(86 * var(--lpx));
+        bottom: calc(64 * var(--lpx)); height: calc(4 * var(--lpx));
+        background: rgba(var(--fg), .12); overflow: hidden;
+      }
+      #boot .fill {
+        position: absolute; inset: 0 auto 0 0; width: 0%;
+        background: linear-gradient(90deg, rgba(var(--accent), .55), rgba(var(--accent), .95));
+        box-shadow: 0 0 calc(12 * var(--lpx)) rgba(var(--accent), .45);
+        transition: width .28s cubic-bezier(.22,.61,.36,1);
+      }
+      /* Segment ticks, drawn over the track rather than as elements. */
+      #boot .track::after {
+        content: ''; position: absolute; inset: 0; pointer-events: none;
+        background: repeating-linear-gradient(90deg,
+          rgba(0,0,0,0) 0, rgba(0,0,0,0) calc(100% / 24 - 2 * var(--lpx)),
+          rgba(3,5,7,.85) calc(100% / 24 - 2 * var(--lpx)), rgba(3,5,7,.85) calc(100% / 24));
+      }
+
+      #boot .ready {
+        position: absolute; left: 0; right: 0; bottom: calc(112 * var(--lpx));
+        text-align: center;
+        font-size: calc(20 * var(--lpx)); letter-spacing: calc(7 * var(--lpx));
+        text-transform: uppercase; color: rgba(var(--fg), .92);
+        text-shadow: 0 calc(2 * var(--lpx)) calc(10 * var(--lpx)) rgba(0,0,0,.95);
+        opacity: 0; pointer-events: none;
+        transition: opacity .5s ease;
+      }
+      #boot.ready .ready { opacity: 1; animation: boot-pulse 2.1s ease-in-out infinite; }
+      #boot.ready .bar-row, #boot.ready .track { opacity: .55; }
+      @keyframes boot-pulse { 0%, 100% { opacity: .45; } 50% { opacity: 1; } }
+
+      @media (prefers-reduced-motion: reduce) {
+        #boot .frame { animation: none; transform: none; }
+        #boot .grain { animation: none; }
+        #boot.ready .ready { animation: none; opacity: 1; }
+      }
     </style>
   </head>
   <body>
     <div id="app"></div>
+
+    <div id="boot">
+      <div class="frame"></div>
+      <div class="scrim"></div>
+      <div class="grain"></div>
+      <div class="plate">
+        <div class="eyebrow">Classified // Task Force 141</div>
+        <h1>Aleppo Corridor</h1>
+        <div class="sub">Operation Silent Corridor &nbsp;·&nbsp; Sector 07 &nbsp;·&nbsp; 14:40 local</div>
+
+        <div class="brief">
+          <div class="brief-label">Objective</div>
+          <div class="brief-body">Clear and hold the plaza. Hostiles will keep coming until the corridor is shut.</div>
+        </div>
+
+        <div class="intel">
+          <div class="intel-label">Intel</div>
+          <div class="intel-body" id="boot-intel">Every wall in this district is a different thickness. Some of them stop rounds.</div>
+        </div>
+
+        <div class="bar-row">
+          <span class="stage" id="boot-stage">Establishing link</span>
+          <span class="pct" id="boot-pct">0%</span>
+        </div>
+        <div class="track"><div class="fill" id="boot-fill"></div></div>
+        <div class="ready">Press any key to deploy</div>
+      </div>
+    </div>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

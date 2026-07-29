@@ -71,6 +71,27 @@ export interface GameContext {
   entities: Map<number, Damageable>
   /** Set once each subsystem has registered itself. */
   services: Services
+  /**
+   * The loading screen, while it is up. Long init work should report through
+   * it: a system that blocks the thread for seconds without calling `step`
+   * freezes the bar and the page with it.
+   */
+  boot?: BootProgress
+}
+
+/**
+ * Progress sink for the loading screen. Implemented by the UI, called by the
+ * engine and by any system whose init is slow enough to be worth a caption.
+ */
+export interface BootProgress {
+  /** The systems about to run, in order, so the bar can be weighted. */
+  begin(names: string[]): void
+  /** Announces one system and yields a frame so the screen repaints. */
+  stage(name: string): Promise<void>
+  /** Progress within the current stage, 0..1. Yields at most every few frames. */
+  step(fraction: number): Promise<void>
+  /** Loading is done; resolves once the screen has been dismissed. */
+  finish(): Promise<void>
 }
 
 /**
@@ -248,6 +269,14 @@ export interface LightingService {
   /** Sets time of day 0..1 where 0.25 is dawn and 0.75 is dusk. */
   setTimeOfDay(t: number): void
   environment: THREE.Texture | null
+  /**
+   * Attaches the cascade and global-illumination shader patches to everything
+   * under `root`, which the per-frame sweep would otherwise do the first time
+   * it saw the material. Patching changes the shader, so anything compiled
+   * before this has to be compiled again: the pre-warm calls it on its
+   * stand-ins first for exactly that reason.
+   */
+  prepareMaterials(root: THREE.Object3D): void
 }
 
 export interface PostFxService {

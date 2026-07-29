@@ -1945,18 +1945,25 @@ function createFadeMaterials(asset: SoldierAsset): THREE.Material[] {
 }
 
 /**
- * A throwaway rig wearing a fade set, so the boot-time pre-warm can present
- * those materials to the shader compiler. The set it builds goes into the pool,
- * so the first corpse gets a compiled shader rather than a stall.
+ * Throwaway rigs for the boot-time pre-warm: one alive, one fading.
+ *
+ * The first wave does not spawn until the match director's first frame, so at
+ * pre-warm time the scene holds no soldiers at all and neither the living
+ * materials nor the corpse's transparent ones would otherwise be compiled
+ * before the fighting starts. The fade set the second rig wears goes into the
+ * pool, so the first corpse gets a compiled shader rather than a stall.
  */
-export function fadeWarmupProxy(asset: SoldierAsset): THREE.Object3D {
+export function soldierWarmupProxies(asset: SoldierAsset): THREE.Object3D[] {
+  const living = createSoldierRig(asset)
+
   const set = createFadeMaterials(asset)
   asset.fadePool.push(set)
-  const rig = createSoldierRig(asset)
-  rig.mesh.material = set
+  const fading = createSoldierRig(asset)
+  fading.mesh.material = set
   // Matches the corpse: a fading body stops casting shadows.
-  rig.mesh.castShadow = false
-  return rig.root
+  fading.mesh.castShadow = false
+
+  return [living.root, fading.root]
 }
 
 export interface SoldierRig {

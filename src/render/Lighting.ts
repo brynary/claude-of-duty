@@ -359,6 +359,23 @@ export class LightingSystem implements System, LightingService {
     this.updateFogColor(this.tmpDir.set(0, 0.05, -1))
   }
 
+  /**
+   * Patches every material in the world before the first frame.
+   *
+   * The cascade sweeps for unpatched materials four times a second and patches
+   * what it finds, and a patch is a new shader. Left to the sweep, the whole
+   * level was patched on frame one — after the pre-warm had already compiled
+   * every one of those materials unpatched, so the compiles happened twice and
+   * the second time landed inside a frame the player was watching.
+   */
+  postInit(ctx: GameContext): void {
+    this.prepareMaterials(ctx.scene)
+  }
+
+  prepareMaterials(root: THREE.Object3D): void {
+    this.cascade?.registerMaterials(root)
+  }
+
   // --- Frame ---------------------------------------------------------------
 
   update(dt: number, ctx: GameContext): void {

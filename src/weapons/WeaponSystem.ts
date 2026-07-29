@@ -121,8 +121,17 @@ export class WeaponSystem implements System, WeaponService {
     }
 
     this.vm.init(ctx, this.mats)
+    this.vm.preload(WEAPONS)
     this.vm.equip(this.def)
     this.vm.syncToSun()
+
+    // A dropped magazine takes a viewmodel material into the world scene, which
+    // is lit differently and so needs its own compiled shader. Nothing else
+    // presents that combination until the player's first reload.
+    const prewarm = ctx.services.prewarm
+    if (prewarm) {
+      prewarm.world(...this.vm.magDropPrototypes().map((proto) => this.magProxy(proto)))
+    }
     this.currentName = this.def.displayName
 
     this.baseFov = ctx.camera.fov
@@ -615,13 +624,23 @@ export class WeaponSystem implements System, WeaponService {
     this.ctx.events.emit('weapon:ammo', { mag: this.state.mag, reserve: this.state.reserve })
   }
 
-  private spawnDroppedMag(ctx: GameContext): void {
-    const proto = this.vm.magDropPrototype()
-    if (!proto) return
+  /**
+   * One dropped magazine, built the same way whether it is about to be thrown
+   * or is only standing in for the pre-warm — the shader three compiles depends
+   * on how the mesh is set up, so the two must not drift apart.
+   */
+  private magProxy(proto: THREE.Mesh): THREE.Mesh {
     const mesh = new THREE.Mesh(proto.geometry, proto.material)
     mesh.castShadow = true
     mesh.receiveShadow = true
     mesh.userData.surface = 'thinMetal'
+    return mesh
+  }
+
+  private spawnDroppedMag(ctx: GameContext): void {
+    const proto = this.vm.magDropPrototype()
+    if (!proto) return
+    const mesh = this.magProxy(proto)
     this.vm.magWorld(this.tmpPos, this.tmpQuat)
     mesh.position.copy(this.tmpPos)
     mesh.quaternion.copy(this.tmpQuat)

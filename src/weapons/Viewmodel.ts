@@ -488,14 +488,36 @@ export class Viewmodel {
 
   // -- weapon lifecycle ----------------------------------------------------
 
-  equip(def: WeaponDef): void {
-    if (this.model) this.model.root.visible = false
+  /**
+   * Builds every weapon up front, hidden.
+   *
+   * Built on first equip instead, the geometry work and the shader compiles for
+   * a weapon the player had not held yet both landed on the frame they switched
+   * to it. The models sit in the rig either way; only the timing changes.
+   */
+  preload(defs: readonly WeaponDef[]): void {
+    for (const def of defs) this.build(def)
+  }
+
+  /** The dropped-magazine stand-ins, for the world-scene pre-warm. */
+  magDropPrototypes(): THREE.Mesh[] {
+    return [...this.models.values()].map((m) => m.magDrop)
+  }
+
+  private build(def: WeaponDef): WeaponModel {
     let model = this.models.get(def.id)
     if (!model) {
       model = buildWeaponModel(def.kind, this.mats)
+      model.root.visible = false
       this.rig.add(model.root)
       this.models.set(def.id, model)
     }
+    return model
+  }
+
+  equip(def: WeaponDef): void {
+    if (this.model) this.model.root.visible = false
+    const model = this.build(def)
     model.root.visible = true
     this.model = model
     this.def = def
