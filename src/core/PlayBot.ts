@@ -121,6 +121,8 @@ export class PlayBotSystem implements System {
    */
   private unreachable = 0
   private slideCooldown = 3
+  /** Rate limit on reissuing the reload command. See `trigger`. */
+  private reloadCooldown = 0
   private lastPos = new THREE.Vector3()
   private wantAds = false
   private t = 0
@@ -444,8 +446,18 @@ export class PlayBotSystem implements System {
       this.firingFor = 0
       this.frame.mouse0 = false
       // Reload in the lull rather than mid-fight, as a person does.
-      if (weapons && !weapons.isReloading && this.magFraction(ctx) < this.skill.reloadThreshold) {
+      //
+      // Rate-limited, because the condition is a level and not an edge: when
+      // the weapon would not accept the reload — an empty reserve, a switch in
+      // flight — this reissued the command every single frame. A playtest run
+      // recorded 72 reload commands in two seconds, followed by seven seconds
+      // in which the player fired nothing at all while four enemies shot at
+      // them. A person presses R once and waits.
+      this.reloadCooldown -= dt
+      if (weapons && !weapons.isReloading && this.reloadCooldown <= 0
+        && this.magFraction(ctx) < this.skill.reloadThreshold) {
         this.frame.pressed.add('KeyR')
+        this.reloadCooldown = 1.2
         this.note('reload in lull')
       }
       return
