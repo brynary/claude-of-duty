@@ -95,13 +95,30 @@ async function main() {
     }
   }
 
-  // An explicit, freshly created profile directory. Letting puppeteer manage
-  // its own temp profile intermittently fails to launch after many runs.
-  const profileDir = join(root, '.chrome-profile')
+  // A profile directory unique to this invocation. A fixed one intermittently
+  // fails to launch with a bare "Code: null" — a stale lock survives a killed
+  // Chrome and the next run inherits it (same class of failure play.mjs and
+  // perf.mjs already eliminated).
+  const profileDir = join(root, `.chrome-profile-shot-${process.pid}`)
   rmSync(profileDir, { recursive: true, force: true })
   mkdirSync(profileDir, { recursive: true })
 
-  const browser = await launch({
+  // Chrome intermittently dies at launch with a bare "Code: null" (crashpad
+  // races a stale singleton). A fresh profile dir plus a short backoff clears
+  // it; three strikes means something is actually wrong.
+  const launchWithRetry = async (options, attempts = 3) => {
+    for (let i = 1; ; i++) {
+      try { return await launch(options) } catch (err) {
+        if (i >= attempts) throw err
+        console.warn(`[shot] launch attempt ${i} failed; retrying…`)
+        await new Promise((r) => setTimeout(r, 3000 * i))
+        rmSync(profileDir, { recursive: true, force: true })
+        mkdirSync(profileDir, { recursive: true })
+      }
+    }
+  }
+
+  const browser = await launchWithRetry({
     executablePath: findChrome(),
     headless: true,
     userDataDir: profileDir,
@@ -143,7 +160,11 @@ async function main() {
     page.on('pageerror', (err) => errors.push(String(err.message ?? err)))
 
     const hudParam = opts.hud === null ? '' : `&hud=${opts.hud}`
-    const url = `${baseUrl}/?pose=${pose}&quality=${opts.quality}${hudParam}&autostart=1`
+    // fixed=1: pose runs must advance by fixed timesteps, or the sim reaches
+    // the freeze point in a different state every capture and two shots of the
+    // same build differ on most pixels. Measured before this flag: 81-98% of
+    // pixels differed between back-to-back captures.
+    const url = `${baseUrl}/?pose=${pose}&quality=${opts.quality}${hudParam}&autostart=1&fixed=1`
 
     let status = 'ok'
     let note = ''
@@ -199,6 +220,7 @@ async function main() {
   writeFileSync(join(outDir, 'report.json'), JSON.stringify(report, null, 2))
   await browser.close()
   if (server) server.kill()
+  rmSync(profileDir, { recursive: true, force: true })
 
   console.log(`[shot] wrote ${report.filter((r) => r.status === 'ok').length}/${opts.poses.length} to ${outDir}`)
   process.exit(hadFailure ? 1 : 0)

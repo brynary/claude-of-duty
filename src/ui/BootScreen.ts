@@ -82,6 +82,9 @@ export class BootScreen implements BootProgress {
   private lastYield = 0
   private intelTimer = 0
   private dismissed = false
+  /** Puts the warmed overlays back exactly as they were; see `warmOverlays`. */
+  private warmRestore: (() => void) | null = null
+  private warmed = false
 
   /** True when there is no screen in the document, e.g. a harness page. */
   private readonly absent: boolean
@@ -105,10 +108,67 @@ export class BootScreen implements BootProgress {
     this.index = this.names.indexOf(name, this.index + 1)
     if (this.stageEl) this.stageEl.textContent = CAPTION[name] ?? name
     this.paint(0)
+    // The frame this yield produces is also the one that carries the overlay
+    // warm, while this screen still hides everything beneath it.
+    this.warmOverlays()
     // A frame, so the caption and bar are on screen before the work that
     // blocks the thread begins rather than after it ends.
     await nextFrame()
     this.lastYield = performance.now()
+  }
+
+  /**
+   * The pause, death and debrief screens sit on a full-viewport
+   * `backdrop-filter` blur whose compositor surface only rasterises the first
+   * time a screen opens — tens of milliseconds at desktop resolutions, and the
+   * death screen's first open lands mid-combat, on the exact frame the player
+   * dies. The blood overlay pays a similar first-hit toll decoding and
+   * rasterising its two full-screen blend layers. While this screen is opaque,
+   * nothing underneath can reach the display, so the overlays are given one
+   * real painted frame here and then put back precisely as they were: the
+   * surfaces and decoded textures stay resident, and the first genuine open
+   * costs what every later open costs.
+   *
+   * Runs once, on the first stage after the HUD has built its DOM; earlier
+   * stages find nothing and simply try again. A page with no HUD warms nothing.
+   */
+  private warmOverlays(): void {
+    // A scripted page dismisses this screen immediately, and dismiss() puts
+    // the warmed styles back before any frame commits — so the warm can never
+    // land there, only leak. Measured: with it active, the firefight capture
+    // differed from the reference build on 41k pixels.
+    if (this.autoDismiss) return
+    if (this.warmed || this.dismissed) return
+    const screens = document.querySelectorAll<HTMLElement>('#cod-menu .screen')
+    const blood = document.querySelectorAll<HTMLElement>('#cod-hud .blood, #cod-hud .blood-glow')
+    if (screens.length === 0 && blood.length === 0) return
+    this.warmed = true
+
+    const undo: (() => void)[] = []
+    const set = (node: HTMLElement, prop: 'display' | 'opacity' | 'pointerEvents', value: string): void => {
+      const prior = node.style[prop]
+      node.style[prop] = value
+      undo.push(() => { node.style[prop] = prior })
+    }
+    for (const node of screens) {
+      set(node, 'display', 'flex')
+      // Full strength rather than an opacity epsilon: a fractional-opacity
+      // ancestor becomes its own backdrop root, and the blur would rasterise
+      // an empty group instead of the live page it needs to learn to sample.
+      set(node, 'opacity', '1')
+      // Nothing may become clickable because of the warm, however briefly.
+      set(node, 'pointerEvents', 'none')
+    }
+    for (const node of blood) set(node, 'opacity', '1')
+
+    this.warmRestore = () => {
+      this.warmRestore = null
+      for (const fn of undo) fn()
+    }
+    // Two frames: the styles are in place before the next paint, and the
+    // restore runs at the top of the frame after it, so exactly one committed
+    // frame carries the warm — enough to rasterise, all of it under the cover.
+    requestAnimationFrame(() => requestAnimationFrame(() => this.warmRestore?.()))
   }
 
   async step(fraction: number): Promise<void> {
@@ -168,6 +228,9 @@ export class BootScreen implements BootProgress {
   private dismiss(immediate: boolean): void {
     if (this.dismissed) return
     this.dismissed = true
+    // The cover is about to lift; whatever the warm touched must already be
+    // back exactly as it was, or a warmed frame could reach the screen.
+    this.warmRestore?.()
     window.clearInterval(this.intelTimer)
     if (immediate) {
       // A capture must not photograph even a fading loading screen.

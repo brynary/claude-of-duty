@@ -69,6 +69,12 @@ export interface Config {
   runSeconds: number
   /** Record the per-frame input stream for deterministic replay. */
   record: boolean
+  /**
+   * Real-time performance run. The bot still drives input, but the frame loop
+   * stays rAF-driven with wall-clock dt, so frame times measure what a player
+   * would actually experience instead of how fast the machine can fast-step.
+   */
+  perf: boolean
 }
 
 const PRESETS: Record<QualityLevel, Partial<Config>> = {
@@ -138,9 +144,12 @@ export function createConfig(search = globalThis.location?.search ?? ''): Config
     stats: q.get('stats') === '1',
     bot: q.get('bot'),
     botSkill: q.get('skill') ?? 'average',
-    fixedStep: q.get('fixed') === '1' || q.has('bot'),
+    // A perf run wants real wall-clock frame times, so it opts out of the
+    // fixed step that every other bot run uses for reproducibility.
+    fixedStep: q.get('fixed') === '1' || (q.has('bot') && q.get('perf') !== '1'),
     runSeconds: q.has('run') ? Number(q.get('run')) : 60,
     record: q.get('record') === '1',
+    perf: q.get('perf') === '1',
   }
 
   Object.assign(base, PRESETS[quality] ?? PRESETS.ultra)

@@ -280,8 +280,18 @@ export class Tracers {
       this.dirtyMin = Infinity
       this.dirtyMax = -Infinity
     }
-    this.geometry.instanceCount = this.wrapped ? this.capacity : this.head
+    this.geometry.instanceCount = Math.max(this.wrapped ? this.capacity : this.head, this.warmHold ? 1 : 0)
     this.material.uniforms.uTime.value = time
+  }
+
+  /**
+   * Holds one instance in the draw while the boot screen is up, so the ribbon
+   * pipeline is created behind it rather than on the first shot. Slot 0 is
+   * zero-filled: a zero-length tracer with life 0 produces no fragments.
+   */
+  private warmHold = false
+  warmDraw(on: boolean): void {
+    this.warmHold = on
   }
 
   setDepth(depth: THREE.Texture | null, near: number, far: number): void {

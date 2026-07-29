@@ -105,6 +105,19 @@ export class Debris {
     })
   }
 
+  /**
+   * Draws one parked chunk while the loading screen is up. The prewarm
+   * proxies compile the programs and warm the shadow path, but the HDR scene
+   * pass builds its pipeline on the first *executed* draw — which used to be
+   * the first explosion. Every debris material shares one program, so a
+   * single chunk covers the pool; the boot screen covers the chunk.
+   */
+  warmDraw(on: boolean): void {
+    const chunk = this.chunks[0]
+    if (!chunk || chunk.active) return
+    chunk.mesh.visible = on
+  }
+
   private material(surface: Surface): THREE.MeshStandardMaterial {
     let m = this.materials.get(surface)
     if (m) return m

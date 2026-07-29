@@ -504,6 +504,30 @@ export class Viewmodel {
     return [...this.models.values()].map((m) => m.magDrop)
   }
 
+  /**
+   * Draws the hidden extras for the boot-time pipeline warm. `renderer.compile`
+   * links their programs, but Metal creates a pipeline at the first *executed*
+   * draw, and everything here idles invisible until the first shot, first ADS
+   * or first weapon switch. The overlay materials all rest at opacity 0, and
+   * the unequipped weapons draw behind the loading screen, so no visible pixel
+   * is produced; visibility states are restored exactly.
+   */
+  private warmSaved: [THREE.Object3D, boolean][] | null = null
+  pipelineWarm(on: boolean): void {
+    if (on) {
+      if (this.warmSaved) return
+      const targets: THREE.Object3D[] = [
+        this.muzzleFlash, this.reticle, this.glassDot, this.scopeMask,
+        ...[...this.models.values()].map((m) => m.root),
+      ]
+      this.warmSaved = targets.map((o) => [o, o.visible])
+      for (const o of targets) o.visible = true
+    } else if (this.warmSaved) {
+      for (const [o, visible] of this.warmSaved) o.visible = visible
+      this.warmSaved = null
+    }
+  }
+
   private build(def: WeaponDef): WeaponModel {
     let model = this.models.get(def.id)
     if (!model) {

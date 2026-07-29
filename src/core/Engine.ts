@@ -45,8 +45,11 @@ export class Engine {
       powerPreference: 'high-performance',
       stencil: false,
       depth: true,
-      // Needed so the screenshot harness can read pixels after a frame.
-      preserveDrawingBuffer: true,
+      // The screenshot harness reads the canvas after a frame has been
+      // composited, which needs the buffer kept; play does not, and keeping a
+      // 3024x1964 surface alive across compositing costs a full-surface copy
+      // every frame. Only a capture run pays for it.
+      preserveDrawingBuffer: this.config.pose !== null || this.config.freezeAt !== null,
     })
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.config.maxPixelRatio))
     this.renderer.setSize(window.innerWidth, window.innerHeight)
@@ -168,11 +171,121 @@ export class Engine {
     // frame times vary with machine load, and a physics-driven game diverges
     // from a different dt within a second or two, so telemetry gathered under
     // variable timing is not comparable between builds.
+    const deltaMs = now - this.lastTime
     const rawDt = this.config.fixedStep
       ? this.fixedStep
-      : Math.min((now - this.lastTime) / 1000, 0.1)
+      : Math.min(deltaMs / 1000, 0.1)
     this.lastTime = now
+    // Record before tick: the gap that just ended was produced by the
+    // *previous* tick, so this pairs each delta with the work that caused it.
+    this.recordFrame(deltaMs, now)
     this.tick(rawDt, now)
+  }
+
+  // --- Frame-time telemetry -------------------------------------------------
+  // Wall-clock gaps between rAF callbacks, which is what the player perceives:
+  // it includes our update and render work, the browser's compositor, and any
+  // GC or shader-compile stall — not just the time spent inside tick().
+
+  private perfDeltas: number[] = []
+  private perfCalls: number[] = []
+  private perfTris: number[] = []
+  private perfWorstAt = 0
+  private perfStartAt = 0
+  /**
+   * Attribution for slow frames. Per-system CPU time is measured every tick
+   * into a preallocated array (update in the first half, lateUpdate in the
+   * second); when a frame's delta crosses the stall threshold, the previous
+   * tick's timings, render time and heap movement are logged so the stall can
+   * be blamed rather than guessed at. A big delta with a small tick points
+   * outside our code: GC, shader compile in the driver, or the compositor.
+   */
+  private sysTimes: Float64Array | null = null
+  private lastTickMs = 0
+  private lastRenderMs = 0
+  private lastHeapBytes = 0
+  private stallLog: Record<string, unknown>[] = []
+
+  private recordFrame(deltaMs: number, now: number): void {
+    // The first frame after start()/reset has no meaningful predecessor.
+    if (this.perfStartAt === 0) { this.perfStartAt = now; return }
+    this.perfDeltas.push(deltaMs)
+    if (deltaMs >= (this.perfDeltas[this.perfWorstAt] ?? 0)) this.perfWorstAt = this.perfDeltas.length - 1
+    this.perfCalls.push(this.renderer.info.render.calls)
+    this.perfTris.push(this.renderer.info.render.triangles)
+
+    const mem = (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory
+    const heap = mem?.usedJSHeapSize ?? 0
+    const heapDelta = heap - this.lastHeapBytes
+    this.lastHeapBytes = heap
+
+    if (deltaMs > 50 && this.stallLog.length < 200) {
+      const n = this.systems.length
+      const top: { name: string; ms: number }[] = []
+      if (this.sysTimes) {
+        for (let i = 0; i < n; i++) {
+          const ms = this.sysTimes[i] + this.sysTimes[n + i]
+          if (ms >= 0.5) top.push({ name: this.systems[i].name, ms: +ms.toFixed(1) })
+        }
+        top.sort((a, b) => b.ms - a.ms)
+      }
+      this.stallLog.push({
+        atSeconds: +this.ctx.elapsed.toFixed(2),
+        ms: +deltaMs.toFixed(1),
+        tickMs: +this.lastTickMs.toFixed(1),
+        renderMs: +this.lastRenderMs.toFixed(1),
+        heapDeltaMB: +(heapDelta / 1048576).toFixed(1),
+        top: top.slice(0, 6),
+      })
+    }
+  }
+
+  /** Forget everything measured so far; the next frame starts a fresh window. */
+  resetPerfStats(): void {
+    this.perfDeltas = []
+    this.perfCalls = []
+    this.perfTris = []
+    this.perfWorstAt = 0
+    this.perfStartAt = 0
+    this.stallLog = []
+    this.lastHeapBytes = 0
+  }
+
+  /**
+   * Percentiles of the measurement window. `fps.p50` is the headline number;
+   * `fps.p99` is the classic "1% low". Stalls are counted at the thresholds a
+   * player can feel: a 50ms frame is a visible hitch, a 100ms one is a hang.
+   */
+  perfReport(): Record<string, unknown> {
+    const n = this.perfDeltas.length
+    if (n === 0) return { frames: 0 }
+    const sorted = [...this.perfDeltas].sort((a, b) => a - b)
+    const at = (q: number) => sorted[Math.min(n - 1, Math.floor(q * n))]
+    const sum = this.perfDeltas.reduce((a, b) => a + b, 0)
+    const sortedCalls = [...this.perfCalls].sort((a, b) => a - b)
+    const sortedTris = [...this.perfTris].sort((a, b) => a - b)
+    const mid = Math.floor(n / 2)
+    let timeInStallMs = 0
+    let over50 = 0, over100 = 0, over250 = 0
+    for (const d of this.perfDeltas) {
+      if (d > 50) { over50++; timeInStallMs += d }
+      if (d > 100) over100++
+      if (d > 250) over250++
+    }
+    return {
+      frames: n,
+      seconds: sum / 1000,
+      fps: { mean: 1000 / (sum / n), p50: 1000 / at(0.5), p90: 1000 / at(0.9), p99: 1000 / at(0.99) },
+      frameMs: { p50: at(0.5), p90: at(0.9), p99: at(0.99), max: sorted[n - 1] },
+      worstFrame: {
+        ms: this.perfDeltas[this.perfWorstAt],
+        atSeconds: this.perfDeltas.slice(0, this.perfWorstAt).reduce((a, b) => a + b, 0) / 1000,
+      },
+      stalls: { over50, over100, over250, timeInStallMs },
+      stallEvents: this.stallLog,
+      drawCalls: { p50: sortedCalls[mid], max: sortedCalls[n - 1] },
+      triangles: { p50: sortedTris[mid], max: sortedTris[n - 1] },
+    }
   }
 
   /**
@@ -196,8 +309,22 @@ export class Engine {
     this.ctx.elapsed += dt
     this.renderer.info.reset()
 
-    for (const s of this.systems) s.update?.(dt, this.ctx)
-    for (const s of this.systems) s.lateUpdate?.(dt, this.ctx)
+    const n = this.systems.length
+    const times = this.sysTimes ?? (this.sysTimes = new Float64Array(n * 2))
+    const tickStart = performance.now()
+    let mark = tickStart
+    for (let i = 0; i < n; i++) {
+      this.systems[i].update?.(dt, this.ctx)
+      const t = performance.now()
+      times[i] = t - mark
+      mark = t
+    }
+    for (let i = 0; i < n; i++) {
+      this.systems[i].lateUpdate?.(dt, this.ctx)
+      const t = performance.now()
+      times[n + i] = t - mark
+      mark = t
+    }
 
     // A headless run still renders periodically: shaders, the shadow cascade
     // and the light probes all run on the render path, and skipping it entirely
@@ -205,10 +332,13 @@ export class Engine {
     // that machinery live at a fraction of the cost.
     const shouldRender = !headless || this.frames % 8 === 0
     if (shouldRender) {
+      const renderStart = performance.now()
       const postfx = this.ctx.services.postfx
       if (postfx) postfx.render(rawDt)
       else this.renderer.render(this.scene, this.camera)
+      this.lastRenderMs = performance.now() - renderStart
     }
+    this.lastTickMs = performance.now() - tickStart
     this.frames++
 
     this.input.endFrame()
@@ -226,10 +356,16 @@ export class Engine {
    */
   private captureFrames = 0
   private markCaptureReady(): void {
-    // Let TAA converge on the frozen frame before declaring readiness.
+    // Let TAA converge on the frozen frame before declaring readiness — then
+    // stop the loop on an exact frame count. Left running, the accumulator
+    // kept blending jittered frames while the harness polled, so two captures
+    // of the same build differed by however many extra frames the polling
+    // latency allowed (measured: 12-20% of pixels, small deltas). The drawing
+    // buffer is preserved, so the screenshot reads this exact frame.
     this.captureFrames++
-    if (this.captureFrames > 24) {
+    if (this.captureFrames === 25) {
       ;(window as unknown as Record<string, unknown>).__captureReady = true
+      this.stop()
     }
   }
 

@@ -1945,25 +1945,43 @@ function createFadeMaterials(asset: SoldierAsset): THREE.Material[] {
 }
 
 /**
- * Throwaway rigs for the boot-time pre-warm: one alive, one fading.
+ * How many fade sets each asset's pool is seeded with. Ten live soldiers are
+ * dealt round-robin across three assets, so at most four wear the same one,
+ * and a corpse fades during a three-second window nine seconds after death —
+ * so four same-asset corpses can be fading at once if a whole cohort dies
+ * inside three seconds. A set borrowed past the pool falls through to
+ * `createFadeMaterials` mid-match, and the clone it makes arrives without the
+ * lighting patch: six programs link on the spot and the shadow sweep re-links
+ * six more moments later, a stall measured at 250-900 ms.
+ */
+const FADE_POOL_SEED = 4
+
+/**
+ * Throwaway rigs for the boot-time pre-warm: one alive, one per pooled fade
+ * set.
  *
  * The first wave does not spawn until the match director's first frame, so at
  * pre-warm time the scene holds no soldiers at all and neither the living
  * materials nor the corpse's transparent ones would otherwise be compiled
- * before the fighting starts. The fade set the second rig wears goes into the
- * pool, so the first corpse gets a compiled shader rather than a stall.
+ * before the fighting starts. Every fade set the pool is seeded with rides on
+ * its own rig, so each set gets lighting-patched and compiled here rather than
+ * the first time that many corpses of one asset happen to fade together.
  */
 export function soldierWarmupProxies(asset: SoldierAsset): THREE.Object3D[] {
   const living = createSoldierRig(asset)
+  const proxies = [living.root]
 
-  const set = createFadeMaterials(asset)
-  asset.fadePool.push(set)
-  const fading = createSoldierRig(asset)
-  fading.mesh.material = set
-  // Matches the corpse: a fading body stops casting shadows.
-  fading.mesh.castShadow = false
+  for (let i = 0; i < FADE_POOL_SEED; i++) {
+    const set = createFadeMaterials(asset)
+    asset.fadePool.push(set)
+    const fading = createSoldierRig(asset)
+    fading.mesh.material = set
+    // Matches the corpse: a fading body stops casting shadows.
+    fading.mesh.castShadow = false
+    proxies.push(fading.root)
+  }
 
-  return [living.root, fading.root]
+  return proxies
 }
 
 export interface SoldierRig {

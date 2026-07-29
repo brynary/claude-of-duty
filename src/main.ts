@@ -85,10 +85,28 @@ async function boot(): Promise<void> {
   await engine.init()
   engine.start()
 
+  // Metal builds a pipeline on the first *executed* draw, not when the
+  // program links — so pooled particles (instanceCount 0) and hidden scope
+  // overlays sailed through every prewarm compile and then paid 95-140ms on
+  // the first shot of the match. Two presented frames with one dead instance
+  // held in each pool and the hidden extras drawn (their materials rest at
+  // opacity 0) create every pipeline while the loading screen still covers
+  // the canvas.
+  engine.ctx.services.fx?.pipelineWarm(true)
+  engine.ctx.services.weapons?.pipelineWarm(true)
+  // Four frames, not two: the lighting bakes its sun shafts and their dust
+  // motes on the third, and those must exist in the scene before the depth
+  // pass below can compile the variants they need.
+  await presentedFrames(4)
+  engine.ctx.services.fx?.pipelineWarm(false)
+  engine.ctx.services.weapons?.pipelineWarm(false)
+  engine.ctx.services.fx?.warmDepthPass()
+
   const dbg = window as unknown as Record<string, unknown>
   dbg.__engine = engine
   dbg.__booted = true
   dbg.__telemetry = () => ({ ...telemetry.report(), botLog: bot.log })
+  dbg.__fps = () => engine.perfReport()
 
   // The opening frames run underneath the loading screen. They are the
   // expensive ones — the post chain compiles its own shaders on the first, and
@@ -97,6 +115,28 @@ async function boot(): Promise<void> {
   if (!engine.config.bot) await presentedFrames(6)
   engine.ctx.boot = undefined
   await loading.finish()
+
+  // A perf run keeps the ordinary rAF loop — the point is to measure real
+  // frame pacing under play — and only borrows the bot for input. Measurement
+  // starts after a short settle so boot-adjacent work (probe bakes, first
+  // shadow renders) does not pollute the window it is trying to characterise.
+  if (engine.config.bot && engine.config.perf) {
+    await presentedFrames(30)
+    engine.resetPerfStats()
+    const startElapsed = engine.ctx.elapsed
+    dbg.__perfStarted = true
+    const stopAt = engine.config.runSeconds
+    const watch = () => {
+      if (engine.ctx.elapsed - startElapsed >= stopAt) {
+        dbg.__fpsReport = engine.perfReport()
+        dbg.__runComplete = true
+        return
+      }
+      requestAnimationFrame(watch)
+    }
+    requestAnimationFrame(watch)
+    return
+  }
 
   // A scripted run is driven by the harness rather than by the display, so it
   // completes as fast as the machine allows instead of in real time. Stepping

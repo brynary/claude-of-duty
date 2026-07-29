@@ -410,8 +410,21 @@ class ParticleGroup {
       this.dirtyMin = Infinity
       this.dirtyMax = -Infinity
     }
-    this.geometry.instanceCount = this.wrapped ? this.capacity : this.head
+    this.geometry.instanceCount = Math.max(this.wrapped ? this.capacity : this.head, this.warmHold ? 1 : 0)
     this.material.uniforms.uTime.value = time
+  }
+
+  /**
+   * Holds one instance in the draw while the boot screen is up. The pipeline
+   * for this group is created on its first executed draw, not at compile, and
+   * a pool that idles at instanceCount 0 never executes one until the first
+   * shot of the match — which is the frame that then pays 15-80ms of pipeline
+   * creation. Slot 0 is zero-filled, so the held instance has life 0 and the
+   * vertex shader parks it outside clip space: no fragment is ever produced.
+   */
+  private warmHold = false
+  warmDraw(on: boolean): void {
+    this.warmHold = on
   }
 
   setDepth(depth: THREE.Texture | null, near: number, far: number): void {
@@ -511,6 +524,11 @@ export class Particles {
   /** Resets and returns the shared spawn description. */
   get params(): ParticleParams {
     return this.p.reset()
+  }
+
+  /** See ParticleGroup.warmDraw: one dead instance per group during boot. */
+  warmDraw(on: boolean): void {
+    for (const g of this.groups.values()) g.warmDraw(on)
   }
 
   emit(key: GroupKey, time: number): void {

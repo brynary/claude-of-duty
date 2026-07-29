@@ -131,6 +131,7 @@ export class FxSystem implements System, FxService {
     // The chunks spawn hidden and wear one surface each, so the surfaces no
     // chunk currently carries would first reach the compiler mid-explosion.
     ctx.services.prewarm?.world(...this.debris.warmupProxies())
+    ctx.services.prewarm?.depthOverride(this.depthMaterial)
     this.worldLights = new FxLightPool(ctx.scene, 3)
     this.viewLights = new FxLightPool(ctx.viewmodelScene, 1)
 
@@ -170,7 +171,38 @@ export class FxSystem implements System, FxService {
     ctx.services.fx = this
   }
 
+  /**
+   * One real prepass render behind the loading screen. The override-material
+   * program variants are as varied as the scene itself — meshes, instanced
+   * meshes with and without per-instance color, skinned soldiers, points,
+   * sprites — and enumerating them in a scratch compile kept missing one;
+   * every miss was a 115-172ms link inside lateUpdate, mid-combat. Rendering
+   * the actual pass once compiles exactly what the scene contains. Soldiers
+   * spawn later, so the skinned variant still rides the prewarm scratch.
+   */
+  postInit(ctx: GameContext): void {
+    this.renderDepthPrepass(ctx, true)
+  }
+
   // --- FxService ------------------------------------------------------------
+
+  /**
+   * One dead instance held in every pooled draw while the loading screen is
+   * up. Programs compile at boot, but Metal builds a pipeline on the first
+   * *executed* draw — and pools idling at instanceCount 0 never execute one
+   * until the first shot, which then paid 15-80ms. Nothing rasterizes: every
+   * held instance has life 0 and parks outside clip space.
+   */
+  warmDepthPass(): void {
+    if (this.ctx) this.renderDepthPrepass(this.ctx, true)
+  }
+
+  pipelineWarm(on: boolean): void {
+    this.world.warmDraw(on)
+    this.view.warmDraw(on)
+    this.tracers.warmDraw(on)
+    this.debris.warmDraw(on)
+  }
 
   impact(point: THREE.Vector3, normal: THREE.Vector3, surface: Surface): void {
     if (!this.ctx || this.claim(point, 0.05)) return
@@ -456,6 +488,17 @@ export class FxSystem implements System, FxService {
       minFilter: THREE.NearestFilter,
       magFilter: THREE.NearestFilter,
     })
+
+    // three allocates the FBO and its textures on first bind, which used to
+    // land in the same frame as the first live soft particle — stacked on top
+    // of that frame's other first-use costs. Bind once now so the multi-MB
+    // allocation happens here instead; no draw is issued, so no frame state
+    // advances and the played frames are untouched.
+    const gl = this.ctx.renderer
+    const prev = gl.getRenderTarget()
+    gl.setRenderTarget(this.depthTarget)
+    gl.clear(true, true, false)
+    gl.setRenderTarget(prev)
   }
 
   private disposeDepthTarget(): void {
@@ -471,10 +514,10 @@ export class FxSystem implements System, FxService {
    * fading, which is most of them; returns null in that case so the particle
    * shader disables its depth fade rather than reading a stale buffer.
    */
-  private renderDepthPrepass(ctx: GameContext): THREE.DepthTexture | null {
+  private renderDepthPrepass(ctx: GameContext, force = false): THREE.DepthTexture | null {
     const target = this.depthTarget
     if (!target) return null
-    if (!this.world.needsDepth(this.time) && !this.tracers.active(this.time)) return null
+    if (!force && !this.world.needsDepth(this.time) && !this.tracers.active(this.time)) return null
 
     const gl = ctx.renderer
     const prevTarget = gl.getRenderTarget()

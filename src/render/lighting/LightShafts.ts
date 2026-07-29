@@ -279,6 +279,13 @@ export class LightShafts {
     }
 
     this.buildMotes(ctx, specs, color, density)
+
+    // The beams are frustum culled and live indoors, so nothing above draws
+    // until the player first looks at a shaft mid-match — which is when three
+    // would otherwise link the raymarch program (40-250ms on this stack).
+    // Every beam shares one program, so one compile here covers them all.
+    // Compile only: a real render at boot phase-shifts screen effects.
+    ctx.renderer.compile(this.group, ctx.camera, ctx.scene)
   }
 
   /**

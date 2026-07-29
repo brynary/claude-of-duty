@@ -128,6 +128,14 @@ export interface PrewarmService {
   world(...objects: THREE.Object3D[]): void
   /** Stand-ins that will appear in the viewmodel scene. */
   viewmodel(...objects: THREE.Object3D[]): void
+  /**
+   * A material some pass will apply as `scene.overrideMaterial` mid-frame.
+   * `renderer.compile` never sees override materials, so each geometry flavour
+   * (plain, instanced, skinned) it meets would otherwise link its program on
+   * the first frame that flavour appears in the pass — mid-firefight, for a
+   * skinned soldier. Registered materials get compiled at boot instead.
+   */
+  depthOverride(material: THREE.Material): void
 }
 
 export interface RaycastHit {
@@ -191,6 +199,20 @@ export interface PlayOptions {
 }
 
 export interface FxService {
+  /**
+   * Hold one dead instance in every pooled draw (on) or release it (off).
+   * Run for a couple of presented frames behind the loading screen so Metal
+   * builds the particle/tracer pipelines before the first shot needs them.
+   */
+  pipelineWarm(on: boolean): void
+  /**
+   * Run one soft-particle depth prepass now, whatever the frame needs. The
+   * pass draws the whole scene with an override material, so anything that
+   * joins the scene after boot — the light shafts and their motes are built
+   * on the third frame — would otherwise compile its depth variant during
+   * the first firefight instead.
+   */
+  warmDepthPass(): void
   impact(point: THREE.Vector3, normal: THREE.Vector3, surface: Surface): void
   bulletTracer(from: THREE.Vector3, to: THREE.Vector3, speed?: number): void
   muzzleFlash(matrix: THREE.Matrix4, scale: number, inViewmodelScene: boolean): void
@@ -229,6 +251,12 @@ export interface HudService {
 }
 
 export interface WeaponService {
+  /**
+   * Make the hidden viewmodel extras (scope overlays, unequipped weapons)
+   * draw (on) or hide again (off), for the boot-time pipeline warm. Their
+   * overlay materials rest at opacity 0, so nothing visible is produced.
+   */
+  pipelineWarm(on: boolean): void
   currentName: string
   /** Fraction 0..1 of how far into aim-down-sights the player is. */
   adsFraction: number

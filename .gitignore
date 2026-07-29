@@ -4,8 +4,8 @@ shots/
 *.log
 .DS_Store
 
-.chrome-profile/
-.chrome-profile-play/
 runs/
-.chrome-profile-play*/
-.chrome-profile-pause*/
+# Every harness run gets its own profile directory, named with its pid: a
+# shared one intermittently fails to launch when a stale lock outlives a
+# killed Chrome.
+.chrome-profile*/

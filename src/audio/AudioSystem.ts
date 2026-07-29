@@ -83,6 +83,36 @@ export class AudioSystem implements System, AudioService {
     }
   }
 
+  /**
+   * Authors the whole sound bank behind the loading screen. Synthesis is pure
+   * seeded JS — it needs the context only for its sample rate, and a context
+   * can be *created* without a gesture; only audibility needs the click. Left
+   * to the update loop, the bank was authored at 4ms a frame (with single
+   * tasks overshooting to ~19ms) across the first second of play — which is
+   * exactly the opening firefight. Sliced so the loading screen keeps painting.
+   */
+  async postInit(): Promise<void> {
+    if (this.headless || this.failed) return
+    this.tryStart()
+    const bank = this.bank
+    const mixer = this.mixer
+    if (!bank || !mixer) return
+    try {
+      while (!bank.complete) {
+        this.pending.length = 0
+        bank.step(12, this.pending)
+        for (const d of this.pending) mixer.register(d)
+        await new Promise((r) => setTimeout(r, 0))
+      }
+      this.pending.length = 0
+      this.bank = null
+      mixer.buildComplete()
+      this.started = true
+    } catch (err) {
+      this.fail(err)
+    }
+  }
+
   private bindGestures(): void {
     if (this.gestureBound || typeof window === 'undefined') return
     this.gestureBound = true

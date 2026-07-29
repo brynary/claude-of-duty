@@ -9,7 +9,10 @@ import { Biquad } from './Synth'
  * clusters) followed by a band-split noise tail whose highs die faster than its
  * lows (which carries the material — plaster is bright, a tunnel is not).
  *
- * Two convolver slots exist so a zone change crossfades instead of cutting.
+ * Each zone owns a permanently-connected convolver chain, and a zone change
+ * only crossfades the chain gains: assigning a ConvolverNode's buffer makes
+ * the engine re-partition the IR for FFT convolution, which stalls the main
+ * thread for several milliseconds — unacceptable mid-combat.
  */
 
 export type ZoneName = 'outdoor' | 'indoor' | 'tunnel' | 'hall'
@@ -117,8 +120,7 @@ export class Reverb {
 
   private ctx: AudioContext
   private rand: Rand
-  private slots: { conv: ConvolverNode; pre: DelayNode; gain: GainNode }[] = []
-  private active = 0
+  private chains = new Map<ZoneName, { conv: ConvolverNode; pre: DelayNode; gain: GainNode }>()
   private zone: ZoneName = 'outdoor'
   private cache = new Map<ZoneName, AudioBuffer>()
 
@@ -129,20 +131,32 @@ export class Reverb {
     this.output = ctx.createGain()
     this.output.gain.value = ZONES.outdoor.wet
 
-    for (let i = 0; i < 2; i++) {
+    // Build every zone's IR now, while the loading screen is up (or at worst
+    // on the unlock gesture, before play). A cache miss used to synthesise
+    // 8-25ms of impulse response on the first doorway crossing of the match.
+    // The order here fixes which RNG draws each IR gets: outdoor is pinned
+    // first, then the rest follow declaration order — reordering the builds
+    // would change the content of every IR.
+    this.irFor('outdoor')
+
+    // One chain per zone, all wired up front. Each convolver's buffer is
+    // assigned exactly once, here, so no zone change ever pays the IR
+    // partitioning cost again.
+    for (const zone of Object.keys(ZONES) as ZoneName[]) {
+      const spec = ZONES[zone]
       const pre = ctx.createDelay(0.5)
+      pre.delayTime.value = spec.predelay
       const conv = ctx.createConvolver()
       conv.normalize = true
+      conv.buffer = this.irFor(zone)
       const gain = ctx.createGain()
-      gain.gain.value = i === 0 ? 1 : 0
+      gain.gain.value = zone === 'outdoor' ? 1 : 0
       this.input.connect(pre)
       pre.connect(conv)
       conv.connect(gain)
       gain.connect(this.output)
-      this.slots.push({ conv, pre, gain })
+      this.chains.set(zone, { conv, pre, gain })
     }
-
-    this.applyZone('outdoor', 0, 0)
   }
 
   get currentZone(): ZoneName {
@@ -152,34 +166,25 @@ export class Reverb {
   setZone(zone: ZoneName, fadeSeconds = 0.7): void {
     if (zone === this.zone) return
     this.zone = zone
-    const next = this.active ^ 1
-    this.applyZone(zone, next, fadeSeconds)
-  }
-
-  private applyZone(zone: ZoneName, slotIndex: number, fade: number): void {
     const spec = ZONES[zone]
-    const slot = this.slots[slotIndex]
-    slot.conv.buffer = this.irFor(zone)
-    slot.pre.delayTime.value = spec.predelay
-
     const now = this.ctx.currentTime
-    const other = this.slots[slotIndex ^ 1]
-    if (fade <= 0) {
-      slot.gain.gain.value = 1
-      other.gain.gain.value = 0
+
+    if (fadeSeconds <= 0) {
+      for (const [name, chain] of this.chains) {
+        chain.gain.gain.value = name === zone ? 1 : 0
+      }
     } else {
       // Equal-power-ish crossfade; a linear one dips audibly in the middle.
-      slot.gain.gain.cancelScheduledValues(now)
-      other.gain.gain.cancelScheduledValues(now)
-      slot.gain.gain.setValueAtTime(slot.gain.gain.value, now)
-      other.gain.gain.setValueAtTime(other.gain.gain.value, now)
-      slot.gain.gain.linearRampToValueAtTime(1, now + fade)
-      other.gain.gain.linearRampToValueAtTime(0, now + fade)
+      for (const [name, chain] of this.chains) {
+        const g = chain.gain.gain
+        g.cancelScheduledValues(now)
+        g.setValueAtTime(g.value, now)
+        g.linearRampToValueAtTime(name === zone ? 1 : 0, now + fadeSeconds)
+      }
     }
     this.output.gain.cancelScheduledValues(now)
     this.output.gain.setValueAtTime(this.output.gain.value, now)
-    this.output.gain.linearRampToValueAtTime(spec.wet, now + Math.max(fade, 0.01))
-    this.active = slotIndex
+    this.output.gain.linearRampToValueAtTime(spec.wet, now + Math.max(fadeSeconds, 0.01))
   }
 
   private irFor(zone: ZoneName): AudioBuffer {
@@ -263,10 +268,10 @@ export class Reverb {
   }
 
   dispose(): void {
-    for (const slot of this.slots) {
-      slot.gain.disconnect()
-      slot.conv.disconnect()
-      slot.pre.disconnect()
+    for (const chain of this.chains.values()) {
+      chain.gain.disconnect()
+      chain.conv.disconnect()
+      chain.pre.disconnect()
     }
     this.input.disconnect()
     this.output.disconnect()

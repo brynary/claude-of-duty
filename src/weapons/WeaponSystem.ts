@@ -36,6 +36,10 @@ export class WeaponSystem implements System, WeaponService {
   readonly name = 'weapons'
 
   currentName = 'M4A1'
+
+  pipelineWarm(on: boolean): void {
+    this.vm.pipelineWarm(on)
+  }
   adsFraction = 0
   recoilPitch = 0
   recoilYaw = 0

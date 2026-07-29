@@ -70,6 +70,12 @@ export class ShadowCascade {
 
   private registered = new WeakSet<THREE.Material>()
   private sweepTimer = 0
+  /**
+   * Sweeps completed. Once the first few have passed, boot is over, and any
+   * material arriving after that will pay its program link mid-match — every
+   * such registration is a prewarm coverage bug worth hearing about.
+   */
+  private sweeps = 0
   private readonly shadowMapSize: number
   private readonly depthRange: number
 
@@ -166,6 +172,12 @@ export class ShadowCascade {
     if (this.registered.has(material) || !receivesDirectLight(material)) return
     this.registered.add(material)
 
+    if (this.sweeps > 8) {
+      const w = window as unknown as Record<string, unknown>
+      w.__lateMaterialRegistrations = ((w.__lateMaterialRegistrations as number | undefined) ?? 0) + 1
+      console.warn(`[cascade] late material registration: ${material.type} "${material.name}" will compile mid-match`)
+    }
+
     const previous: CompileHook = material.onBeforeCompile
     this.csm.setupMaterial(material)
     const csmHook: CompileHook = material.onBeforeCompile
@@ -181,6 +193,7 @@ export class ShadowCascade {
     this.sweepTimer -= dt
     if (this.sweepTimer <= 0) {
       this.sweepTimer = 0.25
+      this.sweeps++
       this.registerMaterials(scene)
     }
     this.csm.update()
