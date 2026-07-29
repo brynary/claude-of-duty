@@ -128,6 +128,9 @@ export class FxSystem implements System, FxService {
     this.decals = new Decals(ctx.scene, ctx.config.decalBudget, this.textures)
     this.tracers = new Tracers(ctx.scene, 96)
     this.debris = new Debris(ctx.scene, ctx.config.quality === 'low' ? 10 : 26, ctx.config.seed)
+    // The chunks spawn hidden and wear one surface each, so the surfaces no
+    // chunk currently carries would first reach the compiler mid-explosion.
+    ctx.services.prewarm?.world(...this.debris.warmupProxies())
     this.worldLights = new FxLightPool(ctx.scene, 3)
     this.viewLights = new FxLightPool(ctx.viewmodelScene, 1)
 

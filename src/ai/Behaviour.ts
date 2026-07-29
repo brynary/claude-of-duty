@@ -1397,6 +1397,13 @@ export class Behaviour {
       this.state = 'dead'
       return
     }
+    // A zero-length frame is a paused or frozen one. Returning early is not
+    // enough on its own to stop the shot: `fireTimer` gates firing and it is
+    // already at or below zero whenever the soldier is due to shoot, so a
+    // soldier that happened to be mid-burst when the menu opened would keep
+    // firing on every paused frame. Nothing that can damage the player may run
+    // on a frame that does not advance time.
+    if (dt <= 0) return
     this.timeInState += dt
     this.cachePlayer()
     this.updatePerception(dt)

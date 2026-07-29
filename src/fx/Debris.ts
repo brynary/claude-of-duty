@@ -73,6 +73,11 @@ export class Debris {
       this.geometries.push(geo)
     }
 
+    // Every surface's material up front. Built on demand, the first chunk of
+    // each new surface arrived with a material three had never seen, and the
+    // shader compiled inside the frame that spawned it.
+    for (const surface of Object.keys(SURFACE_TINT) as Surface[]) this.material(surface)
+
     for (let i = 0; i < count; i++) {
       const mesh = new THREE.Mesh(this.geometries[i % this.geometries.length], this.material('concrete'))
       mesh.castShadow = true
@@ -82,6 +87,22 @@ export class Debris {
       this.root.add(mesh)
       this.chunks.push({ mesh, handle: null, born: 0, active: false })
     }
+  }
+
+  /**
+   * Stand-ins for the boot-time shader pre-warm: the pool's own chunks are
+   * hidden and carry one material each, so nothing else in the scene would ever
+   * present the other surfaces to the compiler before a chunk of that surface
+   * flies. The caller owns the returned meshes and drops them once compiled;
+   * the geometry and materials belong to the pool and are shared, not copied.
+   */
+  warmupProxies(): THREE.Mesh[] {
+    return [...this.materials.values()].map((m) => {
+      const mesh = new THREE.Mesh(this.geometries[0], m)
+      mesh.castShadow = true
+      mesh.receiveShadow = true
+      return mesh
+    })
   }
 
   private material(surface: Surface): THREE.MeshStandardMaterial {

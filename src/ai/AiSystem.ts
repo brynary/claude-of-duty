@@ -7,7 +7,7 @@ import { difficulty } from '../game/Difficulty'
 import { NavGrid, Steering } from './Navigation'
 import { AI_CADENCE, Behaviour, Squad, groundBelow } from './Behaviour'
 import { Soldier, type SoldierWorld } from './Soldier'
-import { buildSoldierAsset, type SoldierAsset } from './SoldierMesh'
+import { buildSoldierAsset, fadeWarmupProxy, type SoldierAsset } from './SoldierMesh'
 
 /**
  * Enemy soldiers: procedural characters, navigation, cover-based combat,
@@ -241,6 +241,10 @@ export class AiSystem implements System, AiService {
 
     const mats = ctx.services.materials
     for (let i = 0; i < 3; i++) this.assets.push(buildSoldierAsset(mats, ctx.config.seed + i * 977))
+    // A corpse fades through its own transparent copies of these materials,
+    // which no living soldier ever puts in front of the compiler.
+    const prewarm = ctx.services.prewarm
+    if (prewarm) for (const a of this.assets) prewarm.world(fadeWarmupProxy(a))
 
     this.flashGeometry = buildMuzzleFlash()
     // No `toneMapped: false` here: the Engine leaves renderer tone mapping off
@@ -788,6 +792,8 @@ export class AiSystem implements System, AiService {
     for (const a of this.assets) {
       a.geometry.dispose()
       for (const m of a.materials) m.dispose()
+      for (const set of a.fadePool) for (const m of set) m.dispose()
+      a.fadePool.length = 0
     }
     this.flashGeometry.dispose()
     this.flashMaterial.dispose()

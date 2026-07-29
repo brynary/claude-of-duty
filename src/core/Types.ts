@@ -89,6 +89,24 @@ export interface Services {
   materials?: MaterialService
   lighting?: LightingService
   postfx?: PostFxService
+  prewarm?: PrewarmService
+}
+
+/**
+ * Boot-time shader pre-warm.
+ *
+ * three compiles a material's shader the first time it is actually drawn, and
+ * a compile costs tens to hundreds of milliseconds. Anything a system will only
+ * put on screen later — pooled debris, a corpse's transparent materials, a
+ * dropped magazine — must be handed over here during init, as a stand-in object
+ * carrying the real geometry and material. The pre-warm presents them to the
+ * compiler before the first frame and then drops them.
+ */
+export interface PrewarmService {
+  /** Stand-ins that will appear in the world scene. */
+  world(...objects: THREE.Object3D[]): void
+  /** Stand-ins that will appear in the viewmodel scene. */
+  viewmodel(...objects: THREE.Object3D[]): void
 }
 
 export interface RaycastHit {
@@ -244,6 +262,12 @@ export interface PostFxService {
 export interface System {
   readonly name: string
   init(ctx: GameContext): Promise<void> | void
+  /**
+   * Runs once after every system has finished `init`, before the first frame.
+   * For work that needs the finished world rather than just the systems that
+   * happen to be registered earlier — the shader pre-warm is the only user.
+   */
+  postInit?(ctx: GameContext): Promise<void> | void
   update?(dt: number, ctx: GameContext): void
   /** Runs after all update() passes; use for camera-dependent work. */
   lateUpdate?(dt: number, ctx: GameContext): void

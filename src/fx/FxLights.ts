@@ -3,10 +3,14 @@ import * as THREE from 'three'
 /**
  * A fixed pool of point lights used by muzzle flashes and explosions.
  *
- * The lights are created once at init and never added to or removed from the
- * scene afterwards: changing a scene's light count forces three to recompile
- * every material in it, which would hitch the frame exactly when the action
- * starts. Idle lights simply sit at zero intensity.
+ * The lights are created once at init and never added to the scene, removed
+ * from it, or hidden afterwards: three counts only the *visible* lights when it
+ * builds a shader, and keys its program cache on that count, so hiding an idle
+ * light recompiles every material in the scene the next time one lights up.
+ * Measured at 29-31 programs and a 0.3-0.7 second frame per distinct count —
+ * i.e. one stall per new number of simultaneous flashes, always during the
+ * first firefight. Idle lights therefore stay visible at zero intensity, which
+ * contributes nothing to the image. {@link LightPool} keeps the same contract.
  */
 
 interface Flash {
@@ -26,7 +30,6 @@ export class FxLightPool {
     for (let i = 0; i < count; i++) {
       const light = new THREE.PointLight(0xffffff, 0, 12, 2)
       light.castShadow = false
-      light.visible = false
       light.name = `fx-flash-${i}`
       scene.add(light)
       this.flashes.push({ light, start: -1e9, duration: 0.1, peak: 0, curve: 2, active: false })
@@ -62,7 +65,6 @@ export class FxLightPool {
     best.light.distance = distance
     best.light.decay = 2
     best.light.intensity = peak
-    best.light.visible = true
     best.start = time
     best.duration = duration
     best.peak = peak
@@ -78,7 +80,6 @@ export class FxLightPool {
       if (u >= 1 || u < 0) {
         f.active = false
         f.light.intensity = 0
-        f.light.visible = false
         continue
       }
       // Instant attack, sharp decay — a muzzle flash is over before the eye

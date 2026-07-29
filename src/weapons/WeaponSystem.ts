@@ -182,6 +182,13 @@ export class WeaponSystem implements System, WeaponService {
     if (this.wasAlive && !alive) this.onDeath()
     this.wasAlive = alive
 
+    // Nothing that fires may run on a frame that does not advance time. `dt`
+    // is zero while paused, and `fireTimer` is at or below zero whenever a shot
+    // is due, so without this a weapon mid-burst when the menu opened would
+    // keep firing every frame. The viewmodel and HUD are updated below the
+    // guard in the capture path, so a frozen screenshot still poses correctly.
+    if (dt <= 0 && !scripted) return
+
     const wantAds = scripted ? scripted.ads : alive && input.mouse1
     const trigger = scripted ? scripted.fire : alive && input.mouse0
     const sprinting = !scripted && (player?.isSprinting ?? false) && !trigger && !wantAds

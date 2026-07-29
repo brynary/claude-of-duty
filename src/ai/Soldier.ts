@@ -4,7 +4,15 @@ import type { PhysicsSystem } from '../physics/Physics'
 import { GROUP } from '../physics/Physics'
 import type { Damageable, GameContext, HitInfo, Team } from '../core/Types'
 import type { Rand } from '../core/Rand'
-import { BIND, type BoneName, type SoldierAsset, type SoldierRig, createSoldierRig } from './SoldierMesh'
+import {
+  BIND,
+  type BoneName,
+  type SoldierAsset,
+  type SoldierRig,
+  borrowFadeMaterials,
+  createSoldierRig,
+  releaseFadeMaterials,
+} from './SoldierMesh'
 import { Ragdoll } from './Ragdoll'
 
 export type Stance = 'stand' | 'crouch' | 'prone'
@@ -171,8 +179,12 @@ export class Soldier implements Damageable {
   private aQ2 = new THREE.Quaternion()
   private aQ3 = new THREE.Quaternion()
 
+  /** The shared variant this soldier was built from; owns the fade material pool. */
+  private readonly asset: SoldierAsset
+
   constructor(world: SoldierWorld, asset: SoldierAsset, flashGeometry: THREE.BufferGeometry, flashMaterial: THREE.Material) {
     this.world = world
+    this.asset = asset
     this.rig = createSoldierRig(asset)
     this.rifleBasePos.copy(this.rig.rifle.position)
 
@@ -272,7 +284,7 @@ export class Soldier implements Damageable {
     this.ragdoll = null
     this.rig.root.removeFromParent()
     if (this.fadeMats) {
-      for (const m of this.fadeMats) m.dispose()
+      releaseFadeMaterials(this.asset, this.fadeMats)
       this.fadeMats = null
     }
   }
@@ -280,18 +292,13 @@ export class Soldier implements Damageable {
   private fadeMats: THREE.Material[] | null = null
 
   /**
-   * Corpse fade-out. Materials are shared between every soldier, so the first
-   * call swaps in per-corpse clones; they are disposed with the soldier.
+   * Corpse fade-out. The living materials are shared by every soldier and are
+   * opaque, so a fading body borrows a transparent set from the asset's pool
+   * and hands it back when the corpse is cleared.
    */
   setFade(alpha: number): void {
     if (!this.fadeMats) {
-      const src = this.rig.mesh.material
-      const list = Array.isArray(src) ? src : [src]
-      this.fadeMats = list.map((m) => {
-        const c = m.clone()
-        c.transparent = true
-        return c
-      })
+      this.fadeMats = borrowFadeMaterials(this.asset)
       this.rig.mesh.material = this.fadeMats
       this.rig.mesh.castShadow = false
       this.flash.visible = false

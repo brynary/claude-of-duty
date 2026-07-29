@@ -102,8 +102,35 @@ export class Engine {
       const ms = performance.now() - t0
       if (ms > 50) console.info(`[engine] ${s.name} init ${ms.toFixed(0)}ms`)
     }
+
+    // Pause is enforced here, in one place, rather than by each system opting
+    // in. Only the match director and the audio mixer ever subscribed to
+    // `game:pause`, so the AI, weapons, physics and player controller all kept
+    // running behind the menu: enemies acquired the player, aimed and killed
+    // them while their input was disabled and they could not answer. Pausing
+    // has to be a property of the frame loop, because a system that forgets to
+    // listen fails silently and only in the one situation nobody measures — a
+    // scripted run never opens a menu.
+    this.events.on('game:pause', (p) => { this.paused = p.paused })
+
     this.handleResize()
+
+    // Resize first: the pre-warm compiles against the render state the first
+    // frame will actually use.
+    for (const s of this.systems) {
+      if (!s.postInit) continue
+      const t0 = performance.now()
+      await s.postInit(this.ctx)
+      const ms = performance.now() - t0
+      if (ms > 50) console.info(`[engine] ${s.name} postInit ${ms.toFixed(0)}ms`)
+    }
   }
+
+  /**
+   * True while a menu holds the game. Rendering continues so the paused frame
+   * stays on screen behind the menu; simulation does not.
+   */
+  private paused = false
 
   start(): void {
     if (this.running) return
@@ -146,7 +173,11 @@ export class Engine {
 
   private tick(rawDt: number, now: number, headless = false): void {
     const frozen = this.config.freezeAt !== null && this.ctx.elapsed >= this.config.freezeAt
-    const dt = frozen ? 0 : rawDt
+    // A paused frame advances by zero, exactly as a frozen capture frame does.
+    // Systems still get their update call, so menus animate and the HUD keeps
+    // drawing, but nothing that integrates dt can move — no AI decisions, no
+    // ballistics, no physics, no damage.
+    const dt = frozen || this.paused ? 0 : rawDt
 
     this.ctx.elapsed += dt
     this.renderer.info.reset()

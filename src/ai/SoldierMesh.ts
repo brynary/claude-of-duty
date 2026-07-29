@@ -1787,6 +1787,8 @@ export interface SoldierAsset {
   /** Rifle transform relative to the right hand bone. */
   rifleLocal: THREE.Matrix4
   palette: Palette
+  /** Idle corpse-fade material sets. See {@link borrowFadeMaterials}. */
+  fadePool: THREE.Material[][]
 }
 
 /**
@@ -1912,7 +1914,49 @@ export function buildSoldierAsset(mats: MaterialService | undefined, seed: numbe
   const handBind = new THREE.Matrix4().makeTranslation(...BIND.handR.p)
   const rifleLocal = new THREE.Matrix4().copy(handBind).invert().multiply(basis)
 
-  return { geometry, materials, boneInverses, rifleLocal, palette }
+  return { geometry, materials, boneInverses, rifleLocal, palette, fadePool: [] }
+}
+
+/**
+ * Corpse-fade materials, lent out a set at a time.
+ *
+ * A fading corpse cannot share the living materials, because it needs its own
+ * opacity and `transparent` is part of the shader three compiles. Cloning a set
+ * per corpse and disposing it with the body dropped the program's last
+ * reference every time the corpses were cleared, so three deleted the shader
+ * and compiled it again for the next man down — a 57-76 ms frame, repeatedly,
+ * mid-firefight. Sets are therefore pooled and never disposed: the clone
+ * happens at most once per simultaneously-fading corpse for the whole run.
+ */
+export function borrowFadeMaterials(asset: SoldierAsset): THREE.Material[] {
+  return asset.fadePool.pop() ?? createFadeMaterials(asset)
+}
+
+export function releaseFadeMaterials(asset: SoldierAsset, set: THREE.Material[]): void {
+  asset.fadePool.push(set)
+}
+
+function createFadeMaterials(asset: SoldierAsset): THREE.Material[] {
+  return asset.materials.map((m) => {
+    const c = m.clone()
+    c.transparent = true
+    return c
+  })
+}
+
+/**
+ * A throwaway rig wearing a fade set, so the boot-time pre-warm can present
+ * those materials to the shader compiler. The set it builds goes into the pool,
+ * so the first corpse gets a compiled shader rather than a stall.
+ */
+export function fadeWarmupProxy(asset: SoldierAsset): THREE.Object3D {
+  const set = createFadeMaterials(asset)
+  asset.fadePool.push(set)
+  const rig = createSoldierRig(asset)
+  rig.mesh.material = set
+  // Matches the corpse: a fading body stops casting shadows.
+  rig.mesh.castShadow = false
+  return rig.root
 }
 
 export interface SoldierRig {
