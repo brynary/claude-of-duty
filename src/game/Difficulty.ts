@@ -84,21 +84,49 @@ export const MAX_ATTACKERS = 2
 
 /**
  * Reference cadence for the incoming-damage estimate reported by `snapshot()`.
- * `[measured]` from `src/ai/Behaviour.ts` at the time of writing: 3-5 round
- * bursts at 0.085-0.105 s spacing with a 0.6-1.6 s pause scaled by 0.85 while
- * in contact, giving ~3.3 rounds/s sustained; damage per hit `5 + U(0, 3.5)`,
- * mean 6.75.
  *
- * Nothing in this module *applies* these. They exist only so `estimatedTimeToDie`
- * is a real number a designer can read rather than a shrug. If the AI's cadence
- * changes, call `setAttackerCadence` and the estimate stays honest.
+ * These are the *defaults*; `AiSystem.init` overwrites them through
+ * `setAttackerCadence` with `Behaviour.AI_CADENCE`, and they are kept equal to
+ * what it passes so an un-wired instance reports the same figure a wired one
+ * does. They used to read 3.3 rounds/s and 6.75 HP a round — the cadence this
+ * file was written against, three times what the AI now delivers — which is how
+ * the preset table below came to advertise a Regular time-to-die of 4.5 s while
+ * the running code reported 18.9 s.
+ *
+ * `[measured]` from `src/ai/Behaviour.ts`: five rounds at 0.105 s inside a
+ * 0.4-0.6 s burst, then a 1.6-2.6 s pause, times an `exposedFraction` of 0.55
+ * for the part of the cycle a token holder is out of cover and not reloading.
+ * Damage per round is `PLAYER_DAMAGE` 5.0, flat.
+ *
+ * Nothing in this module *applies* these. They exist only so the reported
+ * threat figures are numbers a designer can read rather than a shrug.
  */
-const DEFAULT_ROUNDS_PER_SEC = 3.3
-const DEFAULT_DAMAGE_PER_HIT = 6.75
-/** Distance the time-to-die estimate is quoted at: the measured mean engagement
- * distance of the current build (17.9 m), which sits inside the 10-30 m target
- * band of FEEL_TARGET §6.3. */
-const REFERENCE_DISTANCE = 18
+const DEFAULT_ROUNDS_PER_SEC = 1.058
+const DEFAULT_DAMAGE_PER_HIT = 5.0
+/** Distance the threat estimates are quoted at: the measured mean engagement
+ * distance of the current build (19-22 m across both scripted runs), which sits
+ * inside the 10-30 m target band of FEEL_TARGET §6.3. Just inside
+ * {@link BASE_NEAR_RANGE}, so the quoted figures are near-range figures. */
+const REFERENCE_DISTANCE = 20
+
+/**
+ * The player's health regeneration, `[stated]` FEEL_TARGET §5.2 from the MWIII
+ * Season 2 patch notes: regeneration begins **3 s** after the last hit and
+ * restores **75 HP/s**.
+ *
+ * `PlayerSystem` owns these and applies them; they are mirrored here, read-only,
+ * because **they, and not any number in this file, decide whether the player can
+ * die.** 75 HP/s refills the whole bar in 1.34 s, so incoming fire only counts
+ * if it arrives with no 3 s gap in it. A difficulty model that reports lethality
+ * as damage-per-second and stops there will describe a game that cannot kill
+ * anyone as dangerous — which is exactly what this one did. See
+ * {@link DifficultySnapshot.damagePerRegenWindow}.
+ *
+ * Only the delay is needed here; the 75 HP/s appears nowhere in the arithmetic
+ * because at that rate the refill is effectively instant against everything else
+ * in this file.
+ */
+const REGEN_DELAY = 3.0
 
 // ---------------------------------------------------------------------------
 // Presets
@@ -152,29 +180,60 @@ export interface PresetValues {
 /**
  * The ladder.
  *
- * Constructed from one design anchor rather than from adjectives: **how long
- * full exposure to the maximum two attackers, at the 18 m reference distance,
- * takes to kill the player.** Regular is anchored at ~4.5 s, chosen because
- *
- *   - it is comfortably longer than the 3 s health-regen delay (§5.2
- *     `[stated]`), so a player cannot regen mid-fight;
- *   - a realistic 1-1.5 s exchange — see, ADS in 0.25 s (§3.1), kill two
- *     enemies at 0.2-0.35 s TTK each (§2.1) — costs 25-40% of the bar, so
- *     winning a fight has a real price without ending the round;
- *   - standing in the open through three exchanges kills you.
- *
  * Effective lethality is `accuracyScale x damageScale / healthScale`, so the
  * three columns compound. §7.6's guessed ladder does not appear to have
  * accounted for that: its Veteran row (0.85 near accuracy, 2.5x damage, "very
- * low health") multiplies out to roughly 4-5x Regular's lethality, about a
- * second of survival before any health reduction. The ladder below targets a
- * 3.0x spread instead and states the resulting time-to-die on every row.
+ * low health") multiplies out to roughly 4-5x Regular's lethality. This ladder
+ * targets a 3.0x spread instead.
  *
- * All four rows are `[estimated]`. Only the Regular *baseline* it is built
- * around (0.5/0.1 accuracy, 500-1000 ms reaction, 100 HP) is `[stated]`.
+ * All four rows are `[estimated]`. Only the Regular *baseline* they are built
+ * around (0.5/0.1 accuracy, 500-1000 ms reaction, 100 HP) is `[stated]`, and
+ * Regular is 1.00 on all three columns by definition rather than by taste.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT EACH ROW ACTUALLY DELIVERS, AND WHY THE SECOND COLUMN IS THE REAL ONE
+ * ---------------------------------------------------------------------------
+ *
+ * Both figures are at {@link REFERENCE_DISTANCE} against the two-attacker clamp
+ * with the AI's real cadence, which is what `effective()` reports:
+ *
+ * | preset   | lethality | unbroken exposure to die | health lost per 3 s |
+ * |----------|-----------|--------------------------|---------------------|
+ * | Recruit  | 0.29x     | 64.8 s                   | 4.6%                |
+ * | Regular  | 1.00x     | 18.9 s                   | 15.9%               |
+ * | Hardened | 1.73x     | 10.9 s                   | 27.5%               |
+ * | Veteran  | 2.90x     | 6.5 s                    | 46.0%               |
+ *
+ * The first column is a fiction and the last one is the truth, because of
+ * {@link REGEN_DELAY}: a gap of 3 s in the incoming fire hands the whole bar
+ * back at 75 HP/s. "18.9 s to die" is only reachable if none of those 18.9
+ * seconds contains a 3 s lull.
+ *
+ * **Measured, none of them do.** Across the two 90 s scripted runs of
+ * 2026-07-28, with the camera bug fixed and the player aiming properly:
+ *
+ *   - the player took damage in **12 of 90 s** (push) and **5 of 90 s** (hold);
+ *   - the longest run of consecutive damaging seconds was **2** and **1**;
+ *   - the worst 3 s window cost **15.5** and **15.8 HP** of a 100 HP pool;
+ *   - total damage taken was 87.5 and 46.7 HP, and **deaths were zero**.
+ *
+ * Read the third line against the table: Regular's modelled 15.9% per 3 s and
+ * the measured 15.5-15.8 HP peak are the *same number*. **The preset values are
+ * not wrong. The exposure is not continuous.** Every hit is followed by a gap
+ * longer than the regen delay, so nothing accumulates and the player is
+ * restored to full after every exchange. Veteran, at 46% of the bar per 3 s,
+ * would not kill this player either — three isolated spurts a minute apart are
+ * three isolated spurts whatever each one is worth.
+ *
+ * So do not raise these numbers to chase deaths. Every one of Regular's three
+ * is `[stated]`, and inflating them to compensate for a duty cycle set in
+ * `src/ai/Behaviour.ts` would have to be unpicked the moment that is fixed.
+ * The deficit is there: `AI_CADENCE.exposedFraction` claims a token holder is
+ * firing 55% of the time, and the damage that reached the player implies at
+ * most 22%. That is the number to move.
  */
 export const PRESETS: Readonly<Record<DifficultyPreset, PresetValues>> = {
-  // lethality 0.29x Regular -> ~15.4 s to die under full two-attacker exposure
+  // lethality 0.29x Regular -> 64.8 s of unbroken exposure, 4.6% of the bar per 3 s
   recruit: {
     id: 'recruit',
     label: 'Recruit',
@@ -185,7 +244,7 @@ export const PRESETS: Readonly<Record<DifficultyPreset, PresetValues>> = {
     reactionScale: 1.7,
   },
   // the baseline: 0.5 near / 0.1 far accuracy, 100 HP, 500-1000 ms reaction
-  // lethality 1.00x -> ~4.5 s
+  // lethality 1.00x -> 18.9 s of unbroken exposure, 15.9% of the bar per 3 s
   regular: {
     id: 'regular',
     label: 'Regular',
@@ -195,7 +254,7 @@ export const PRESETS: Readonly<Record<DifficultyPreset, PresetValues>> = {
     healthScale: 1.0,
     reactionScale: 1.0,
   },
-  // lethality 1.73x -> ~2.6 s
+  // lethality 1.73x -> 10.9 s of unbroken exposure, 27.5% of the bar per 3 s
   hardened: {
     id: 'hardened',
     label: 'Hardened',
@@ -205,7 +264,7 @@ export const PRESETS: Readonly<Record<DifficultyPreset, PresetValues>> = {
     healthScale: 0.9,
     reactionScale: 0.76,
   },
-  // lethality 2.90x -> ~1.6 s
+  // lethality 2.90x -> 6.5 s of unbroken exposure, 46.0% of the bar per 3 s
   veteran: {
     id: 'veteran',
     label: 'Veteran',
@@ -244,14 +303,21 @@ const HIT_CHANCE_CEILING = 0.9
  *      moves roughly three times more slowly.
  *
  * There is a third hazard specific to this project. Two of the four input
- * signals — player accuracy and time-to-kill — are dominated by *weapon*
- * tuning, not by difficulty. With the current build's 5.4% accuracy and 1.47 s
- * TTK, a naive controller would read "this player is drowning", pin itself at
- * maximum assistance and quietly mask the weapon bug. Two defences: the
- * outcome signals (deaths, damage taken) carry 70% of the weight and the
- * process signals only 30%; and `pinnedFor` reports how long the assist has sat
- * against a bound, which a harness run should treat as "something upstream is
- * wrong, do not trust this run's difficulty numbers".
+ * signals — player accuracy and kill duration — are dominated by *weapon*
+ * tuning, not by difficulty, so a build with a broken weapon reads as a
+ * drowning player and a naive controller would pin itself at maximum assistance
+ * and quietly mask the bug. That is not hypothetical: the round measured at
+ * 5.4% accuracy and 1.47 s kill duration turned out to be a camera that could
+ * not turn, not a difficulty that was too high. Two defences: the outcome
+ * signals (deaths, damage taken) carry 70% of the weight and the process signals
+ * only 30%; and `pinnedFor` reports how long the assist has sat against a bound,
+ * which a harness run should treat as "something upstream is wrong, do not trust
+ * this run's difficulty numbers".
+ *
+ * With the camera fixed the same runs read 33-40% accuracy and 0.97 s, both
+ * healthy, and the controller finally has real evidence to work from: **zero
+ * deaths across two 90 s runs.** That is what it is for, and what the band
+ * sizing below is now calibrated against.
  */
 
 /** Signed assist. Negative eases the game, positive hardens it. */
@@ -259,17 +325,47 @@ const ASSIST_MIN = -1
 const ASSIST_MAX = 1
 
 /**
- * Per-variable bands at full assist. Chosen so total lethality moves within
- * **-24% / +12%** of the selected preset — roughly a third of one step on the
- * preset ladder in the easing direction, and a sixth of a step hardening.
- * A player on Regular never silently receives Recruit.
+ * Per-variable bands at full assist.
+ *
+ * **Size these against the assist the controller can reach, not against ±1.**
+ * That is the mistake the previous version made and it cost the whole system its
+ * usefulness. `recomputeTarget` only returns ±1 when all four signals sit at
+ * their extremes at once, and the two directions are not equally able to do
+ * that: a drowning player trips all four together and reaches about **-0.87**,
+ * while a dominating player gets nothing from the accuracy signal — 33-40% is
+ * *healthy*, it scores zero — and tops out around **+0.55**. The deadband
+ * rescale then takes 20 points off both.
+ *
+ * Measured against the two 90 s runs of 2026-07-28, the first runs where the
+ * player could actually aim: zero deaths, 0.05-0.15 of the health pool lost per
+ * engagement — far below the band — and the controller read that correctly and
+ * settled at about **+0.35 to +0.45**. With the old 0.06 bands that expressed
+ * itself as **1.03x to 1.05x lethality**, which is indistinguishable from
+ * nothing. The system detected the problem the brief describes and then had no
+ * way to say so.
+ *
+ * With the bands below, the same evidence produces **1.11x to 1.18x**, and the
+ * ±1 bounds — which are what actually caps the system — sit at:
+ *
+ * | direction | at the bound | reachable in practice |
+ * | --- | --- | --- |
+ * | harden | 1.32x (half a preset step) | ~+0.5, so ~1.15x |
+ * | ease | 0.76x (a third of a step down) | ~-0.87, so ~0.79x |
+ *
+ * A player on Regular therefore never silently receives Hardened (1.73x) or
+ * Recruit (0.29x), which is the property that matters. The residual asymmetry
+ * favours the player, which is the correct direction, and the larger asymmetry
+ * is still in the *rates* below where it is a stated decision.
  */
-const EASE_ACCURACY_BAND = 0.12 // hit chance x0.88 at full ease
-const HARDEN_ACCURACY_BAND = 0.06 // x1.06 at full harden
-const EASE_DAMAGE_BAND = 0.14 // damage x0.86
-const HARDEN_DAMAGE_BAND = 0.06 // x1.06
+const EASE_ACCURACY_BAND = 0.12 // hit chance x0.88 at the -1 bound
+const HARDEN_ACCURACY_BAND = 0.15 // x1.10 at the reachable +0.65, x1.15 at +1
+const EASE_DAMAGE_BAND = 0.14 // damage x0.86 at the -1 bound
+const HARDEN_DAMAGE_BAND = 0.15 // x1.10 at +0.65, x1.15 at +1
 const EASE_REACTION_BAND = 0.1 // enemies react 10% slower
-const HARDEN_REACTION_BAND = 0.04 // 4% faster
+/** 8%: 500-1000 ms becomes 474-948 ms at +0.65, 460-920 ms at +1. Both still
+ * inside the spirit of the `[stated]` window, which is the constraint — §7.5's
+ * whole point is that the AI reacts slower than the player kills. */
+const HARDEN_REACTION_BAND = 0.08
 
 /**
  * Health is never touched dynamically. Changing the player's maximum health
@@ -344,13 +440,36 @@ const WINDOW = 6
  *     attackers and longer fights.
  *   accuracy               [0.18, 0.45]  the harness target, from FEEL_TARGET
  *     §3.6 `[stated]`: ADS spread is exactly zero on every weapon inspected.
- *   time to kill           [0.20, 0.35]  the harness target, FEEL_TARGET §2.1
- *     `[measured]`.
+ *   kill duration          [0.80, 2.20]  the harness target. See below — this
+ *     band was wrong, and wrong in the direction that mattered.
  */
 const DEATHS_PER_ENGAGEMENT = { lo: 0.083, hi: 0.25, spanLo: 0.083, spanHi: 0.25 }
 const DAMAGE_FRACTION = { lo: 0.2, hi: 0.55, spanLo: 0.2, spanHi: 0.35 }
 const ACCURACY = { lo: 0.18, hi: 0.45, spanLo: 0.18, spanHi: 0.2 }
-const TTK = { lo: 0.2, hi: 0.35, spanLo: 0.2, spanHi: 0.3 }
+/**
+ * Kill duration: **first damaging hit to the enemy's death**, which is what
+ * `PerformanceWindow.timeToKill` accumulates and is not the same quantity as
+ * FEEL_TARGET §2.1's time-to-kill.
+ *
+ * §2.1's 200-300 ms is the weapon's burst time with every round on target. This
+ * is a whole engagement: it contains the misses, so it is dominated by accuracy
+ * and it *rises* when the weapon gets better at any fixed hit rate. The harness
+ * knows this — `tools/analyze-play.mjs` calls the metric `killDuration`, targets
+ * it at **0.8-2.2 s**, and carries a note that labelling it "time to kill" and
+ * reading it against 200-300 ms "framed an accuracy problem as a weapon
+ * problem". This file then made the identical mistake one layer down.
+ *
+ * The consequence was not cosmetic. Both 90 s runs of 2026-07-28 measured 0.97
+ * and 0.98 s — healthy, mid-band. Against the old `hi` of 0.35 with a 0.3 span
+ * that saturates the score at a **full-strength** vote for easing, so every run
+ * where the game was working spent a tenth of its weight arguing the player was
+ * drowning. With deaths and damage both pointing the other way it did not flip
+ * the sign, but it cancelled a quarter of the hardening the evidence supported.
+ *
+ * Spans: full strength at 0.3 s below and 3.7 s above, the latter chosen against
+ * the harness's own 4.0 s ceiling on worst-case kill duration.
+ */
+const TTK = { lo: 0.8, hi: 2.2, spanLo: 0.5, spanHi: 1.5 }
 
 const W_DEATHS = 0.4
 const W_DAMAGE = 0.3
@@ -409,9 +528,29 @@ export interface DifficultySnapshot {
   /** Combined accuracy x damage / health, relative to Regular with no assist.
    * The one number to read if you only read one. */
   lethalityVsRegular: number
-  /** Seconds to die under continuous fire from `maxAttackers` at 18 m, using
-   * the AI cadence in `setAttackerCadence`. An estimate, not a measurement. */
+  /**
+   * Seconds of **unbroken** fire from `maxAttackers` at {@link REFERENCE_DISTANCE}
+   * needed to kill the player, using the cadence in `setAttackerCadence`.
+   *
+   * An estimate, not a measurement, and an optimistic one: it is the answer only
+   * if no 3 s gap ever opens in those seconds. Read
+   * {@link damagePerRegenWindow} alongside it or do not read it at all.
+   */
   estimatedTimeToDie: number
+  /**
+   * Fraction of the health pool that same exposure removes inside one
+   * {@link REGEN_DELAY} — the most the player can lose before the regen clock
+   * resets and 75 HP/s puts the bar back in 1.34 s.
+   *
+   * **This is the honest lethality figure.** Under 1.0 means no single burst of
+   * exposure can kill, so the player dies only to fire that stays unbroken for
+   * `estimatedTimeToDie`. Regular sits at 0.16, and the two scripted runs of
+   * 2026-07-28 confirm the arithmetic from the other end: their worst 3 s
+   * windows cost 15.5 and 15.8 HP against the 15.9 predicted here, and neither
+   * run produced a death, because no two damaging seconds ever landed close
+   * enough together to compound.
+   */
+  damagePerRegenWindow: number
 }
 
 // ---------------------------------------------------------------------------
@@ -503,7 +642,7 @@ export class DifficultySystem implements System {
     playerMaxHealth: BASE_PLAYER_HEALTH, reactionMin: 0, reactionMax: 0, maxAttackers: MAX_ATTACKERS,
     assist: 0, atBound: false, pinnedFor: 0, active: false,
     window: { episodes: 0, deathsPerEngagement: null, damageFractionPerEngagement: null, accuracy: null, timeToKill: null },
-    lethalityVsRegular: 1, estimatedTimeToDie: 0,
+    lethalityVsRegular: 1, estimatedTimeToDie: 0, damagePerRegenWindow: 0,
   }
 
   constructor(preset: DifficultyPreset = 'regular') {
@@ -673,6 +812,7 @@ export class DifficultySystem implements System {
     const dps = MAX_ATTACKERS * this.roundsPerSec * this.hitChance(REFERENCE_DISTANCE)
       * this.damagePerHit * o.damageToPlayerScale
     o.estimatedTimeToDie = dps > 0 ? o.playerMaxHealth / dps : Infinity
+    o.damagePerRegenWindow = (dps * REGEN_DELAY) / o.playerMaxHealth
     return o
   }
 
@@ -693,6 +833,7 @@ export class DifficultySystem implements System {
       ` | assist ${e.assist >= 0 ? '+' : ''}${e.assist.toFixed(2)} (${dir}` +
       `${e.active ? '' : ', grace'}${e.pinnedFor > 0 ? `, pinned ${e.pinnedFor.toFixed(0)}s` : ''})` +
       ` | lethality x${e.lethalityVsRegular.toFixed(2)} | ttd ${e.estimatedTimeToDie.toFixed(1)}s` +
+      ` unbroken, ${(e.damagePerRegenWindow * 100).toFixed(0)}%/3s` +
       ` | n=${e.window.episodes}`
     )
   }

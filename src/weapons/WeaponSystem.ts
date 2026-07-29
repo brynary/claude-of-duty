@@ -138,6 +138,14 @@ export class WeaponSystem implements System, WeaponService {
     // large part of why the run after a death reads as unwinnable.
     this.offs.push(ctx.events.on('player:respawn', () => this.onRespawn()))
 
+    // Kills feed the gun that made them. See `resupplyPerKill` for why the
+    // ammunition has to come from somewhere: a fixed loadout is sized for a
+    // fight that ends, and this one does not. The guard matches Telemetry's own
+    // kill filter so the two count the same events.
+    this.offs.push(ctx.events.on('entity:killed', (p) => {
+      if (p.byPlayer && p.entity.team === 'enemy') this.onKill()
+    }))
+
     ctx.services.weapons = this
   }
 
@@ -199,7 +207,19 @@ export class WeaponSystem implements System, WeaponService {
     // trigger is still down. Doing this only on the fire path left the weapon
     // sitting empty whenever the player let go, so the next trigger pull was a
     // dry click instead of a shot.
-    if (alive && state.mag <= 0 && state.reserve > 0) this.tryReload()
+    //
+    // Note what this guard implies: while the reserve holds, the reload starts
+    // the frame after the magazine empties, `blocked` goes true, and the dry
+    // click below is unreachable. So *every* dry fire the telemetry records is
+    // an exhausted loadout, not a mistimed reload. Confirmed against the run
+    // data — the run that fired exactly `magSize + reserve` rounds logged all
+    // 12 of the dry fires, and the one that stopped ten rounds short logged
+    // none. With nothing left to load, fall back to a weapon that still has
+    // rounds, the way Call of Duty drops you to your secondary.
+    if (alive && state.mag <= 0) {
+      if (state.reserve > 0) this.tryReload()
+      else if (!scripted) this.switchToArmedWeapon()
+    }
 
     // --- sprint-out -------------------------------------------------------
     // §3.2 `[stated]`: sprint-out is 160-230 ms and is "the number that
@@ -476,6 +496,46 @@ export class WeaponSystem implements System, WeaponService {
     state.mag += take
     state.reserve -= take
     this.ammoDirty = true
+  }
+
+  /**
+   * An enemy down returns rounds to the equipped weapon, capped at the loadout
+   * it spawned with. The equipped weapon and no other: the credit should read
+   * as "that kill paid for itself", which it only does on the gun in your
+   * hands, and a backup that quietly refills is not a backup.
+   */
+  private onKill(): void {
+    const def = this.def
+    const state = this.state
+    if (state.reserve >= def.reserve) return
+    state.reserve = Math.min(def.reserve, state.reserve + def.resupplyPerKill)
+    this.ammoDirty = true
+    this.ctx.events.emit('weapon:ammo', { mag: state.mag, reserve: state.reserve })
+  }
+
+  /**
+   * Last resort when the equipped weapon has nothing left anywhere: draw
+   * whichever of the others is best stocked. A backstop rather than a mechanic
+   * — with resupply running, reaching it at all means shooting well below the
+   * target accuracy band for a sustained stretch. Doing nothing is correct when
+   * every weapon is empty; that is genuinely out of ammunition, and the dry
+   * click is the right answer.
+   */
+  private switchToArmedWeapon(): void {
+    if (this.switchTimer >= 0 || this.pendingSwitch >= 0) return
+    let best = -1
+    let bestRounds = 0
+    for (let i = 0; i < WEAPONS.length; i++) {
+      if (i === this.index) continue
+      const s = this.ammo.get(WEAPONS[i].id)
+      if (!s) continue
+      const rounds = s.mag + s.reserve
+      if (rounds > bestRounds) {
+        bestRounds = rounds
+        best = i
+      }
+    }
+    if (best >= 0) this.requestSwitch(best)
   }
 
   private cancelReload(ctx: GameContext): void {

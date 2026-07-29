@@ -181,7 +181,7 @@ export class Menus {
     this.item(pane, 'SETTINGS', i++, false, () => this.show('settings'))
 
     const hint = stagger(el('div', 'hint', pane), i++)
-    for (const h of ['WASD MOVE', 'SHIFT SPRINT', 'CTRL CROUCH', 'R RELOAD', 'RMB ADS', 'ESC PAUSE']) {
+    for (const h of ['WASD MOVE', 'SHIFT SPRINT', 'CTRL CROUCH', 'C TOGGLE CROUCH', 'R RELOAD', 'RMB ADS', 'ESC PAUSE']) {
       el('span', '', hint).textContent = h
     }
 

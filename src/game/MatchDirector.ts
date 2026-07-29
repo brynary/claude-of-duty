@@ -58,6 +58,21 @@ interface Reinforcer {
  * that deadlocks when the AI loses the player is this file's bug and that part
  * is fixed.
  *
+ * ## Duration is `size`; pressure is `concurrent`
+ *
+ * The second thing the participation rule exposed, once the runs were valid.
+ * With the deadlock gone the waves still came out thin, and for a different
+ * reason: the budget was `max(opening, size - standing)`, so the same stragglers
+ * that used to hold a wave open were now *shrinking* the next one. Wave one
+ * spent its whole budget on its opening beat and then had nothing to send for
+ * half a minute while the player worked the field down to nothing. Both measured
+ * runs contain a ten-second stretch with no hostile alive anywhere.
+ *
+ * So the two columns are separated. `size` is taken flat and decides how long a
+ * wave runs; `concurrent` is checked on every beat and decides how many are in
+ * the fight while it does. Nothing here derives one from the other, and nothing
+ * derives either from how badly the AI is pathing.
+ *
  * ## Everything is correct mid-wave
  *
  * A scripted run is a fixed number of simulated seconds and is cut off wherever
@@ -125,6 +140,20 @@ export class MatchDirector implements System, MatchService {
   private waveBudget = 0
   /** Of that budget, how many are still to be sent. */
   private remainingToSpawn = 0
+  /**
+   * Set by `beginWave`, cleared by the first beat that runs, and the reason the
+   * announced wave size is trustworthy.
+   *
+   * `beginWave` is reached from the `game:started` event, which the HUD emits
+   * from its own update; the AI seeds the level from *its* update. So on the
+   * frame the match opens, the field the director can see may or may not contain
+   * the AI's five soldiers, depending on which ran first — and it read empty in
+   * both measured runs. While the budget was derived from that field this race
+   * silently set wave one's size; now it only reaches the number on the HUD, and
+   * the first beat corrects it. `update` returns early on `dt <= 0`, so a beat
+   * only runs on a frame where the AI has already spawned.
+   */
+  private budgetPending = false
   /** Match time of the next reinforcement beat. */
   private nextBeatAt = 0
   /** Beats delivered this wave; the first one is the opening squad. */
@@ -391,6 +420,11 @@ export class MatchDirector implements System, MatchService {
     // fell through to a twenty-plus second backstop timer. A wave should have a
     // middle, and the middle is made of arrivals.
     if (this.t >= this.nextBeatAt) {
+      if (this.budgetPending) {
+        this.budgetPending = false
+        // `dt > 0` here, so the AI has taken a frame and the field is real.
+        s.waveSize = active + this.remainingToSpawn
+      }
       let blocked = false
       if (this.remainingToSpawn > 0) {
         const want = Math.min(this.beatSize(def), def.concurrent - active, this.remainingToSpawn)
@@ -443,25 +477,26 @@ export class MatchDirector implements System, MatchService {
     this.waveIndex = index
     this.pruneParticipation()
 
-    // Hostiles already fighting count against the wave rather than being added
-    // to it: the AI seeds the level with five soldiers during its own init, and
-    // wave one is those five, not those five plus six more.
+    // The budget is `def.size`, flat. It used to be
+    // `max(opening, size - standing)`, and subtracting the standing field is
+    // what hollowed the waves out: a wave shrank in exact proportion to how many
+    // hostiles were still on the plaza, which in this build means it shrank as a
+    // reward for the AI having lost the player. Wave one's budget came out at
+    // three or six depending on a frame race, and either way it was spent at the
+    // opening beat, after which the wave had nothing left to send and decayed
+    // from eight hostiles to none.
     //
-    // Never below `opening`, though. A wave that delivers nobody is not a wave,
-    // it is the previous one continuing under a new banner — which is exactly
-    // what wave one was, since the seeded field covered its whole budget and it
-    // spawned nothing at all.
-    //
-    // `standing` counts participants, so a straggler who lost the player does
-    // not shrink the next wave on its way past.
-    const standing = this.countParticipating()
-    this.waveBudget = Math.max(def.opening, def.size - standing)
-    this.remainingToSpawn = this.waveBudget
+    // Presence is `concurrent`'s job and it does it on every beat, so the two
+    // are no longer fighting over the same lever. See `WaveDef.size`.
+    this.budgetPending = true
+    this.waveBudget = def.size
+    this.remainingToSpawn = def.size
 
     s.phase = 'wave'
     s.wave = index + 1
     s.waveLabel = def.label
-    s.waveSize = standing + this.remainingToSpawn
+    // Provisional, and corrected on the first beat once the field is readable.
+    s.waveSize = def.size
     s.hostilesLeft = s.waveSize
     s.waveKills = 0
     s.flawlessWave = true

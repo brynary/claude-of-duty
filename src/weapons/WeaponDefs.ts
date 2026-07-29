@@ -50,7 +50,31 @@ export interface WeaponDef {
   /** Delay between bursts, seconds. */
   burstDelay: number
   magSize: number
+  /** Rounds carried outside the magazine at spawn, and the ceiling resupply refills to. */
   reserve: number
+  /**
+   * Rounds returned to the reserve for each enemy the player kills.
+   *
+   * A fixed loadout cannot survive a mode whose fights never stop. Measured on
+   * the shipped `push` run: the player fired 240 rounds, which is `magSize +
+   * reserve` exactly, ran the loadout to zero at t=82 s of a 90 s run, and
+   * spent the remaining 8.5 s dry-clicking — all 12 of that run's dry fires.
+   * The sister `hold` run fired 230, stopped ten rounds short of the same wall,
+   * and dry-fired zero times. The magazine was never the problem; the supply
+   * was.
+   *
+   * Call of Duty's own answer is resupply, not a bigger pouch: campaign ammo
+   * off bodies, Zombies' box, and multiplayer's Scavenger perk, which
+   * replenishes from fallen players. 30+210 is already eight magazines, at the
+   * generous end of what a CoD AR carries, so the loadout stays a CoD loadout
+   * and the kills feed it.
+   *
+   * Sized so that a kill returns what a kill costs at the *top* of the target
+   * accuracy band (§1, 18-45%): `shotsToKill / 0.45`. Accuracy above that band
+   * is net-positive and below it drains, so shooting well literally buys
+   * ammunition and shooting badly still runs you out.
+   */
+  resupplyPerKill: number
   /** Metres per second used for the tracer's travel time. */
   muzzleVelocity: number
   /** Loudness radius reported to the AI. */
@@ -82,7 +106,24 @@ export interface WeaponDef {
   /** Normalised times within the reload where the magazine leaves and seats. */
   magOutAt: number
   magInAt: number
-  /** Normalised time of the charging-handle pull on an empty reload. */
+  /**
+   * Normalised time of the charging-handle pull on an empty reload, and with it
+   * the moment the first round becomes usable.
+   *
+   * Derived rather than guessed. An empty reload is the tactical reload with
+   * bolt work appended: the magazine seats at the same *absolute* moment in
+   * both animations, and the extra `reloadEmptyTime - reloadTime` is the bolt.
+   * So the credit point is
+   *
+   *   chargeAt = (magInAt * reloadTime + reloadEmptyTime - reloadTime) / reloadEmptyTime
+   *
+   * This makes §3.3's reload-cancel window identical for a tactical and an
+   * empty reload on the same weapon, which is the invariant CoD4's files imply,
+   * instead of four unrelated numbers. The four values here were previously
+   * 0.82 / 0.88 / 0.84 / 0.88 — all late, all invented, and all charging the
+   * player up to half a second of extra lockout on the empty reload that a
+   * fight with no lulls forces every single magazine.
+   */
   chargeAt: number
   drawTime: number
   holsterTime: number
@@ -158,7 +199,17 @@ export const WEAPONS: readonly WeaponDef[] = [
     penetration: 1, maxPenetrations: 2, range: 320,
     rpm: 780, pellets: 1,
     modes: ['auto', 'burst', 'semi'], burstCount: 3, burstDelay: 0.2,
-    magSize: 30, reserve: 210, muzzleVelocity: 880, noiseRadius: 45,
+    // 4 shots to kill, so a kill costs 4 / accuracy rounds: 8.9 at the 45% top
+    // of the target band, 11.0 at the 36% the fixed-aim runs actually measured,
+    // 22.2 at the 18% floor. Resupply of 9 is the first of those, so a 36%
+    // player drains 2 rounds per kill (240-round loadout, ~120 kills) and an
+    // 18% player drains 13 (~18 kills, and the dry-weapon swap catches them).
+    //
+    // 30 rounds at 11.0 per kill is 2.7 kills per magazine. That is already
+    // *above* CoD: a BO6 XM4 is 5 STK, so 12.5-16.7 rounds per kill at the same
+    // accuracies, i.e. 1.8-2.4 kills per magazine. Enlarging the magazine would
+    // move away from the reference, not toward it, so it stays at 30.
+    magSize: 30, reserve: 210, resupplyPerKill: 9, muzzleVelocity: 880, noiseRadius: 45,
     // spreadAds is 0 on every weapon here: §3.6 [stated], "all weapons in Call
     // of Duty ... are perfectly accurate at an infinite range while aiming down
     // the sights", corroborated by `adsSpread 0` in the shipped weapon files.
@@ -216,7 +267,13 @@ export const WEAPONS: readonly WeaponDef[] = [
     // 1.50 s — 60% of the animation — leaving a 1.00 s free cancel window.
     // magInAt is that credit point, and WeaponSystem lets you fire out of the
     // reload once it passes.
-    reloadTime: 2.4, reloadEmptyTime: 3.25, magOutAt: 0.30, magInAt: 0.60, chargeAt: 0.82,
+    //
+    // chargeAt by the rule on the interface: (0.60 x 2.4 + 0.85) / 3.25 = 0.705.
+    // The gun is usable 2.29 s into an empty reload rather than 2.67 s, and both
+    // windows land on 0.96 s against the AK-47's measured 1.00 s. Worth 0.38 s
+    // per empty reload, and with downtime at 3.4 s the player fights every
+    // magazine to empty, so that is ~8 of them a run.
+    reloadTime: 2.4, reloadEmptyTime: 3.25, magOutAt: 0.30, magInAt: 0.60, chargeAt: 0.705,
     drawTime: 0.55, holsterTime: 0.35, sprintOutTime: 0.16, inspectTime: 2.4,
     // Measured against a 60 degree viewmodel camera at 16:9: 28.8% of screen
     // width, top of the optic at 52% height, magazine tip on the bottom edge,
@@ -243,7 +300,8 @@ export const WEAPONS: readonly WeaponDef[] = [
     penetration: 0.55, maxPenetrations: 1, range: 200,
     rpm: 920, pellets: 1,
     modes: ['auto', 'semi'], burstCount: 3, burstDelay: 0.18,
-    magSize: 32, reserve: 224, muzzleVelocity: 400, noiseRadius: 38,
+    // 5 shots to kill: 11.1 rounds per kill at the 45% top of the band.
+    magSize: 32, reserve: 224, resupplyPerKill: 11, muzzleVelocity: 400, noiseRadius: 38,
     spreadHip: 0.0225, spreadAds: 0, spreadPerShot: 0.0020, spreadMax: 0.060,
     spreadDecay: 0.13, spreadMoveMul: 1.35, spreadCrouchMul: 0.80, spreadJumpMul: 2.0,
     // Budget: 5 shots on the presented torso at the 13 m designed SMG distance.
@@ -258,7 +316,10 @@ export const WEAPONS: readonly WeaponDef[] = [
     },
     adsTime: 0.21, eyeRelief: 0.235, adsFovScale: 0.80, adsVmFov: 50,
     // CoD4 MP5 [measured]: 2.33 s tactical, 3.30 s empty, ammo at 1.77 s (76%).
-    reloadTime: 2.35, reloadEmptyTime: 3.30, magOutAt: 0.28, magInAt: 0.76, chargeAt: 0.88,
+    // chargeAt = (0.76 x 2.35 + 0.95) / 3.30 = 0.829. Both windows 0.56 s — the
+    // MP5's measured credit point genuinely is late, so the empty reload's is
+    // too, and the derivation preserves that rather than flattening it.
+    reloadTime: 2.35, reloadEmptyTime: 3.30, magOutAt: 0.28, magInAt: 0.76, chargeAt: 0.829,
     drawTime: 0.50, holsterTime: 0.28, sprintOutTime: 0.15, inspectTime: 2.2,
     hip: { pos: [0.124, -0.106, -0.470], rot: [0.016, 0.052, 0.104] },
     sprint: { pos: [0.106, -0.160, -0.440], rot: [-0.44, 0.66, 0.38] },
@@ -284,7 +345,10 @@ export const WEAPONS: readonly WeaponDef[] = [
     // CoD4 M40A3 [measured]: 0.05 s fire + 0.866 s rechamber ~= 65 RPM.
     rpm: 62, pellets: 1,
     modes: ['semi'], burstCount: 1, burstDelay: 0,
-    magSize: 7, reserve: 42, muzzleVelocity: 915, noiseRadius: 90,
+    // One shot to kill, so 2.2 rounds per kill even at the 45% top of the band.
+    // 2 keeps a sniper who is hitting roughly self-sufficient, which is the
+    // right bargain for a weapon that punishes a miss with a full rechamber.
+    magSize: 7, reserve: 42, resupplyPerKill: 2, muzzleVelocity: 915, noiseRadius: 90,
     spreadHip: 0.085, spreadAds: 0, spreadPerShot: 0.010, spreadMax: 0.12,
     spreadDecay: 0.20, spreadMoveMul: 2.2, spreadCrouchMul: 0.60, spreadJumpMul: 3.0,
     // One round per second, so the centre speed has 0.97 s to recentre: the
@@ -295,7 +359,8 @@ export const WEAPONS: readonly WeaponDef[] = [
       kickBack: 0.040, kickUp: 0.150, kickRoll: 0.045, visualSnap: 15,
     },
     adsTime: 0.50, eyeRelief: 0.300, adsFovScale: 0.30, adsVmFov: 40,
-    reloadTime: 2.7, reloadEmptyTime: 3.2, magOutAt: 0.28, magInAt: 0.62, chargeAt: 0.84,
+    // chargeAt = (0.62 x 2.7 + 0.5) / 3.2 = 0.679. Both windows 1.03 s.
+    reloadTime: 2.7, reloadEmptyTime: 3.2, magOutAt: 0.28, magInAt: 0.62, chargeAt: 0.679,
     drawTime: 0.85, holsterTime: 0.50, sprintOutTime: 0.30, inspectTime: 2.8,
     hip: { pos: [0.136, -0.120, -0.505], rot: [0.012, 0.044, 0.102] },
     sprint: { pos: [0.116, -0.176, -0.470], rot: [-0.38, 0.58, 0.34] },
@@ -321,7 +386,8 @@ export const WEAPONS: readonly WeaponDef[] = [
     penetration: 0.5, maxPenetrations: 1, range: 140,
     rpm: 480, pellets: 1,
     modes: ['semi', 'burst'], burstCount: 3, burstDelay: 0.22,
-    magSize: 17, reserve: 68, muzzleVelocity: 360, noiseRadius: 32,
+    // 3 shots to kill: 6.7 rounds per kill at the 45% top of the band.
+    magSize: 17, reserve: 68, resupplyPerKill: 7, muzzleVelocity: 360, noiseRadius: 32,
     spreadHip: 0.0230, spreadAds: 0, spreadPerShot: 0.0045, spreadMax: 0.070,
     spreadDecay: 0.16, spreadMoveMul: 1.4, spreadCrouchMul: 0.78, spreadJumpMul: 2.2,
     recoil: {
@@ -331,7 +397,11 @@ export const WEAPONS: readonly WeaponDef[] = [
     },
     adsTime: 0.13, eyeRelief: 0.320, adsFovScale: 0.82, adsVmFov: 50,
     // CoD4 M9 [measured]: 1.63 s tactical, 1.92 s empty, ammo at 1.20 s (74%).
-    reloadTime: 1.63, reloadEmptyTime: 1.92, magOutAt: 0.26, magInAt: 0.74, chargeAt: 0.88,
+    // The M9 is the cleanest check on the chargeAt rule: its empty reload is
+    // only 0.29 s longer than its tactical one, so the slide drop must follow
+    // the magazine almost immediately, and the rule says 0.779 — a 75 ms gap.
+    // Both windows 0.42 s.
+    reloadTime: 1.63, reloadEmptyTime: 1.92, magOutAt: 0.26, magInAt: 0.74, chargeAt: 0.779,
     drawTime: 0.45, holsterTime: 0.28, sprintOutTime: 0.10, inspectTime: 2.0,
     hip: { pos: [0.104, -0.116, -0.330], rot: [0.028, 0.052, 0.088] },
     sprint: { pos: [0.088, -0.166, -0.305], rot: [-0.46, 0.56, 0.32] },

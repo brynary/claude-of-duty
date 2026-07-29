@@ -102,10 +102,10 @@ export class PlayerSystem implements System, PlayerService {
    * Read by: `HudSystem`, for the `?stats=1` readout.
    *
    * True while `C` has latched the crouch on. The latch has no tell of its own
-   * — the low camera looks the same however the crouch was asked for — and its
-   * only automatic release is sprinting forward, which the crouch itself
-   * blocks unless `ShiftLeft` is registered. Naming it is the only way to tell
-   * a latched crouch from a held one from inside the game.
+   * — the low camera looks the same however the crouch was asked for — and it
+   * releases on the next `C` press, a fresh Ctrl press, a jump, or sprinting
+   * forward. Naming it is the only way to tell a latched crouch from a held
+   * one from inside the game.
    */
   get crouchLatched(): boolean { return this.crouchToggle }
   /** Read by: `HudSystem`, for the `?stats=1` readout. True while something
@@ -273,16 +273,28 @@ export class PlayerSystem implements System, PlayerService {
     if (m.forward < 0.5 || ads > 0.3 || m.busy || dead) this.tacLatch = false
 
     if (inp.wasPressed('KeyC')) this.crouchToggle = !this.crouchToggle
+    // A fresh Ctrl press hands the latched crouch to the held key, so releasing
+    // Ctrl stands the player up — without this, the latch made the advertised
+    // crouch key look dead: tap it while latched and nothing changed.
+    else if (inp.wasPressed('ControlLeft')) this.crouchToggle = false
     const crouchEdge = inp.wasPressed('ControlLeft') || inp.wasPressed('KeyC')
 
     m.sprintHeld = !dead && (inp.isDown('ShiftLeft') || this.tacLatch)
     m.tacSprint = this.tacLatch
-    if (m.sprintHeld && m.forward > 0.5) this.crouchToggle = false
+    m.jumpPressed = !dead && inp.wasPressed('Space')
+    // Sprinting forward or jumping releases the latch. Not on the frame a
+    // crouch key went down — clearing it then ate the press outright, so C
+    // could neither crouch nor start a slide while sprinting — and not during
+    // a slide, or a C-slide under held sprint would self-cancel at the minimum
+    // slide time instead of riding out.
+    const sprintingForward = m.sprintHeld && m.forward > 0.5
+    if ((sprintingForward && !crouchEdge && !this.loco.isSliding) || m.jumpPressed) {
+      this.crouchToggle = false
+    }
 
     m.crouchHeld = !dead && (inp.isDown('ControlLeft') || this.crouchToggle)
     m.crouchPressed = !dead && crouchEdge && m.crouchHeld
     m.walkHeld = inp.isDown('AltLeft')
-    m.jumpPressed = !dead && inp.wasPressed('Space')
   }
 
   // --- reactions -----------------------------------------------------------

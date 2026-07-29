@@ -58,6 +58,49 @@ import { groundHeight } from './Terrain'
  *
  * Nothing here decides *how* enemies fight — that is `src/ai`. This only
  * decides where they exist and when they arrive.
+ *
+ * ## This round: the staging is correct and almost none of it is reaching play
+ *
+ * Read the two shipped 90 s runs rather than the constants and three things
+ * come out that no amount of tuning in this file would have found.
+ *
+ * **1. Spawn to first contact is under a second.** Line the engagement starts
+ * in `runs/feel5` up against the seconds in which the live count rises: a
+ * hostile appears at t = 12 and is in contact at 12.98; four appear at t = 79
+ * and three are in contact by 79.32. Every arrival in both runs contacts the
+ * player inside about a second of being placed. The commute this file stages
+ * for — measured at 3.9 s mean, 7.2 s p90 over the 12-30 m window — is not
+ * being spent, because the hostile is not starting behind anything. Opening
+ * distances confirm it: 22.4 m mean in the `push` run, clustered on 16, 17,
+ * 19, 21.5, 24, 26, 28 and 30 m, which is `AiSystem`'s own composed arc, every
+ * point of which is required to have *a clear line to the player's chest*.
+ * The published posts are losing to it. See the note on {@link MAX_STAGE}: the
+ * promotion it relies on writes hidden posts to the front of the candidate
+ * array, but `AiSystem.pickSpawn` starts its scan at `(i + wave * 3) % n` and
+ * `wave` increments once per reinforcement beat, so the start offset walks the
+ * whole array and the promoted block is picked roughly `promoted / n` of the
+ * time. That is an `src/ai` fault and it is the single largest thing standing
+ * between this file and the game.
+ *
+ * **2. There is already enough quiet; it is in the wrong shape.** The graded
+ * downtime figure is a mean over the positive gaps between consecutive
+ * engagements, and the runs give 43.3 s of quiet in 17 pieces (`push`) and
+ * 55.6 s in 13 (`hold`) — 48% and 62% of a 90 s run. Three or four of those
+ * pieces are real lulls of 6-25 s; the other fourteen and nine are slivers
+ * averaging 1.1 s and 1.2 s, each one the pause between killing one hostile
+ * and the next one acquiring. The same quiet delivered as three or four lulls
+ * would read as 10.8-18.5 s and sit inside the 12-28 s band. **Downtime is
+ * short because arrivals are staggered, not because the level is busy.** The
+ * lever is contacts that overlap: hostiles that arrive and acquire together
+ * produce negative gaps, which the metric drops. That is mostly the
+ * reinforcement cadence in `game/MatchDefs.ts`, which sends two hostiles every
+ * 0.9-3.2 s against a 0.97 s kill.
+ *
+ * **3. This director was still spawning, and its own wave cycle was dead.**
+ * Both faults were in this file, both are fixed, and each has its constant:
+ * {@link EncounterDirector.lastSpawnAt} for the backstop wave that fired on
+ * frame one under the gate, and {@link WAVE_BOUNDARY} for the wave counter
+ * that never advanced because the gate returned before reaching it.
  */
 
 // ---------------------------------------------------------------------------
@@ -188,6 +231,31 @@ export const POSTS: readonly Post[] = [
   { x: 12.0, z: 40.0, lane: 'highway', sight: 26 },
 
   // --- Overwatch on the market hall deck ----------------------------------
+  //
+  // **Not used in live play.** These two are kept for capture poses only; see
+  // the elevated-post filter in {@link EncounterDirector.init}.
+  //
+  // The deck is a navigation island, and the arithmetic says so exactly. The
+  // only way up is the exterior stair on the hall's west face, built in
+  // `buildMarketHall` as 16 steps of 0.175 m rise over 0.26 m run — a slope of
+  // 0.673, collided as one smooth ramp. `NavGrid` samples the level on a
+  // 0.75 m lattice (`max(0.7, 96 / 128)` over this level's 94 x 96 m bounds)
+  // and refuses any move between adjacent cells whose ground differs by more
+  // than its `STEP_HEIGHT` of 0.45 m. One cell along that ramp climbs
+  // 0.75 x 0.673 = **0.505 m**, which is over the limit by 12%, so A* cannot
+  // take a single step up the stair and the 2.86 m deck is reachable from
+  // nowhere. `AiSystem` re-grounds a published post with a downward ray but
+  // never asks whether it is connected to anything, so a soldier put here
+  // stands on the roof until the AI's stranded-soldier recycle collects him —
+  // and for those seconds he is a body the match counts as present and the
+  // player can neither reach nor be reached by.
+  //
+  // Two ways to get the overwatch position back, neither of them this file's:
+  // widen the stair's run from 0.26 m to about 0.34 m (slope 0.515, 0.386 m
+  // per lattice cell, 14% under the limit) and move the parapet gap and
+  // landing in `Buildings.ts` to match the longer flight; or have `AiSystem`
+  // reject a published post its own nav cannot path from. Until one of those
+  // lands, staging a wave here stages it nowhere.
   { x: 19.0, z: 18.5, lane: 'roof', sight: 30, y: footprintBase(19.75, 16.25, 8.5, 11.5) + 2.86, enclosed: true },
   { x: 20.6, z: 13.5, lane: 'roof', sight: 28, y: footprintBase(19.75, 16.25, 8.5, 11.5) + 2.86, enclosed: true },
 ]
@@ -244,6 +312,20 @@ const REAR_COS = -0.174
  * in the player's view — however carefully this file staged it.
  *
  * 30 m is that band's upper edge, so every post published now outranks the arc.
+ *
+ * **"Outranks" was too strong, and the runs say so.** `buildSpawnCandidates`
+ * does move the promoted posts to the front of its array, but `pickSpawn` then
+ * scans from `(i + wave * 3) % n` rather than from zero, and `wave` there is
+ * incremented once per call to `spawnWave` — which under `MatchDirector` is
+ * once per reinforcement beat, not once per wave. The start offset therefore
+ * walks the whole array, and the promoted block wins only when the offset
+ * happens to land inside it: roughly `promoted / n`, which with about six
+ * published posts against nine arc points is nearer two spawns in five than
+ * all of them. The other three land on the arc, every point of which is
+ * *chosen* to have a clear line to the player's chest. Measured consequence:
+ * spawn to first contact under a second, and a 22.4 m mean opening distance
+ * that sits on the arc's own range table. Staging cannot fix this from here;
+ * `pickSpawn` has to stop rotating past the promoted block.
  */
 const MAX_STAGE = 30
 
@@ -318,6 +400,12 @@ const WANT_DIST = 22
  * paired with {@link EncounterDirector.recentLanes} it is what stops three
  * waves in a row walking out of the alley. It is no longer described as
  * controlling the distance fights happen at, because it does not.
+ *
+ * Until this round it did not rotate at all in a played game: the index it is
+ * read with was only advanced past the `directsSpawning` gate. Driven over a
+ * three-minute match-directed run the shipped file staged every one of nine
+ * waves against `SIGHT_CYCLE[0]`; it now steps once per wave. See
+ * {@link WAVE_BOUNDARY}.
  */
 const SIGHT_CYCLE = [26, 13, 30, 18, 22, 10, 34, 20]
 
@@ -366,6 +454,14 @@ const LIVE_CAP = 8
  * wave on top of it. The comment here used to give that as 6 s; the constants
  * in `src/ai` are `LULL_MIN` 11 / `LULL_MAX` 15, so the real headroom is two
  * seconds, not one and a half.
+ *
+ * Note what this constant is *not* able to do, which the paragraph above reads
+ * as though it could. It runs only when nothing else is directing — a menu,
+ * an abandoned match, a finished one. Every measured run is match-directed
+ * from the first frame, so no downtime figure yet published has ever been a
+ * function of this number. Downtime now measures 3.41 s; the 43.3 s of quiet
+ * behind that mean arrives in 17 pieces, and the fix is fewer arrival clusters
+ * rather than a longer timer here. See the header.
  */
 const QUIET_BEFORE_WAVE = 9
 
@@ -438,6 +534,32 @@ const BACKSTOP_SIGHT = 13
 const MIN_WAVE_GAP = 7
 
 /**
+ * Seconds of no arrivals after which the next arrival counts as a new wave.
+ *
+ * This exists because the director's own wave counter was dead in every game
+ * anyone has ever played. {@link SIGHT_CYCLE} is indexed by `waveIndex`, and
+ * `waveIndex` was advanced on the line after `spawnWave` — which is on the far
+ * side of the `directsSpawning` gate. `MatchDirector` holds that flag from the
+ * first frame to the last, so this director never reached the increment: it
+ * staged every wave of every run for `SIGHT_CYCLE[0]`, and {@link recentLanes}
+ * stayed `[null, null]` forever, so the penalty that stops three waves walking
+ * out of the same alley never applied once. Both were switched off by the
+ * change that stopped this file double-spawning, silently, and both are the
+ * whole reason the file exists.
+ *
+ * The fix is to key the cycle on what actually happens rather than on who
+ * caused it: a hostile arriving after a gap this long is a new approach
+ * whoever sent it. The threshold has to sit above the match's reinforcement
+ * beat and below its break. `MatchDefs` runs beats at 3.2 s down to 0.9 s and
+ * schedules `WAVE_SETTLE` 1.5 s + `breakSeconds` 9 s = 10.5 s between waves, so
+ * six is clear of both ends. A wave whose beats are blocked at the concurrency
+ * ceiling for six seconds also rolls the cycle, which is right: six seconds
+ * without an arrival is an approach the player can feel, whatever the director
+ * upstream believes it is in the middle of.
+ */
+const WAVE_BOUNDARY = 6
+
+/**
  * Live enemies at or below which the current wave counts as spent.
  *
  * This was 1, and 1 is the number behind the playtest note that "enemiesAlive
@@ -482,6 +604,11 @@ const MAX_STAGED = PRIMARY_MAX + SECONDARY_MAX
  * whole value is the angle down into the junction. One soldier there is a
  * threat the player has to solve; a squad there is a squad that is not coming.
  * See {@link leads} for why it may not lead a wave at all.
+ *
+ * Dormant in live play, where the deck is dropped outright for being
+ * unreachable — see the note on the roof entries in {@link POSTS}. It is kept
+ * because the cap is the right rule for any overwatch lane, and because the
+ * deck is two lines away from coming back if the stair is ever regraded.
  */
 const OVERWATCH_MAX = 1
 
@@ -566,6 +693,14 @@ const POST_CLEARANCE = 0.9
  * market hall would be under-reported the other way, because everything else
  * would still outrank it. Both are wrong only for a deck; a third class, or
  * real heights, is the fix if a second roof ever goes in.
+ *
+ * With the deck dropped from live staging there are no elevated posts left in
+ * a played game, so {@link EncounterDirector.deckSupports} finds none, every
+ * solid cell is baked {@link FULL_HEIGHT}, and the lattice collapses to the
+ * binary one a ground-to-ground line needs. That is a graceful degradation
+ * rather than dead weight: nothing above changes, the second class simply has
+ * nothing to distinguish, and it starts working again the moment a reachable
+ * deck post is added back.
  */
 /** A structure that hides a post on the ground, but not one standing on it. */
 const DECK_SUPPORT = 1
@@ -622,7 +757,38 @@ export class EncounterDirector {
   private contacts = new Set<number>()
   private quiet = 0
   private waveIndex = 0
-  private lastSpawnAt = -99
+  /**
+   * When a hostile last arrived, from anybody's spawner.
+   *
+   * **Starts at zero, not at minus infinity, and that one character was three
+   * extra hostiles in the opening of every run.** Every clock in this class is
+   * `ctx.elapsed - lastSpawnAt`, so a sentinel in the deep past reads as
+   * "nothing has spawned for a hundred seconds" on the very first frame:
+   * {@link MAX_SILENCE} and {@link MIN_WAVE_GAP} were both satisfied at
+   * `elapsed = 0.03`, `live` was zero so the wave counted as spent, and this
+   * director committed a backstop wave before the game had drawn a frame.
+   *
+   * The gate below could not stop it either, because on frame one it is not
+   * yet true: `MatchDirector` only leaves `idle` when `HudSystem` emits
+   * `game:started`, which happens in *its* update — three systems later in the
+   * same frame. So the one frame in the whole run where the match does not own
+   * spawning is the frame this director was guaranteed to fire on.
+   *
+   * Measured, both 90 s runs open with **eight** live hostiles: five from
+   * `AiSystem.openingWave` and three from here, against wave one's designed
+   * opening of three. That number is not just noisy, it is self-sustaining —
+   * `MatchDirector` sizes each reinforcement beat as
+   * `min(beat, concurrent - active, remaining)` and wave one's `concurrent` is
+   * four, so with eight already standing the term is negative and **the match
+   * cannot deliver its own wave at all** until the field thins below four. The
+   * measured runs sit at five to six live for the first forty seconds doing
+   * exactly that.
+   *
+   * Zero is the honest value: `AiSystem` spawns its opening wave on the first
+   * frame with `dt > 0`, so at `elapsed = 0` a wave has, for this director's
+   * purposes, just landed.
+   */
+  private lastSpawnAt = 0
   private lastStageAt = -99
   /**
    * Lanes the last two *committed* waves came from, most recent first. Both are
@@ -649,6 +815,10 @@ export class EncounterDirector {
    * between two lanes, and it defeats the point of {@link SIGHT_CYCLE}, since a
    * lane chosen to open at 13 m is no use if the wave actually comes from the
    * one staged for 30 m.
+   *
+   * "When a wave is actually committed" now means *when hostiles actually
+   * arrive*, not when this director commits one itself — see
+   * {@link WAVE_BOUNDARY}.
    */
   private stagedLane: Lane | null = null
 
@@ -680,6 +850,12 @@ export class EncounterDirector {
         buried.push(p)
         continue
       }
+      // An elevated post is dropped from live staging outright. See the note on
+      // the roof entries in {@link POSTS}: the market hall deck is a nav island
+      // and a soldier put on it cannot walk to the player. Captures keep it —
+      // a scripted pose holds its soldiers in place and never asks them to
+      // path — which is why the test is here rather than in the table.
+      if (this.enabled && p.y !== undefined) continue
       this.posts.push(p)
       this.world.push(new THREE.Vector3(p.x, p.y ?? groundHeight(p.x, p.z) + 0.05, p.z))
     }
@@ -713,7 +889,16 @@ export class EncounterDirector {
     this.offs.push(e.on('ai:contact', (p) => { this.contacts.add(p.id) }))
     this.offs.push(e.on('ai:lostContact', (p) => { this.contacts.delete(p.id) }))
     this.offs.push(e.on('entity:killed', (p) => { this.contacts.delete(p.entity.id) }))
-    this.offs.push(e.on('entity:spawned', () => { this.lastSpawnAt = ctx.elapsed }))
+    // Arrivals drive the cycle, whoever sent them. See {@link WAVE_BOUNDARY}.
+    this.offs.push(e.on('entity:spawned', (p) => {
+      if (p.entity.team !== 'enemy') return
+      if (ctx.elapsed - this.lastSpawnAt >= WAVE_BOUNDARY) {
+        this.waveIndex++
+        this.recentLanes[1] = this.recentLanes[0]
+        this.recentLanes[0] = this.stagedLane
+      }
+      this.lastSpawnAt = ctx.elapsed
+    }))
     this.offs.push(e.on('player:respawn', () => { this.contacts.clear(); this.quiet = 0 }))
 
     // The opening wave is spawned from `AiSystem.init`, which runs after this,
@@ -789,13 +974,20 @@ export class EncounterDirector {
     // director still paces the level on its own when nothing is directing.
     if (getMatchService(ctx)?.directsSpawning) return
 
+    // The wave counter and the lane history are *not* advanced here. They are
+    // advanced by the `entity:spawned` handler, which sees this spawn as well
+    // as the match's and the AI's, and which is therefore the only place that
+    // stays correct on both sides of the gate above. See {@link WAVE_BOUNDARY}.
     const size = WAVE_SIZES[this.waveIndex % WAVE_SIZES.length]
-    this.waveIndex++
-    this.lastSpawnAt = ctx.elapsed
     this.quiet = 0
     ai.spawnWave(Math.min(size, LIVE_CAP - live))
-    this.recentLanes[1] = this.recentLanes[0]
-    this.recentLanes[0] = this.stagedLane
+    // After the spawn, not before, and the order is load-bearing twice over.
+    // The handler needs to still see the *previous* arrival when it decides
+    // whether this one opens a new wave; and a `spawnWave` that places nobody —
+    // every point blocked, or `AiSystem`'s own live cap reached — emits nothing
+    // at all, so without this line the request would repeat every frame instead
+    // of once per {@link MIN_WAVE_GAP}.
+    this.lastSpawnAt = ctx.elapsed
   }
 
   dispose(): void {

@@ -3,6 +3,35 @@
  * not. Every number here is stated with the target it is aiming at, because
  * "the pressure should rise" is a direction, not a specification.
  *
+ * ## What the two 90 s runs of 2026-07-28 actually showed
+ *
+ * These are the first runs whose gameplay numbers mean anything — every earlier
+ * measurement was taken with a camera that could not turn. Read them before
+ * changing anything here, because two of the three things they show are the
+ * opposite of what the metrics suggest.
+ *
+ * **Waves do not land on top of each other.** `downtimeMean` reads 2.5 s
+ * against a 12-28 s target, which looks like overlap. It is not: that metric is
+ * the gap between *per-enemy engagements*, and a single hostile that loses and
+ * re-acquires the player closes and opens one each time — the sample list
+ * contains gaps of 0.03 s. Look at the field instead and the shape inverts. The
+ * push run has **no hostile alive at all from t=68 to t=78**, the hold run from
+ * t=28 to t=38, and both spend a further 10-20 s at one or two. The problem is
+ * starvation, not overlap, and lengthening the break would make it worse.
+ *
+ * **A 90 s run never reaches the escalation.** Reconstructed from the spawn
+ * order, the push run opens wave two around t=34 and wave three at t≈78, so it
+ * measures the two gentlest rows of a six-row table and eleven seconds of the
+ * third. Every "the game is too easy" number is a statement about waves one and
+ * two.
+ *
+ * **`concurrent` was the binding constraint, and it starved the wave.** Wave one
+ * capped participation at four while the AI's own seeded field put eight bodies
+ * on the plaza, so the director skipped its reinforcement beats for twelve
+ * seconds at a stretch — the +1 arrivals at t=12 and t=22 are beats that finally
+ * found a slot. Reinforcement was not slow because the beat was slow; it was
+ * slow because there was nowhere to put anybody.
+ *
  * ## The shape a wave is supposed to have
  *
  * A wave is **a cadence, not a budget delivered in clumps**. The previous table
@@ -23,10 +52,32 @@
  * what gives a wave a middle: the fight does not pause between arrivals, it
  * accelerates through them.
  *
- * `openInterval` → `peakInterval` runs **3.2 s → 0.9 s** across the six waves.
+ * `openInterval` → `peakInterval` runs **2.2 s → 0.9 s** across the six waves.
  * That sits in the slow half of the `[measured]` 2.0 → 0.1 s band, which is
- * right: our waves are twenty to forty seconds long, not a sixty-round arc, so
- * they occupy the early part of the same curve rather than its end.
+ * right: our waves are twenty-five to forty-five seconds long, not a sixty-round
+ * arc, so they occupy the early part of the same curve rather than its end.
+ *
+ * The beat was never the bottleneck, though, and tightening it is not what the
+ * measured runs called for. Two to three hostiles every two to three seconds is
+ * already six to ten times the rate the player kills them; what stopped the
+ * arrivals was `concurrent`, and before that, the budget.
+ *
+ * ## Duration and density are separate columns, and used not to be
+ *
+ * `size` decides how long a wave lasts. `concurrent` decides how dangerous it is
+ * while it lasts. Those are the only two jobs, and the old budget rule —
+ * `max(opening, size - standing)` — had each column doing part of the other's.
+ * Subtracting the standing field meant a wave delivered fewer hostiles precisely
+ * when hostiles were still on the plaza, which is to say it got *smaller* as a
+ * reward for the AI having lost the player. Wave one's budget came out at three
+ * or six depending on a frame-ordering race with the AI's own seeded spawn, and
+ * once that budget was spent — at the opening beat — the wave had nothing left
+ * to send and simply decayed from eight hostiles to zero over half a minute.
+ * That decay is most of the "empty field" above.
+ *
+ * `MatchDirector` now takes `size` at face value and lets `concurrent` regulate
+ * presence, which is what that column is for. A wave holds its density for its
+ * whole body instead of spiking at the opening and thinning out.
  *
  * ## What bounds the pressure
  *
@@ -92,17 +143,17 @@
  *
  * ## Match length
  *
- * 67 hostiles across six waves, plus whatever the AI seeded the level with
- * before the match started. At the measured 0.87 s kill duration the fighting
- * itself is a small part of that; the clock is dominated by hostiles closing the
- * 8–24 m to contact and by the 45 s of scheduled break. A clean run lands around
- * four to five minutes, which is the length of a Call of Duty multiplayer match
- * (MWIII Team Deathmatch: 100 kills, 10 minute limit `[stated]`, with most games
- * finishing well inside it).
+ * 69 hostiles across six waves, plus the five the AI seeds the level with before
+ * the match starts. The clock is set by how fast the player kills, since a wave
+ * ends when its budget is spent and the field has cleared: at the measured
+ * **0.24-0.32 kills/s** that is 74 bodies in 230-310 s, plus 45 s of scheduled
+ * break, so **four and a half to five and a half minutes**. That is the length
+ * of a Call of Duty multiplayer match (MWIII Team Deathmatch: 100 kills, 10
+ * minute limit `[stated]`, with most games finishing well inside it).
  *
- * A ninety-second scripted run reaches roughly the middle of wave three, so it
- * measures the 6 → 8 → 10 part of the escalation. `?wave=N` opens the match at
- * any wave and is the way to measure the late end on the same length of run.
+ * A ninety-second scripted run reaches wave one and the opening of wave two.
+ * `?wave=N` opens the match at any wave and is the way to measure the late end
+ * on the same length of run — it is now needed from wave three.
  */
 
 export interface WaveDef {
@@ -110,12 +161,37 @@ export interface WaveDef {
   label: string
   /** One line of situation, shown under the banner title. */
   brief: string
-  /** Hostiles this wave delivers of its own, on top of anyone already standing. */
+  /**
+   * Hostiles this wave delivers of its own, on top of anyone already standing.
+   *
+   * Taken at face value. It used to be reduced by whoever was still on the
+   * field when the wave opened — `max(opening, size - standing)` — which put
+   * the two columns in charge of each other's job and made the wave *shrink*
+   * for the one reason it should not: stragglers the AI had lost the player to.
+   * See the delivery note at the top of the file.
+   *
+   * With `size` fixed, this column sets how long a wave lasts and nothing else:
+   * a wave ends when its budget is spent and the field has cleared, so its
+   * duration is `size / kills-per-second` plus the tail. At the measured
+   * 0.24-0.32 kills/s that is 25-45 s a wave and a five-minute match.
+   */
   size: number
   /**
    * Most *participating* hostiles at once — see `MatchDirector`'s staleness
    * rule. Counting bodies here rather than participants is what let two
    * hostiles who had lost the player hold five reinforcements off the field.
+   *
+   * **This is the pressure column.** With `size` deciding duration, this decides
+   * density, and density is what the player feels: `ai_maxAttackerCount "2"`
+   * means at most two hostiles shoot at once, so the question is only whether
+   * two of them are in contact at any moment. Measured, roughly a third of live
+   * hostiles hold contact at a time, so a field of six keeps both attacker slots
+   * filled and a field of four does not.
+   *
+   * Bounded above by `AiSystem`'s `MAX_LIVE` of 10, which counts *bodies* while
+   * this counts participants, so the gap between them is the stale stragglers.
+   * Eight leaves two slots of headroom; nine did not, and a wave that cannot
+   * place a hostile four beats running has its budget truncated.
    */
   concurrent: number
   /** Arrive together the instant the wave opens. The punch. */
@@ -135,56 +211,80 @@ export interface WaveDef {
 }
 
 /**
- * Escalation, read down the columns: 6 → 17 hostiles, 4 → 9 present at once,
- * 3.2 s → 0.9 s between arrivals. Three axes rising together, and the break
- * held constant underneath them.
+ * Escalation, read down the columns: 8 → 15 hostiles, 6 → 8 present at once,
+ * 2.2 s → 0.9 s between arrivals. The break is held constant underneath them.
  *
- * `concurrent` tops out at nine against `AiSystem`'s own cap of ten live
- * soldiers. That is deliberate headroom rather than an accident: if the cap is
- * reached the director's request comes back short, the beat retries, and the
- * wave finishes on whoever arrived. It degrades; it does not deadlock.
+ * **The floor moved much further than the ceiling, and that is the change.**
+ * The previous table opened at four concurrent and reached nine, on the theory
+ * that a rising ceiling is what escalation means. Measured, the ceiling was
+ * never tested: a ninety-second run reaches the middle of wave two, so every
+ * number anyone has ever measured about this game came from the rows that read
+ * four and five. Those rows produced a mean of 2.8-3.0 participating hostiles,
+ * a mean of 1.1 in contact against an attacker clamp of two, and **zero deaths
+ * in ninety seconds.** The top of the table was carrying pressure that never
+ * reached the field.
+ *
+ * So the first row now opens at six — enough to keep both attacker slots filled
+ * — and the last sits at eight, which is the real ceiling `AiSystem`'s
+ * `MAX_LIVE` of 10 allows once stale stragglers are counted. Replaying the
+ * director's own beat, concurrency and clear rules against the measured kill
+ * rate, that lifts mean participants from 2.8-3.0 to **3.8-4.5** and cuts the
+ * empty-field time in a ninety-second window from 21 s to 11-18 s, with the
+ * spawn request never once refused for want of a slot.
+ *
+ * Sizes are close to where they were, because `size` buys duration rather than
+ * pressure and the match is already the length it should be. 69 hostiles plus
+ * the five the AI seeds is a four-and-a-half to five-and-a-half minute match at
+ * 0.24-0.32 kills/s, which is the Call of Duty multiplayer length §1 cites.
+ *
+ * **What a ninety-second run now measures.** Wave one and the opening of wave
+ * two, where it used to reach the middle of wave three. That is a deliberate
+ * trade and it is the right way round: one wave fought at a density of six is a
+ * better sample of this game than two waves fought at four, and the first forty
+ * seconds are no longer a warm-up. `?wave=N` remains the way to measure the top
+ * of the table, and it is now needed from wave three rather than wave four.
  */
 export const WAVES: readonly WaveDef[] = [
   {
     label: 'PROBING CONTACT',
     brief: 'A patrol has walked into the plaza',
-    size: 6, concurrent: 4, opening: 3, reinforce: 2,
-    openInterval: 3.2, peakInterval: 2.0,
+    size: 8, concurrent: 6, opening: 5, reinforce: 3,
+    openInterval: 2.2, peakInterval: 1.5,
     breakSeconds: 9,
   },
   {
     label: 'SECOND ELEMENT',
     brief: 'They know where you are now',
-    size: 8, concurrent: 5, opening: 3, reinforce: 2,
-    openInterval: 3.0, peakInterval: 1.8,
+    size: 10, concurrent: 7, opening: 5, reinforce: 3,
+    openInterval: 2.0, peakInterval: 1.4,
     breakSeconds: 9,
   },
   {
     label: 'FLANKING PUSH',
     brief: 'Two approaches, not one',
-    size: 10, concurrent: 6, opening: 4, reinforce: 2,
-    openInterval: 2.8, peakInterval: 1.6,
+    size: 11, concurrent: 7, opening: 5, reinforce: 3,
+    openInterval: 1.8, peakInterval: 1.2,
     breakSeconds: 9,
   },
   {
     label: 'SUPPRESSION SQUAD',
     brief: 'They are trying to pin you in the open',
-    size: 12, concurrent: 7, opening: 4, reinforce: 3,
-    openInterval: 2.5, peakInterval: 1.4,
+    size: 12, concurrent: 8, opening: 6, reinforce: 3,
+    openInterval: 1.6, peakInterval: 1.1,
     breakSeconds: 9,
   },
   {
     label: 'SUSTAINED ASSAULT',
     brief: 'No gaps left in the line',
-    size: 14, concurrent: 8, opening: 5, reinforce: 3,
-    openInterval: 2.2, peakInterval: 1.1,
+    size: 13, concurrent: 8, opening: 6, reinforce: 4,
+    openInterval: 1.4, peakInterval: 1.0,
     breakSeconds: 9,
   },
   {
     label: 'FINAL PUSH',
     brief: 'Everything they have left, all at once',
-    size: 17, concurrent: 9, opening: 5, reinforce: 3,
-    openInterval: 1.8, peakInterval: 0.9,
+    size: 15, concurrent: 8, opening: 6, reinforce: 4,
+    openInterval: 1.2, peakInterval: 0.9,
     breakSeconds: 0,
   },
 ]
