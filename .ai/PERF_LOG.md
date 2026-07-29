@@ -347,10 +347,43 @@ blocking on a saturated GPU queue. Deep queue (vsync off) = long wait; shallow
 queue (vsync on) = none. Consistent with the swarm's read that a long frame
 delta with an idle CPU is queue drainage, not a hitch a player feels.
 
-Residual: one vsync push trial hit 92ms, 2ms over target, on an idle-CPU
-frame (tick 10.6ms, render 6.1ms, heapΔ 0) — the compositor family, not our
-code. Confirmation battery running (vsync push x3, headful x2) to
-characterise how often that outlier occurs.
+## Confirmation battery — TARGET MET on the real display
+
+Worst frame per run, wave 6, all scenarios in combat with AI and firing:
+
+| condition | runs | worst frames |
+|---|---|---|
+| **headful, real display** | 60s + 90s + 90s | **50ms, 29ms, 38ms** |
+| headless vsync, hold60 expert | 2 | 17ms, 25ms |
+| headless vsync, push120 | 5 | 50, 55, 75, 92, 100ms |
+| headless free-run (stress) | 4 | 117-167ms |
+
+On the actual display — the condition a player is in — nothing exceeded 50ms
+across roughly four minutes of continuous combat, and the two 90-second runs
+recorded zero frames over 50ms. Goal (worst < 90ms) met with margin.
+
+Residual, stated honestly: headless vsync push still produced 92ms and 100ms
+outliers in 2 of 5 trials. The 100ms frame carried 88.6ms of real CPU inside
+fx, so it is not purely a pacing artifact — it is the depth prepass blocking
+on the GPU queue. It has never appeared on the real display. If it is ever
+worth chasing, the lead is FxSystem.renderDepthPrepass's setRenderTarget /
+render pair contending with the previous frame's particle reads of the same
+target; double-buffering that target would decouple them, at the cost of one
+more half-res depth buffer.
+
+## Measurement traps this pass discovered (all cost real time)
+
+1. Capture non-determinism: variable dt, then TAA accumulation continuing
+   while the harness polled. Both fixed; 7/8 poses now bit-exact.
+2. Thermal/contention load between back-to-back GPU batteries made a good
+   build look 2.5x worse. Every battery now gets a cooldown, and a suspicious
+   result is re-run with the order reversed.
+3. Free-running rAF measures WORSE than vsync and invents stalls the player
+   never sees. Headful on the real display is the only fully trustworthy
+   condition; headless vsync is a good proxy; free-run is a stress probe only.
+4. Compile-only warms do not create Metal pipeline states — only an executed
+   draw does. Cost a whole wave to rediscover after I had reverted a working
+   fix for the wrong reason.
 
 ## Remaining stall families after wave 3
 
