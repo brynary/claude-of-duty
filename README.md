@@ -35,6 +35,38 @@ Vaulting is automatic when you move into a ledge below about 1.4m.
 
 Quality tiers: append `?quality=low|medium|high|ultra` (default `ultra`).
 
+## AI-controlled runs
+
+Add `bot` and `autostart=1` to let the scripted AI player control the game.
+Use `perf=1` when you want to watch the run at normal speed:
+
+```text
+https://brynary.github.io/claude-of-duty/?bot=push&skill=average&seed=1337&run=90&quality=high&autostart=1&perf=1
+```
+
+| Parameter | Instructions |
+|---|---|
+| `bot` | Required. Select `push`, `hold`, `patrol`, or `traverse`. The `traverse` scenario moves without firing. |
+| `autostart=1` | Required for an unattended run. It skips the deployment menu. |
+| `skill` | Select `novice`, `average`, or `expert`. The default is `average`. |
+| `seed` | Set an integer seed. Reuse the seed to reproduce the same world and behavior. The default is `1337`. |
+| `run` | Set the simulated duration in seconds. Use a positive number. The default is `60`. |
+| `quality` | Select `low`, `medium`, `high`, or `ultra`. The default is `ultra`. |
+| `perf=1` | Use normal browser frame timing. Add this parameter when you watch the run or measure real-time performance. |
+
+Without `perf=1`, an AI run uses a fixed timestep and advances as fast as the
+browser can process it. In that mode, `run=90` means 90 simulated seconds, not
+90 seconds of elapsed time. This fast mode is for deterministic telemetry runs.
+
+Do not combine `perf=1` with `fixed=1`. In real-time mode, `run` sets the
+telemetry window. The AI continues to play after that window ends.
+
+Other useful parameters are `hud=0` to hide the HUD,
+`difficulty=recruit|regular|hardened|veteran` to set enemy difficulty,
+`wave=1` through `wave=6` to start at a specific wave, and `stats=1` to show the
+performance overlay. AI-controlled runs use unlimited lives, so they ignore
+the `lives` parameter.
+
 ## Architecture
 
 `src/core/Types.ts` is the contract. Every subsystem implements `System` and
