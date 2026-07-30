@@ -248,9 +248,17 @@ export class HudSystem implements System, HudService {
       else this.pause()
       return
     }
-    if (!this.started && (e.code === 'Enter' || e.code === 'Space') && this.menus.current === 'start') {
+    if (this.started || this.menus.current !== 'start') return
+    if (e.code === 'Enter' || e.code === 'Space') {
       e.preventDefault()
       this.beginPlay()
+      return
+    }
+    // The difficulty ladder is a horizontal strip, so it takes the horizontal
+    // keys. Nothing else on the start screen wants them.
+    if (e.code === 'ArrowLeft' || e.code === 'ArrowRight') {
+      e.preventDefault()
+      this.menus.stepDifficulty(e.code === 'ArrowRight' ? 1 : -1)
     }
   }
 

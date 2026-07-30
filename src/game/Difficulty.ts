@@ -1074,6 +1074,59 @@ export class DifficultySystem implements System {
 }
 
 // ---------------------------------------------------------------------------
+// Preset facts, for a menu that has to describe a preset it has not applied
+// ---------------------------------------------------------------------------
+
+/**
+ * One preset's numbers, read straight from the table.
+ *
+ * `effective()` reports what the *running* game is doing, which is the right
+ * answer everywhere except a difficulty menu. That has to describe four presets
+ * at once — including the three it has not selected — and it must not disturb
+ * the shared instance to do it, because `setPreset` clears the rolling window.
+ *
+ * The four figures below are the three variables §7.6 establishes that the
+ * presets move, plus the reaction window. Deliberately nothing derived from the
+ * AI's firing cadence: `damagePerRegenWindow` is the honest lethality figure and
+ * the one a designer should read, but it depends on a duty cycle the notes on
+ * PRESETS show is currently under-delivering, so it is not a number to put in
+ * front of a player choosing a preset.
+ */
+export interface PresetFacts {
+  readonly id: DifficultyPreset
+  readonly label: string
+  readonly blurb: string
+  /** 1-based rung on the ladder, for a threat meter. */
+  readonly tier: number
+  /** How many rungs there are, so a meter does not hard-code four. */
+  readonly rungs: number
+  /** accuracy x damage / health versus Regular. The one number to read. */
+  readonly lethality: number
+  readonly playerMaxHealth: number
+  /** Chance a shot at or inside {@link BASE_NEAR_RANGE} is allowed to land. */
+  readonly hitChanceNear: number
+  readonly reactionMinMs: number
+  readonly reactionMaxMs: number
+}
+
+/** Pure. Allocates one object, so call it on a menu event, not per frame. */
+export function presetFacts(id: DifficultyPreset): PresetFacts {
+  const p = PRESETS[id]
+  return {
+    id,
+    label: p.label,
+    blurb: p.blurb,
+    tier: PRESET_ORDER.indexOf(id) + 1,
+    rungs: PRESET_ORDER.length,
+    lethality: (p.accuracyScale * p.damageScale) / p.healthScale,
+    playerMaxHealth: BASE_PLAYER_HEALTH * p.healthScale,
+    hitChanceNear: clamp(BASE_NEAR_ACCURACY * p.accuracyScale, 0, HIT_CHANCE_CEILING),
+    reactionMinMs: BASE_REACTION_MIN * p.reactionScale * 1000,
+    reactionMaxMs: BASE_REACTION_MAX * p.reactionScale * 1000,
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Access
 // ---------------------------------------------------------------------------
 

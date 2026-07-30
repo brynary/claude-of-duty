@@ -408,6 +408,7 @@ export class PlayerSystem implements System, PlayerService {
 
   private updateHealth(dt: number, ctx: GameContext): void {
     this.damageFlash *= Math.exp(-4.5 * dt)
+    this.syncMaxHealth()
 
     if (this.alive) {
       if (ctx.elapsed - this.lastDamageAt > REGEN_DELAY && this.health < this.maxHealth) {
@@ -424,6 +425,26 @@ export class PlayerSystem implements System, PlayerService {
       const low = frac < 0.4 ? (1 - frac / 0.4) * (0.22 + 0.07 * Math.sin(ctx.elapsed * 4.2)) : 0
       postfx.setDamageFlash(Math.min(1, Math.max(this.damageFlash, low)))
     }
+  }
+
+  /**
+   * Follows the difficulty preset's health pool.
+   *
+   * `init` reads it once, which was enough while the only way to pick a preset
+   * was the query string. The start screen can now change it between boot and
+   * deploy, and a stale `maxHealth` there is not cosmetic: it is the whole of
+   * `healthScale`, one of the three variables the presets move.
+   *
+   * The fraction is preserved rather than the absolute value, so a change can
+   * never read to the player as a hit or a heal. Pure arithmetic on a preset
+   * table, and a no-op on every frame the preset has not moved.
+   */
+  private syncMaxHealth(): void {
+    const max = difficulty.playerMaxHealth()
+    if (max === this.maxHealth || max <= 0) return
+    const frac = this.maxHealth > 0 ? THREE.MathUtils.clamp(this.health / this.maxHealth, 0, 1) : 1
+    this.maxHealth = max
+    this.health = max * frac
   }
 
   private pushHud(ctx: GameContext): void {

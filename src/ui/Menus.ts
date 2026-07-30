@@ -1,6 +1,7 @@
 import { createConfig, type Config, type QualityLevel } from '../core/Config'
 import { Rand } from '../core/Rand'
 import type { GameContext } from '../core/Types'
+import { difficulty, presetFacts, PRESET_ORDER, type DifficultyPreset } from '../game/Difficulty'
 import type { MatchSummary } from '../game/Match'
 import { formatClock, formatScore } from './MatchHud'
 import { TextSlot, el } from './Style'
@@ -43,6 +44,18 @@ const RENDER_KEYS = [
 const RESPAWN_SECONDS = 3.4
 
 /**
+ * The difficulty readout, in reading order.
+ *
+ * The tiles carry the one summary number — lethality against Regular — so the
+ * whole ladder can be compared without hovering it. This is the breakdown of
+ * that number for the one preset under the pointer, and it is deliberately the
+ * three variables FEEL_TARGET §7.6 establishes that the presets move. Every
+ * figure comes out of `presetFacts`; none of it is a bar drawn to look
+ * convincing.
+ */
+const DIFF_STATS = ['YOUR HEALTH', 'ENEMY ACCURACY', 'REACTION TIME'] as const
+
+/**
  * Start, pause, settings and death screens. Each is a full-bleed panel over a
  * blurred, desaturated freeze of the live scene, with staggered entrances and
  * a single accent colour doing all the work.
@@ -62,6 +75,14 @@ export class Menus {
 
   private victory!: ResultScreen
   private defeat!: ResultScreen
+
+  private diffBlock!: HTMLElement
+  private diffTiles = new Map<DifficultyPreset, HTMLElement>()
+  private diffBlurb!: TextSlot
+  private diffStats = new Map<string, TextSlot>()
+  /** Which preset the readout is describing: the hovered tile while one is
+   * hovered, the chosen one otherwise. Held so a repeat does no DOM work. */
+  private diffShown: DifficultyPreset | null = null
 
   private ctx: GameContext
   private handlers: MenuHandlers
@@ -177,6 +198,11 @@ export class Menus {
     sub.textContent = 'OPERATION SILENT CORRIDOR — SECTOR 07'
     stagger(el('div', 'divider', pane), i++)
 
+    // Before DEPLOY, because the choice is part of committing to the mission
+    // rather than a setting buried behind it — which is where it was, reachable
+    // only as `?difficulty=veteran` in the query string.
+    this.buildDifficulty(pane, i++)
+
     this.item(pane, 'DEPLOY', i++, true, () => this.handlers.onDeploy())
     this.item(pane, 'SETTINGS', i++, false, () => this.show('settings'))
 
@@ -192,6 +218,100 @@ export class Menus {
       'OBJECTIVE — CLEAR AND HOLD THE PLAZA',
     ]) el('div', '', corner).textContent = line
     return node
+  }
+
+  /**
+   * The difficulty ladder: four tiles, a threat meter on each, and one readout
+   * under them that describes whichever tile the pointer is over — hover to
+   * compare, click to commit, exactly as the series does it.
+   *
+   * The tiles are the only place in this layer that writes to a game system.
+   * `difficulty` is the shared instance every other system already imports, and
+   * it is the single source of truth for what is selected: this widget holds no
+   * copy of the choice, so it cannot drift from what the AI is applying.
+   */
+  private buildDifficulty(pane: HTMLElement, index: number): void {
+    const block = stagger(el('div', 'diff', pane), index)
+    this.diffBlock = block
+
+    const head = el('div', 'diff-head', block)
+    el('span', 'diff-title', head).textContent = 'DIFFICULTY'
+    el('span', 'diff-keys', head).textContent = '◄ ► TO CHANGE'
+
+    const tiles = el('div', 'diff-tiles', block)
+    for (const id of PRESET_ORDER) {
+      const facts = presetFacts(id)
+      const tile = el('button', `diff-tile ${id}`, tiles)
+      tile.type = 'button'
+      // Painted by the select animation only, so the sweep never costs a
+      // repaint while the menu is just sitting there.
+      el('i', 'sweep', tile)
+      const top = el('span', 'top', tile)
+      el('span', 'n', top).textContent = facts.label
+      el('span', 'x', top).textContent = `${facts.lethality.toFixed(2)}x`
+      const pips = el('span', 'pips', tile)
+      for (let rung = 0; rung < facts.rungs; rung++) {
+        el('i', rung < facts.tier ? 'lit' : '', pips)
+      }
+      tile.addEventListener('click', (e) => { e.preventDefault(); this.chooseDifficulty(id) })
+      tile.addEventListener('mouseenter', () => this.describeDifficulty(id))
+      tile.addEventListener('mouseleave', () => this.describeDifficulty(difficulty.currentPreset()))
+      this.diffTiles.set(id, tile)
+    }
+
+    const read = el('div', 'diff-read', block)
+    this.diffBlurb = new TextSlot(el('div', 'diff-blurb', read))
+    const stats = el('div', 'diff-stats', read)
+    for (const label of DIFF_STATS) {
+      const cell = el('div', '', stats)
+      el('span', '', cell).textContent = label
+      this.diffStats.set(label, new TextSlot(el('b', '', cell)))
+    }
+
+    this.markDifficulty()
+    this.describeDifficulty(difficulty.currentPreset())
+  }
+
+  /**
+   * Moves the selection one rung. Clamped rather than wrapped: a single key
+   * press must never carry the player from the hardest preset to the easiest.
+   */
+  stepDifficulty(delta: number): void {
+    const at = PRESET_ORDER.indexOf(difficulty.currentPreset())
+    const next = PRESET_ORDER[clampIndex(at + delta, PRESET_ORDER.length)]
+    if (next !== difficulty.currentPreset()) this.chooseDifficulty(next)
+  }
+
+  private chooseDifficulty(id: DifficultyPreset): void {
+    difficulty.setPreset(id)
+    this.markDifficulty()
+    this.describeDifficulty(id)
+    const tile = this.diffTiles.get(id)
+    if (tile) restartSweep(tile)
+  }
+
+  private markDifficulty(): void {
+    const chosen = difficulty.currentPreset()
+    for (const [id, tile] of this.diffTiles) {
+      tile.classList.toggle('on', id === chosen)
+      tile.setAttribute('aria-pressed', id === chosen ? 'true' : 'false')
+    }
+  }
+
+  private describeDifficulty(id: DifficultyPreset): void {
+    if (id === this.diffShown) return
+    this.diffShown = id
+    const f = presetFacts(id)
+    this.diffBlurb.set(f.blurb.toUpperCase())
+    this.diffStats.get('YOUR HEALTH')?.set(`${f.playerMaxHealth.toFixed(0)} HP`)
+    // Near accuracy: the chance a shot inside 20 m is allowed to land. Far
+    // accuracy moves with it, so one figure describes the change.
+    this.diffStats.get('ENEMY ACCURACY')?.set(`${Math.round(f.hitChanceNear * 100)}%`)
+    this.diffStats.get('REACTION TIME')?.set(`${f.reactionMinMs.toFixed(0)}-${f.reactionMaxMs.toFixed(0)} MS`)
+    // The top rung turns the whole block red, the same signal the wave banner
+    // uses for the final push. Veteran's blurb is "You will not survive"; it
+    // should not be presented in the same friendly green as Recruit.
+    this.diffBlock.classList.toggle('alert', f.tier >= f.rungs)
   }
 
   private buildPause(): HTMLElement {
@@ -431,6 +551,17 @@ function line(parent: HTMLElement, text: string): void {
  */
 function lineHtml(parent: HTMLElement, html: string): void {
   el('div', '', parent).innerHTML = html
+}
+
+function clampIndex(i: number, length: number): number {
+  return i < 0 ? 0 : i >= length ? length - 1 : i
+}
+
+/** Replays a tile's select sweep, whether or not it has run before. */
+function restartSweep(tile: HTMLElement): void {
+  tile.classList.remove('picked')
+  void tile.offsetWidth
+  tile.classList.add('picked')
 }
 
 function stagger<T extends HTMLElement>(node: T, index: number): T {

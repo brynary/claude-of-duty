@@ -862,6 +862,194 @@ const CSS = `
   color: rgba(var(--fg), .3);
   line-height: 1.7;
 }
+/* ------------------------------------------------------- difficulty ladder */
+/* The only control on the start screen that changes the game rather than the
+   picture, so it carries more weight than a settings row: four tiles, a threat
+   meter on each, and a readout of the three variables the preset actually
+   moves. The ladder is colour-coded green → amber → red, so which end of it a
+   tile sits on is legible before a word has been read.
+
+   The start pane widens for it. Every other screen keeps the narrower column,
+   which is why this overrides .pane rather than changing it. */
+#cod-menu .screen.start .pane { width: calc(690 * var(--px)); }
+#cod-menu .diff { margin: calc(4 * var(--px)) 0 calc(20 * var(--px)); }
+#cod-menu .diff-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  padding: 0 calc(2 * var(--px)) calc(9 * var(--px)) calc(20 * var(--px));
+}
+#cod-menu .diff-title {
+  font-size: calc(12 * var(--px));
+  letter-spacing: calc(4.6 * var(--px));
+  text-transform: uppercase;
+  color: rgba(var(--fg), .62);
+  text-shadow: var(--sh);
+}
+#cod-menu .diff-keys {
+  font-size: calc(10 * var(--px));
+  letter-spacing: calc(2.2 * var(--px));
+  text-transform: uppercase;
+  color: rgba(var(--fg), .3);
+}
+/* Column flow rather than a fixed repeat(4, ...): the tile count comes from
+   PRESET_ORDER, and a fifth preset should not need a stylesheet edit. */
+#cod-menu .diff-tiles {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: calc(4 * var(--px));
+  margin-left: calc(20 * var(--px));
+}
+#cod-menu .diff-tile {
+  position: relative;
+  overflow: hidden;
+  cursor: pointer;
+  display: flex; flex-direction: column; align-items: stretch;
+  gap: calc(13 * var(--px));
+  padding: calc(13 * var(--px)) calc(12 * var(--px)) calc(12 * var(--px));
+  background: linear-gradient(180deg, rgba(var(--fg), .085), rgba(var(--fg), .02));
+  border: calc(1 * var(--px)) solid rgba(var(--fg), .1);
+  border-top: calc(3 * var(--px)) solid rgba(var(--fg), .2);
+  box-shadow: inset 0 calc(1 * var(--px)) 0 rgba(var(--fg), .06);
+  transition: border-color .16s ease, transform .16s cubic-bezier(.2,.8,.3,1);
+  will-change: transform;
+}
+/* The fill is a separate layer so selection can cross-fade it. A gradient in
+   the background shorthand cannot be transitioned. */
+#cod-menu .diff-tile::before {
+  content: '';
+  position: absolute; inset: 0;
+  background: linear-gradient(180deg, rgba(var(--accent), .3), rgba(var(--accent), .04) 72%);
+  opacity: 0;
+  transition: opacity .18s ease;
+}
+#cod-menu .diff-tile:hover { border-color: rgba(var(--fg), .3); }
+#cod-menu .diff-tile:hover::before { opacity: .3; }
+#cod-menu .diff-tile:focus-visible { outline: none; border-color: rgba(var(--accent), .55); }
+#cod-menu .diff-tile:focus-visible::before { opacity: .45; }
+#cod-menu .diff-tile:hover, #cod-menu .diff-tile.on {
+  transform: translate3d(0, calc(-2 * var(--px)), 0);
+}
+/* The inset glow reads as light spilling down off the lit top edge, which is
+   what gives the selected tile depth rather than just a brighter fill. Inset
+   because overflow: hidden would clip an outer one. */
+#cod-menu .diff-tile.on {
+  border-color: rgba(var(--accent), .34);
+  border-top-color: rgba(var(--accent), .95);
+  box-shadow: inset 0 calc(11 * var(--px)) calc(17 * var(--px)) calc(-11 * var(--px)) rgba(var(--accent), .55);
+}
+#cod-menu .diff-tile.on::before { opacity: 1; }
+#cod-menu .diff-tile.on .n { color: rgba(var(--fg), .99); }
+/* "You will not survive" does not belong in the same friendly green as
+   "for players new to first person action games". */
+#cod-menu .diff-tile.veteran.on {
+  border-color: rgba(var(--danger), .4);
+  border-top-color: rgba(var(--danger), .92);
+  box-shadow: inset 0 calc(11 * var(--px)) calc(17 * var(--px)) calc(-11 * var(--px)) rgba(var(--danger), .55);
+}
+#cod-menu .diff-tile.veteran.on::before {
+  background: linear-gradient(180deg, rgba(var(--danger), .3), rgba(var(--danger), .04) 72%);
+}
+#cod-menu .diff-tile .top {
+  position: relative;
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: calc(6 * var(--px));
+}
+#cod-menu .diff-tile .n {
+  font-size: calc(17 * var(--px));
+  font-weight: 600;
+  letter-spacing: calc(2.2 * var(--px));
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: rgba(var(--fg), .6);
+  text-shadow: var(--sh);
+  transition: color .16s ease;
+}
+/* Lethality against Regular, on every tile rather than only the selected one,
+   so the whole ladder can be compared without hovering it. */
+#cod-menu .diff-tile .x {
+  font-family: var(--fm);
+  font-size: calc(11 * var(--px));
+  letter-spacing: 0;
+  color: rgba(var(--fg), .42);
+  text-shadow: var(--sh);
+  transition: color .16s ease;
+}
+#cod-menu .diff-tile.on .x { color: rgba(var(--fg), .78); }
+/* A signal-strength ladder: rising bars, lit up to the preset's rung. */
+#cod-menu .diff-tile .pips {
+  position: relative;
+  display: flex; align-items: flex-end; gap: calc(4 * var(--px));
+  height: calc(12 * var(--px));
+}
+#cod-menu .diff-tile .pips i {
+  width: calc(11 * var(--px));
+  background: rgba(var(--fg), .14);
+  box-shadow: inset 0 0 0 calc(1 * var(--px)) rgba(2,4,4,.45);
+}
+#cod-menu .diff-tile .pips i:nth-child(1) { height: calc(4.5 * var(--px)); }
+#cod-menu .diff-tile .pips i:nth-child(2) { height: calc(7 * var(--px)); }
+#cod-menu .diff-tile .pips i:nth-child(3) { height: calc(9.5 * var(--px)); }
+#cod-menu .diff-tile .pips i:nth-child(4) { height: calc(12 * var(--px)); }
+#cod-menu .diff-tile .pips i.lit { background: rgba(var(--accent), .8); }
+#cod-menu .diff-tile.hardened .pips i.lit { background: rgba(var(--amber), .84); }
+#cod-menu .diff-tile.veteran .pips i.lit { background: rgba(var(--danger), .82); }
+/* Painted only while the select animation runs. */
+#cod-menu .diff-tile .sweep {
+  position: absolute; top: 0; bottom: 0; left: 0;
+  width: 45%;
+  background: linear-gradient(90deg, rgba(255,255,255,0), rgba(255,255,255,.42), rgba(255,255,255,0));
+  opacity: 0;
+  pointer-events: none;
+}
+#cod-menu .diff-tile.picked .sweep { animation: codDiffSweep .46s cubic-bezier(.3,.7,.3,1) 1; }
+@keyframes codDiffSweep {
+  from { opacity: 0; transform: translate3d(-120%, 0, 0); }
+  30%  { opacity: 1; }
+  to   { opacity: 0; transform: translate3d(320%, 0, 0); }
+}
+#cod-menu .diff-read {
+  margin: calc(11 * var(--px)) 0 0 calc(20 * var(--px));
+  border-left: calc(2 * var(--px)) solid rgba(var(--accent), .55);
+  padding: calc(1 * var(--px)) 0 calc(1 * var(--px)) calc(12 * var(--px));
+  transition: border-color .2s ease;
+}
+#cod-menu .diff.alert .diff-read { border-left-color: rgba(var(--danger), .72); }
+#cod-menu .diff-blurb {
+  font-size: calc(12.5 * var(--px));
+  letter-spacing: calc(2.8 * var(--px));
+  text-transform: uppercase;
+  color: rgba(var(--fg), .64);
+  text-shadow: var(--sh);
+  transition: color .2s ease;
+}
+#cod-menu .diff.alert .diff-blurb { color: rgba(var(--danger), .84); }
+#cod-menu .diff-stats {
+  display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
+  margin-top: calc(10 * var(--px));
+}
+#cod-menu .diff-stats div {
+  display: flex; flex-direction: column; gap: calc(3 * var(--px));
+  border-left: calc(1 * var(--px)) solid rgba(var(--fg), .1);
+  padding-left: calc(10 * var(--px));
+}
+#cod-menu .diff-stats div:first-child { border-left: 0; padding-left: 0; }
+#cod-menu .diff-stats span {
+  font-size: calc(9.5 * var(--px));
+  letter-spacing: calc(1.9 * var(--px));
+  text-transform: uppercase;
+  color: rgba(var(--fg), .34);
+}
+/* Monospace, like the stats overlay: these are instrument readings, and they
+   must not reflow as the digits change under the pointer. */
+#cod-menu .diff-stats b {
+  font-family: var(--fm);
+  font-size: calc(12.5 * var(--px));
+  font-weight: 600;
+  letter-spacing: 0;
+  color: rgba(var(--fg), .88);
+  text-shadow: var(--sh);
+}
+
 #cod-menu .death-title {
   font-size: calc(58 * var(--px));
   letter-spacing: calc(10 * var(--px));
